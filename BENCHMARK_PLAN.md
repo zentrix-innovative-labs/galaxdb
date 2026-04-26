@@ -1,6 +1,6 @@
-# Andromeda Benchmark Plan (v1)
+# GalaxDB Benchmark Plan (v1)
 
-This runbook defines how to benchmark Andromeda v1 against major existing databases for OLTP, ANN, hybrid search, versioned snapshots, and failure recovery.
+This runbook defines how to benchmark GalaxDB v1 against major existing databases for OLTP, ANN, hybrid search, versioned snapshots, and failure recovery.
 
 ## 1) Objectives
 
@@ -21,7 +21,7 @@ This runbook defines how to benchmark Andromeda v1 against major existing databa
 Notes:
 1. Use single-node modes for all systems in v1 comparison.
 2. Match vector dimension, metric, and top-k across all runs.
-3. Disable distributed features in systems where possible to keep parity with Andromeda v1 scope.
+3. Disable distributed features in systems where possible to keep parity with GalaxDB v1 scope.
 
 ## 3) Hardware Profiles
 
@@ -132,7 +132,7 @@ Use public datasets where possible.
 - Exact brute-force cosine on sampled subsets
 
 3. Observability
-- Exported metrics endpoint for Andromeda
+- Exported metrics endpoint for GalaxDB
 - System-level stats from Linux perf and iostat
 
 4. Result packaging
@@ -142,7 +142,7 @@ Use public datasets where possible.
 
 ## 8) Success Gates (v1)
 
-Andromeda v1 passes when all are true on Profile B:
+GalaxDB v1 passes when all are true on Profile B:
 
 1. Correctness
 - Zero committed data loss in all W6 tests
@@ -172,7 +172,7 @@ Andromeda v1 passes when all are true on Profile B:
 - Baseline runs for Qdrant, Weaviate, Milvus
 
 4. Week 4
-- Andromeda v1 runs on all workloads
+- GalaxDB v1 runs on all workloads
 
 5. Week 5
 - Failure injection and recovery suite

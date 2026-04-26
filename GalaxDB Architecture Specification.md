@@ -1,8 +1,8 @@
-# Andromeda Architecture Specification  
+# GalaxDB Architecture Specification  
 **Final Version 2.0**  
 *Covering v1 (MVP) and v2 (Full AI‑Native Vision)*
 
-**Authors:** Andromeda Engineering  
+**Authors:** GalaxDB Engineering  
 **Status:** Design Locked. Implementation‑ready for v1.
 
 ---
@@ -37,7 +37,7 @@
 
 ## 1. Vision & Design Principles
 
-Andromeda is the **AI‑native database** that unifies transactional, analytical, vector, and graph data into a single engine. It eliminates the five‑database spaghetti and actively improves the AI built on top of it.
+GalaxDB is the **AI‑native database** that unifies transactional, analytical, vector, and graph data into a single engine. It eliminates the five‑database spaghetti and actively improves the AI built on top of it.
 
 **Core Principles (apply to all versions):**
 
@@ -50,7 +50,7 @@ Andromeda is the **AI‑native database** that unifies transactional, analytical
 
 ## 2. Architecture Overview
 
-Andromeda’s architecture is layered, with each version adding capabilities:
+GalaxDB’s architecture is layered, with each version adding capabilities:
 
 ```
 ┌────────────────────────────────────────────┐
@@ -131,7 +131,7 @@ Andromeda’s architecture is layered, with each version adding capabilities:
 
 **Lifecycle**
 - **Crash recovery**: Exponential backoff restart; DB continues serving (embeddings remain stale).
-- **Back‑pressure**: 10k in‑flight queue limit. Overflow rows are written to `_andromeda_embedding_backlog`, reprocessed later by a low‑priority scanner. No data loss.
+- **Back‑pressure**: 10k in‑flight queue limit. Overflow rows are written to `_GalaxDB_embedding_backlog`, reprocessed later by a low‑priority scanner. No data loss.
 
 ### 3.5 AuroraSQL Language
 
@@ -164,8 +164,8 @@ When clustering is added, the guarantee will be downgraded to causal consistency
 
 | Mode | Description |
 |------|-------------|
-| Embedded | `import andromeda` – in‑process, no server. |
-| Standalone | `andromeda --server` – listens on port 5432. |
+| Embedded | `import GalaxDB` – in‑process, no server. |
+| Standalone | `GalaxDB --server` – listens on port 5432. |
 | Clustered | **v2 only** |
 
 ### 3.10 Binary Footprint
@@ -218,7 +218,7 @@ The following sections describe the complete AI‑Native vision, building upon t
 
 ### 4.3 Active Learning & Feedback Loop
 
-- `_andromeda_predictions` table: applications insert `(row_id, model_id, prediction, actual)`.
+- `_GalaxDB_predictions` table: applications insert `(row_id, model_id, prediction, actual)`.
 - **Drift detector** monitors accuracy, triggers PQ/index retraining and alerts.
 - **Active learning**: `ORDER BY ACTIVE_LEARNING` pre‑computes uncertainty scores as a column; background job refreshes them on model update.
 - **FEEDBACK SQL** appends delta updates, preserving lineage.
@@ -287,4 +287,4 @@ The following sections describe the complete AI‑Native vision, building upon t
 
 ---
 
-*This document is the authoritative reference for Andromeda. All future implementation decisions must be traceable to the principles and constraints laid out herein.*
+*This document is the authoritative reference for GalaxDB. All future implementation decisions must be traceable to the principles and constraints laid out herein.*

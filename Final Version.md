@@ -1,4 +1,4 @@
-# Andromeda Architecture Specification
+# GalaxDB Architecture Specification
 ## Final Version — v1 Hardened, v2 Fully Designed
 
 **Status:** Design locked. All design review issues resolved. All audit loopholes closed. Implementation-ready for v1.
@@ -41,7 +41,7 @@
 
 ## 1. Vision & Design Principles
 
-Andromeda is the **AI-native database** that unifies transactional, analytical, vector, and graph data into a single engine. It eliminates the five-database spaghetti and actively improves the AI built on top of it.
+GalaxDB is the **AI-native database** that unifies transactional, analytical, vector, and graph data into a single engine. It eliminates the five-database spaghetti and actively improves the AI built on top of it.
 
 ### Core Principles
 
@@ -59,7 +59,7 @@ Andromeda is the **AI-native database** that unifies transactional, analytical, 
 
 ## 2. Architecture Overview
 
-Andromeda's architecture is layered. Each version adds capabilities while preserving the same foundational model.
+GalaxDB's architecture is layered. Each version adds capabilities while preserving the same foundational model.
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -90,7 +90,7 @@ Andromeda's architecture is layered. Each version adds capabilities while preser
 
 #### LSM-Tree with PAX Blocks
 
-Andromeda stores data in **PAX (Partition Attributes Across) blocks** — each block holds approximately 1,000 rows with columns stored contiguously within the block.
+GalaxDB stores data in **PAX (Partition Attributes Across) blocks** — each block holds approximately 1,000 rows with columns stored contiguously within the block.
 
 **Write Path:**
 1. Incoming rows accumulate in a lock-free Bw-Tree memory buffer.
@@ -225,7 +225,7 @@ This constraint is specifically and only on the source column of an embedding. A
 - **Pinned tags are retention-exempt.** A named version tag prevents garbage collection of its referenced blocks.
 - `DROP VERSION TAG` releases the pin.
 - `EXPIRE VERSION 'tag' AFTER INTERVAL '90 days'` sets a timed auto-expiry.
-- Tags are listed in the system catalog `_andromeda_versions`.
+- Tags are listed in the system catalog `_GalaxDB_versions`.
 
 #### Semantic Search at Historical Versions
 
@@ -283,12 +283,12 @@ EXPIRE VERSION 'q4_training_snapshot' AFTER INTERVAL '180 days';
 | macOS | `kqueue` monitoring parent PID — sidecar terminates when parent exits |
 | Windows | Named pipe heartbeat — sidecar polls parent; if pipe breaks, sidecar exits |
 
-When the `andromeda` process starts (CLI or embedded), it spawns the sidecar as a child process. When the parent exits (cleanly or via crash), the sidecar terminates automatically.
+When the `GalaxDB` process starts (CLI or embedded), it spawns the sidecar as a child process. When the parent exits (cleanly or via crash), the sidecar terminates automatically.
 
 #### Back-Pressure & Data Loss Prevention
 
 - The embedding request queue has a hard limit of **10,000 in-flight items**.
-- When the queue is full, new requests are **not dropped**. Instead, the row ID is written to the **persistent backlog table** `_andromeda_embedding_backlog`.
+- When the queue is full, new requests are **not dropped**. Instead, the row ID is written to the **persistent backlog table** `_GalaxDB_embedding_backlog`.
 - A low-priority background scanner periodically drains this table, re-submitting requests when the sidecar has capacity.
 - **No data is silently lost.** Rows in the backlog remain stale (excluded from semantic search) but are guaranteed eventual processing.
 - The metric `_embedding_backlog_depth` is exposed for monitoring.
@@ -311,7 +311,7 @@ When the `andromeda` process starts (CLI or embedded), it spawns the sidecar as 
 
 ### 3.5 AuroraSQL Language
 
-Andromeda v1 supports PostgreSQL-compatible SQL extended with AI-native primitives.
+GalaxDB v1 supports PostgreSQL-compatible SQL extended with AI-native primitives.
 
 #### DDL with Auto-Embedding
 
@@ -441,8 +441,8 @@ The v1 consistency model is split into two separate concerns, because the row st
 
 | Mode | Platforms | Description |
 |------|-----------|-------------|
-| **Embedded** | Linux (x86-64, ARM64), macOS (x86-64, ARM64), Windows (x86-64) | `import andromeda` in Python; library runs in-process. Sidecar spawned as child. |
-| **Standalone server** | Linux, macOS | `andromeda --server` listens on localhost:5432 (PostgreSQL wire protocol). |
+| **Embedded** | Linux (x86-64, ARM64), macOS (x86-64, ARM64), Windows (x86-64) | `import GalaxDB` in Python; library runs in-process. Sidecar spawned as child. |
+| **Standalone server** | Linux, macOS | `GalaxDB --server` listens on localhost:5432 (PostgreSQL wire protocol). |
 | **Clustered** | Linux (x86-64) | v2 only. Multi-node with Raft consensus, distributed ANN. |
 
 Platform-specific sidecar ownership is handled via conditional compilation (`#[cfg(target_os)]`):
@@ -456,11 +456,11 @@ Platform-specific sidecar ownership is handled via conditional compilation (`#[c
 
 | Installation Tier | Contents | Size |
 |-------------------|----------|------|
-| **Minimal** (`andromeda-core`) | Database engine: LSM, PAX, HNSW, SQL, wire protocol | **< 64 MB** |
-| **Standard** (`andromeda`) | Core + Python embedded client | **< 70 MB** |
-| **Full** (`andromeda-full`) | Standard + embedding sidecar + default model | **< 350 MB** |
+| **Minimal** (`GalaxDB-core`) | Database engine: LSM, PAX, HNSW, SQL, wire protocol | **< 64 MB** |
+| **Standard** (`GalaxDB`) | Core + Python embedded client | **< 70 MB** |
+| **Full** (`GalaxDB-full`) | Standard + embedding sidecar + default model | **< 350 MB** |
 
-Users select the tier at install time. The sidecar and model are fetched lazily when first needed if not pre-installed. The `pip install andromeda-db` package defaults to the Standard tier with lazy fetch for the sidecar.
+Users select the tier at install time. The sidecar and model are fetched lazily when first needed if not pre-installed. The `pip install GalaxDB-db` package defaults to the Standard tier with lazy fetch for the sidecar.
 
 ---
 
@@ -603,10 +603,10 @@ v2 enhances the v1 graph+delta design with:
 ### 4.4 Active Learning & Feedback Loop
 
 #### Prediction Tracking
-- Applications insert prediction outcomes into the system table `_andromeda_predictions`:
+- Applications insert prediction outcomes into the system table `_GalaxDB_predictions`:
 
 ```sql
-INSERT INTO _andromeda_predictions (row_id, model_id, prediction, actual, timestamp)
+INSERT INTO _GalaxDB_predictions (row_id, model_id, prediction, actual, timestamp)
 VALUES (42, 'fraud_v3', 'legitimate', 'fraud', NOW());
 ```
 
@@ -635,7 +635,7 @@ SOURCE 'quality_model_v3'
 - The row's gradient is boosted, influencing RGABH tiering and active learning.
 
 #### Drift Detection
-- Monitors accuracy in `_andromeda_predictions` over sliding windows.
+- Monitors accuracy in `_GalaxDB_predictions` over sliding windows.
 - When accuracy drops below a threshold for a data segment:
   - Alerts are emitted.
   - Affected rows' gradients are boosted (increasing their hotness and surfacing them for relabeling).
@@ -728,7 +728,7 @@ trait EmbeddingModel {
 |-------|----------|--------------|
 | **1** | 3–4 months | RGABH adaptive storage: multi-timescale EMA gradients, block hotness, auto-tuned tiering (NVMe → S3 → Glacier), quiescent metadata sweep, PQ codebook drift detection + auto-refresh. |
 | **2** | 4–5 months | Distributed clustering: consistent hash sharding, IVF+HNSW two-level index, IVF coexisting quantizers, HLC causal consistency, Raft replication, read replicas for HTAP, 2PC for strict serializability. |
-| **3** | 3–4 months | Active learning engine: `_andromeda_predictions` table, uncertainty scoring background job, `FEEDBACK` SQL, drift detector, three-stage cold-start bootstrap. |
+| **3** | 3–4 months | Active learning engine: `_GalaxDB_predictions` table, uncertainty scoring background job, `FEEDBACK` SQL, drift detector, three-stage cold-start bootstrap. |
 | **4** | 2–3 months | Full PostgreSQL extended protocol, BI tool compatibility, GPU Direct Storage, federated queries with differential privacy, plugin marketplace launch. |
 
 ---
@@ -815,4 +815,4 @@ trait EmbeddingModel {
 
 ---
 
-*This document is the authoritative reference for Andromeda v1 and v2. Every design decision is traceable to a specific issue in the audit trail (Appendices A–B). The v1 specification (§3) is frozen. Implementation begins against §3 immediately.*
+*This document is the authoritative reference for GalaxDB v1 and v2. Every design decision is traceable to a specific issue in the audit trail (Appendices A–B). The v1 specification (§3) is frozen. Implementation begins against §3 immediately.*

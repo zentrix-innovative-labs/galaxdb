@@ -2,7 +2,7 @@ You've caught the exact failure modes that would have surfaced during implementa
 
 ---
 
-## Andromeda v1 Architecture Specification — Corrected
+## GalaxDB v1 Architecture Specification — Corrected
 
 **Version 1.1 — Buildable MVP, Hardened**  
 **Target: 4 months, 2–3 Rust engineers**  
@@ -26,7 +26,7 @@ You've caught the exact failure modes that would have surfaced during implementa
 
 ## 1. Introduction
 
-Andromeda v1 is a **single‑node, embedded, hybrid database** that unifies OLTP row storage, columnar analytics, and vector similarity search into one engine. It is the first step toward the full AI‑native vision — a system that replaces PostgreSQL, a vector extension, and a feature store with a single ~50 MB binary.
+GalaxDB v1 is a **single‑node, embedded, hybrid database** that unifies OLTP row storage, columnar analytics, and vector similarity search into one engine. It is the first step toward the full AI‑native vision — a system that replaces PostgreSQL, a vector extension, and a feature store with a single ~50 MB binary.
 
 This document describes exactly what will be built, what is explicitly deferred, and every design decision that carries a correctness or performance consequence.
 
@@ -144,7 +144,7 @@ This constraint applies specifically and only to the source column of an embeddi
 
 ## 5. Versioning (Merkle DAG)
 
-Andromeda provides Git‑like time‑travel for row data:
+GalaxDB provides Git‑like time‑travel for row data:
 
 - Every write creates a new PAX block with a commit timestamp.
 - A Merkle tree over block hashes forms the system state; each commit produces a **version root**.
@@ -167,17 +167,17 @@ Embedding computation is offloaded to a separate process to keep the database li
 
 ### 6.2 Lifecycle
 
-- **Starting:** When the `andromeda` process starts (either CLI or embedded via Python), it spawns the sidecar as a child process.
+- **Starting:** When the `GalaxDB` process starts (either CLI or embedded via Python), it spawns the sidecar as a child process.
 - **Process ownership:** The sidecar monitors its parent's PID; if the parent dies, the sidecar terminates (`prctl(PR_SET_PDEATHSIG)` on Linux).
 - **Health:** The sidecar sends a heartbeat (ping) every 5 seconds. If the database misses 3 consecutive pings, it considers the sidecar crashed.
 - **Crash recovery:** On crash, embedding work is marked as failed. The database continues serving queries normally (embeddings remain stale). The sidecar is restarted with exponential backoff (1s, 2s, 4s, up to 60s). During recovery, new writes still proceed but their embeddings stay stale until the sidecar returns.
-- **Back‑pressure:** The embedding request queue has a hard limit of 10,000 in‑flight items. When the queue is full, new embedding requests are **not dropped** — instead, the row ID is written to a persistent **stale‑row backlog table** (`_andromeda_embedding_backlog`). A low‑priority background scanner periodically drains this table, re‑submitting embedding requests when the sidecar has capacity. The row remains stale until processed, but it is never permanently lost. The metric `_embedding_queue_full` increments to track how often back‑pressure is triggered, representing delayed indexing, not data loss.
+- **Back‑pressure:** The embedding request queue has a hard limit of 10,000 in‑flight items. When the queue is full, new embedding requests are **not dropped** — instead, the row ID is written to a persistent **stale‑row backlog table** (`_GalaxDB_embedding_backlog`). A low‑priority background scanner periodically drains this table, re‑submitting embedding requests when the sidecar has capacity. The row remains stale until processed, but it is never permanently lost. The metric `_embedding_queue_full` increments to track how often back‑pressure is triggered, representing delayed indexing, not data loss.
 
 ---
 
 ## 7. SQL Language (AuroraSQL)
 
-Andromeda v1 supports a **superset of PostgreSQL‑compatible SQL** with the following custom extensions.
+GalaxDB v1 supports a **superset of PostgreSQL‑compatible SQL** with the following custom extensions.
 
 ### 7.1 DDL Extensions
 
@@ -223,7 +223,7 @@ SELECT * FROM table AT VERSION timestamp_or_tag ...
 
 ## 8. PostgreSQL Wire Compatibility
 
-Andromeda v1 implements **Tier 1** of the PostgreSQL wire protocol:
+GalaxDB v1 implements **Tier 1** of the PostgreSQL wire protocol:
 
 - Simple query protocol (`Q` message).
 - Basic DDL (`CREATE TABLE`, `DROP TABLE`), DML (`INSERT`, `SELECT`, `DELETE` with normal columns), and `SET` for runtime parameters.
@@ -246,9 +246,9 @@ This guarantee applies to v1 only. The distributed (clustered) mode planned for 
 A `SELECT` query can be executed against a named version tag and materialized as an **Arrow RecordBatch** stream for training consumption:
 
 ```python
-import andromeda
+import GalaxDB
 
-db = andromeda.Database("mydata")
+db = GalaxDB.Database("mydata")
 reader = db.execute_arrow("""
     SELECT title, description, embedding
     FROM products AT VERSION 'q2_train'
@@ -258,7 +258,7 @@ for batch in reader:
     ...
 ```
 
-- The Arrow Flight server is embedded in the Andromeda process and exposes versioned snapshots via a simple `do_get` endpoint.
+- The Arrow Flight server is embedded in the GalaxDB process and exposes versioned snapshots via a simple `do_get` endpoint.
 - **No GPU Direct Storage in v1.** Training data flows through CPU memory. GPU‑Direct (direct NVMe → GPU DMA) is deferred to v2.
 
 ---
@@ -276,8 +276,8 @@ The sidecar and model are downloaded on first use or bundled in the official dis
 
 | Mode | Description |
 |------|-------------|
-| **Embedded** | `import andromeda` in Python; library starts in‑process. No replication, no background cluster tasks. The sidecar is spawned as a child process. |
-| **Standalone server** | `andromeda --server` starts a PostgreSQL‑wire‑compatible server on localhost:5432. Same binary, same capabilities. |
+| **Embedded** | `import GalaxDB` in Python; library starts in‑process. No replication, no background cluster tasks. The sidecar is spawned as a child process. |
+| **Standalone server** | `GalaxDB --server` starts a PostgreSQL‑wire‑compatible server on localhost:5432. Same binary, same capabilities. |
 | **Clustered** | Not in v1. |
 
 ---
@@ -307,7 +307,7 @@ These features are designed but deferred to v2 or later:
 ### Month 2 — SQL Layer + Client Integration
 - `sqlparser-rs` integration with AuroraSQL extensions (`SEMANTIC_MATCH`, `AT VERSION`, `EMBEDDING MODEL` in DDL).
 - PostgreSQL simple query protocol (`Q` message).
-- Python embedded mode: `import andromeda`, basic CRUD, `pg_catalog` stubs.
+- Python embedded mode: `import GalaxDB`, basic CRUD, `pg_catalog` stubs.
 - End‑to‑end working: create tables, insert rows, query with standard SQL.
 
 ### Month 3 — Vector Index + Embedding Sidecar

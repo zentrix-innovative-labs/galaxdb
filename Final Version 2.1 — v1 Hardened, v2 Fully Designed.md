@@ -1,4 +1,4 @@
-# Andromeda Architecture Specification
+# GalaxDB Architecture Specification
 ## Final Version 2.1 — v1 Hardened, v2 Fully Designed
 
 **Status:** Design locked. All 20 critical/high issues from the full design review resolved. Twelve v1.1 loopholes identified in the external audit closed. Ten v2 performance upgrades incorporated.
@@ -41,7 +41,7 @@
 
 ## 1. Vision & Design Principles
 
-Andromeda is the **AI-native database** that unifies transactional, analytical, vector, and graph data into a single engine. It eliminates the five-database spaghetti and actively improves the AI built on top of it.
+GalaxDB is the **AI-native database** that unifies transactional, analytical, vector, and graph data into a single engine. It eliminates the five-database spaghetti and actively improves the AI built on top of it.
 
 **Core Principles (apply to all versions):**
 
@@ -55,7 +55,7 @@ Andromeda is the **AI-native database** that unifies transactional, analytical, 
 
 ## 2. Architecture Overview
 
-Andromeda's architecture is layered, with each version adding capabilities:
+GalaxDB's architecture is layered, with each version adding capabilities:
 
 ```
 ┌──────────────────────────────────────────────────┐
@@ -176,7 +176,7 @@ When a `SEMANTIC_MATCH` is combined with a strict `WHERE` filter (e.g., `WHERE p
 - Default retention: 30 days (not 7 — see rationale below). Configurable per table.
 - **Pinned tags are retention‑exempt.** A named version tag explicitly prevents GC of the blocks it references. This is audit fix #9: reproducible training snapshots cannot disappear.
 - `DROP VERSION TAG` releases the pin. An explicit `EXPIRE VERSION` DDL allows timed auto‑expiry.
-- Tags can be exported as Arrow Flight datasets (§3.8). Exported tags are listed in system catalog `_andromeda_versions`.
+- Tags can be exported as Arrow Flight datasets (§3.8). Exported tags are listed in system catalog `_GalaxDB_versions`.
 
 **Semantic Search at Historical Versions:**
 
@@ -224,7 +224,7 @@ Addresses audit #10.
 
 **Back‑pressure & Data Loss Prevention:**
 - Embedding request queue: 10,000 in‑flight items, bounded.
-- When queue is full, new requests are written to the **persistent stale‑row backlog table** `_andromeda_embedding_backlog`.
+- When queue is full, new requests are written to the **persistent stale‑row backlog table** `_GalaxDB_embedding_backlog`.
 - A low‑priority background scanner drains this table, re‑submitting requests when the sidecar has capacity.
 - **No data is silently dropped.** Rows in the backlog remain stale (excluded from semantic search) but are guaranteed eventual processing.
 - The metric `_embedding_backlog_depth` is exposed for monitoring.
@@ -343,8 +343,8 @@ The previous v1.1 statement "v1 provides strict serializable isolation for all r
 
 | Mode | Platforms | Description |
 |------|-----------|-------------|
-| Embedded | Linux (x86‑64, ARM64), macOS (x86‑64, ARM64), Windows (x86‑64) | `import andromeda` — in‑process, no server. Sidecar spawned as child process. |
-| Standalone server | Linux, macOS | `andromeda --server` — listens on port 5432. |
+| Embedded | Linux (x86‑64, ARM64), macOS (x86‑64, ARM64), Windows (x86‑64) | `import GalaxDB` — in‑process, no server. Sidecar spawned as child process. |
+| Standalone server | Linux, macOS | `GalaxDB --server` — listens on port 5432. |
 | Clustered | v2 only | Distributed mode with Raft, multi‑node. |
 
 **Platform‑specific notes:**
@@ -369,9 +369,9 @@ The previous v1.1 statement "v1 provides strict serializable isolation for all r
 
 **Installation tiers:**
 
-1. **Minimal:** `andromeda-core` — database engine only. No embedding. ~60 MB.
-2. **Standard:** `andromeda` — engine + embedded mode Python client. ~65 MB.
-3. **Full:** `andromeda-full` — engine + sidecar + default model. ~300 MB.
+1. **Minimal:** `GalaxDB-core` — database engine only. No embedding. ~60 MB.
+2. **Standard:** `GalaxDB` — engine + embedded mode Python client. ~65 MB.
+3. **Full:** `GalaxDB-full` — engine + sidecar + default model. ~300 MB.
 
 Users choose tier at install time. The sidecar and model are fetched lazily if needed.
 
@@ -388,7 +388,7 @@ Addresses audit #11: size target is now realistic, with explicit module tiers.
 
 **Embedding Durability:**
 - A computed embedding is durable once its PAX block is flushed and fsync'd.
-- Stale rows in the backlog table `_andromeda_embedding_backlog` are durable as rows (the row data is persisted) but the embedding column is `NULL` until processed.
+- Stale rows in the backlog table `_GalaxDB_embedding_backlog` are durable as rows (the row data is persisted) but the embedding column is `NULL` until processed.
 - On crash, the backlog table is recovered from the LSM/WAL. The background scanner resumes processing.
 - No embedding work is lost: either the embedding was written to a PAX block (durable) or the row is in the backlog (will be retried).
 
@@ -473,7 +473,7 @@ Performance upgrades #1, #6, #7 incorporated.
 
 ### 4.4 Active Learning & Feedback Loop
 
-- `_andromeda_predictions` table: applications insert `(row_id, model_id, prediction, actual)`.
+- `_GalaxDB_predictions` table: applications insert `(row_id, model_id, prediction, actual)`.
 - Drift detector: monitors accuracy, triggers PQ/index retraining.
 - `ORDER BY ACTIVE_LEARNING`: pre‑computed uncertainty scores as a real column; background job refreshes on model update.
 - `FEEDBACK` SQL: append‑only delta updates, preserving Merkle lineage.
@@ -533,7 +533,7 @@ Audit fix #1 (fully resolved for v2) and performance upgrade #9.
 |-------|-------------|
 | **1** | RGABH adaptive storage: multi‑timescale EMA gradients, block hotness, auto‑tuned tiering (NVMe → S3 → Glacier), quiescent sweep, codebook drift detection + refresh. |
 | **2** | Distributed clustering: consistent hash sharding, IVF+HNSW two‑level index, HLC causal consistency, Raft replication, read replicas for HTAP. |
-| **3** | Active learning engine: uncertainty scoring, `FEEDBACK` SQL, drift detector, `_andromeda_predictions` table, cold‑start bootstrap. |
+| **3** | Active learning engine: uncertainty scoring, `FEEDBACK` SQL, drift detector, `_GalaxDB_predictions` table, cold‑start bootstrap. |
 | **4** | Full PostgreSQL extended query protocol, BI tool compatibility, GPU Direct, federated queries, plugin marketplace. |
 
 ---
@@ -593,4 +593,4 @@ Audit fix #1 (fully resolved for v2) and performance upgrade #9.
 
 ---
 
-*This document is the authoritative reference for Andromeda v1 and v2. Every design decision is traceable to a specific issue in the audit trail. The v1 specification is frozen; implementation begins against §3.*
+*This document is the authoritative reference for GalaxDB v1 and v2. Every design decision is traceable to a specific issue in the audit trail. The v1 specification is frozen; implementation begins against §3.*

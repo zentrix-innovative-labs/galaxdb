@@ -1,8 +1,8 @@
 <p align="center">
-	<img src="assets/andromeda-avatar.svg" alt="Andromeda avatar" width="180" />
+	<img src="assets/GalaxDB-avatar.svg" alt="GalaxDB avatar" width="180" />
 </p>
 
-<h1 align="center">Andromeda</h1>
+<h1 align="center">GalaxDB</h1>
 
 <p align="center">
 	<strong>AI-native database architecture</strong><br />
@@ -16,9 +16,9 @@
 	<img src="https://img.shields.io/badge/license-Apache--2.0-333333" alt="license" />
 </p>
 
-## Why Andromeda
+## Why GalaxDB
 
-Andromeda is designed as a single-engine model where row storage, columnar scans, semantic retrieval, and versioned reproducibility are first-class capabilities instead of bolt-ons.
+GalaxDB is designed as a single-engine model where row storage, columnar scans, semantic retrieval, and versioned reproducibility are first-class capabilities instead of bolt-ons.
 
 Core intent:
 - OLTP row performance with durable write semantics
@@ -44,8 +44,8 @@ Core intent:
 
 - [Final Version.md](Final%20Version.md): final architecture specification
 - [Final Version 2.1 — v1 Hardened, v2 Fully Designed.md](Final%20Version%202.1%20%E2%80%94%20v1%20Hardened,%20v2%20Fully%20Designed.md): hardened revision with audit mapping
-- [Andromeda Architecture Specification.md](Andromeda%20Architecture%20Specification.md): earlier consolidated version
-- [Andromeda v1 Architecture Specification.md](Andromeda%20v1%20Architecture%20Specification.md): v1-focused baseline
+- [GalaxDB Architecture Specification.md](GalaxDB%20Architecture%20Specification.md): earlier consolidated version
+- [GalaxDB v1 Architecture Specification.md](GalaxDB%20v1%20Architecture%20Specification.md): v1-focused baseline
 - [BENCHMARK_PLAN.md](BENCHMARK_PLAN.md): concrete benchmark execution runbook
 
 ## Benchmark Scope
