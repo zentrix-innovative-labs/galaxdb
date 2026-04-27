@@ -141,6 +141,8 @@ Two structures coexist and periodically merge:
 
 2. **Delta buffer** — A small in-memory flat index (exact k-NN) holding vectors inserted or updated since the last merge. Backed by a persistent write-ahead log for durability across crashes.
 
+The delta buffer uses the **same unified WAL** as the LSM store, with a distinct `DELTA_INSERT` record type. Recovery replays both row-store and delta-buffer state from the same log sequence.
+
 #### Query Path
 
 1. `SEMANTIC_MATCH` probes **both** the base graph and the delta buffer.
@@ -194,6 +196,8 @@ To reduce storage and I/O for embeddings:
   - If > 1,000,000: randomly sample 1,000,000 vectors for training.
 - Each vector is stored as a short PQ code alongside its raw floats in the PAX block.
 - The HNSW graph references PQ codes for approximate search; raw floats are only read for final re-ranking.
+
+**Bootstrap transition behavior:** Before the PQ codebook exists (`< 10,000` vectors), graph payload entries store raw float32 vectors instead of PQ codes. After codebook training completes, a background rewrite populates PQ codes for existing nodes. During this transition, each node carries a `has_pq_code` flag; query execution falls back to raw-float scoring when the flag is false.
 
 **Drift monitoring (v1):** A background thread periodically samples raw vectors and recomputes quantization error against the codebook. If error increases beyond a configurable threshold, a warning is logged and a metric is emitted. Automatic codebook refresh requires v2 (RGABH-driven drift detection).
 
@@ -419,14 +423,17 @@ The v1 consistency model is split into two separate concerns, because the row st
 - Embedding: typically available within 10–500 ms, depending on sidecar load and model latency.
 - The system column `_embedding_stale` is readable by applications: `SELECT _embedding_stale FROM products WHERE id = 42`.
 
+**Reader-visible atomicity rule:** Embedding materialization uses the same LSM update path as any other row update. The embedding value and `_embedding_stale` transition (`true -> false`) are written in the same row version. Readers therefore observe a consistent pair: either stale+NULL embedding or fresh+materialized embedding, never a mixed state.
+
 ---
 
 ### 3.8 Training Data Path
 
-#### Arrow Flight Export
+#### Arrow IPC Export (v1)
 
-- A `SELECT … AT VERSION 'tag'` query can be materialized as an **Arrow RecordBatch stream** via an embedded Arrow Flight server.
+- A `SELECT … AT VERSION 'tag'` query can be materialized as an **Arrow RecordBatch stream** via the in-process `execute_arrow()` API.
 - Python API: `db.execute_arrow(query)` returns an iterator of `pyarrow.RecordBatch` objects, suitable for direct ingestion into PyTorch, TensorFlow, or JAX.
+- v1 does not expose Arrow Flight over gRPC; this keeps the embedded binary lean and avoids network-protocol complexity during initial delivery.
 - No GPU Direct Storage in v1; data flows through CPU memory.
 
 #### Reproducibility Contract
@@ -468,8 +475,10 @@ Users select the tier at install time. The sidecar and model are fetched lazily 
 
 #### Data Durability
 - Committed row data is durable after fsync on the PAX block and WAL entry.
-- Crash recovery: on startup, replay WAL from the last checkpoint. Maximum recovery time is < 30 seconds, bounded by checkpoint frequency (configurable, default every 60 seconds).
+- Crash recovery: on startup, replay the unified WAL from the last checkpoint. Maximum recovery time is < 30 seconds, bounded by checkpoint frequency (configurable, default every 60 seconds).
 - Power loss: committed data survives. Uncommitted transactions (no fsync acknowledgment) are rolled back.
+
+WAL replay includes all record families (row updates, compaction metadata, and vector delta-buffer records such as `DELTA_INSERT`) in a single ordered recovery path.
 
 #### Embedding Durability
 - A computed embedding is durable once its PAX block is flushed and fsync'd.
@@ -672,6 +681,7 @@ WHERE SEMANTIC_MATCH(description, 'camping gear', 0.5);
 - Full `information_schema` and `pg_catalog` sufficient for Tableau, Metabase, DataGrip, DBeaver.
 - Server-side cursors and portals for large result sets.
 - `SET` for session-level runtime parameters.
+- Arrow Flight network export (gRPC) for remote high-throughput dataset transfer.
 
 ---
 
@@ -698,11 +708,17 @@ WHERE SEMANTIC_MATCH(description, 'camping gear', 0.5);
 
 ```rust
 trait EmbeddingModel {
-    fn embed(&self, text: &str) -> Vec<f32>;
-    fn model_id(&self) -> &str;
-    fn dimensions(&self) -> usize;
+  fn embed(&self, text: &str) -> Vec<f32> {
+    self.embed_batch(&[text]).remove(0)
+  }
+  fn embed_batch(&self, texts: &[&str]) -> Vec<Vec<f32>>;
+  fn model_id(&self) -> &str;
+  fn dimensions(&self) -> usize;
+  fn max_batch_size(&self) -> usize { 32 }
 }
 ```
+
+The sidecar uses `embed_batch` for throughput on bulk ingestion. The default `embed` implementation preserves compatibility for simple single-item callers.
 
 - v2 adds a plugin registry and sandboxed execution environment.
 - Third-party developers can publish models, active-learning strategies, and domain-specific data processors.
@@ -719,8 +735,8 @@ trait EmbeddingModel {
 |-------|-------------|---------------|
 | **1** | Core LSM storage engine | PAX blocks, WAL, checkpoint, crash recovery, Bw-Tree buffer, HotSet/ScanBuffer pool, compaction. Tested entirely via Rust API. |
 | **2** | SQL layer + client integration | `sqlparser-rs` with AuroraSQL extensions, PostgreSQL simple query protocol, Python embedded mode, pg_catalog stubs, basic CRUD end-to-end. |
-| **3** | Vector index + embedding sidecar | mmap'd HNSW base graph + delta buffer with merge policy, PQ codebook training (min-10k threshold), sidecar lifecycle + backlog durability, `SEMANTIC_MATCH` with union+re-rank, filter-aware traversal. |
-| **4** | Versioning + hardening | Merkle DAG, `AT VERSION` with consistency guardrails, version tags with pinning, Arrow Flight export, compatibility testing (psycopg2, SQLAlchemy), chaos test harness, public demo notebook. |
+| **3** | Vector index + embedding sidecar | mmap'd HNSW base graph + delta buffer with merge policy, PQ codebook training (min-10k threshold), sidecar lifecycle + backlog durability, `SEMANTIC_MATCH` with union+re-rank, adaptive planner fallback (graph vs brute-force under tight filters). |
+| **4** | Versioning + hardening | Merkle DAG, `AT VERSION` with consistency guardrails, version tags with pinning, ACORN-style disconnected-safe in-graph filtering hardening, Arrow IPC export API, compatibility testing (psycopg2, SQLAlchemy), chaos test harness, public demo notebook. |
 
 ### v2 — 12–18 Months, Expanded Team
 
