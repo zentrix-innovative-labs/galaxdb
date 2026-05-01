@@ -1,0 +1,14 @@
+[package]
+name = "galaxdb-sidecar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Embedding Sidecar binary (ort crate, Unix socket, backlog)"
+
+[[bin]]
+name = "galaxdb-sidecar"
+path = "src/main.rs"
+
+[dependencies]
+galaxdb-common.workspace = true

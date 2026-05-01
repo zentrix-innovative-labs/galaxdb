@@ -1,0 +1,16 @@
+[package]
+name = "galaxdb-io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "I/O abstraction: io_uring (Linux) / tokio (macOS/Windows)"
+
+[dependencies]
+galaxdb-common.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
+tempfile = "3"

@@ -2,97 +2,97 @@
 
 ## Month 1: Core Storage Engine
 
-- [ ] 1. Scaffold Rust workspace and shared types
-  - [ ] 1.1 Create Cargo workspace with crates: galaxdb-common, galaxdb-storage, galaxdb-io, galaxdb-crypto, galaxdb-vector, galaxdb-sql, galaxdb-wire, galaxdb-versioning, galaxdb-sidecar, galaxdb-observe, galaxdb-server, galaxdb-embedded
-  - [ ] 1.2 Define shared error types, config structs, and type aliases in galaxdb-common (TableId, BlockId, RowId, Timestamp, ColumnType enum)
-  - [ ] 1.3 Add workspace dependencies: crossbeam-skiplist, xxhash-rust, lz4_flex, zstd, tokio, memmap2, aes-gcm, aws-sdk-kms, rustls, prometheus, tracing, tracing-subscriber, opentelemetry, half
-  - [ ] 1.4 Set up CI with `cargo build --release`, `cargo test`, `cargo clippy` in GitHub Actions
+- [x] 1. Scaffold Rust workspace and shared types
+  - [x] 1.1 Create Cargo workspace with crates: galaxdb-common, galaxdb-storage, galaxdb-io, galaxdb-crypto, galaxdb-vector, galaxdb-sql, galaxdb-wire, galaxdb-versioning, galaxdb-sidecar, galaxdb-observe, galaxdb-server, galaxdb-embedded
+  - [x] 1.2 Define shared error types, config structs, and type aliases in galaxdb-common (TableId, BlockId, RowId, Timestamp, ColumnType enum)
+  - [x] 1.3 Add workspace dependencies: crossbeam-skiplist, xxhash-rust, lz4_flex, zstd, tokio, memmap2, aes-gcm, aws-sdk-kms, rustls, prometheus, tracing, tracing-subscriber, opentelemetry, half
+  - [x] 1.4 Set up CI with `cargo build --release`, `cargo test`, `cargo clippy` in GitHub Actions
 
-- [ ] 2. Implement I/O abstraction layer — galaxdb-io (Req 11)
-  - [ ] 2.1 Define `IoScheduler` trait with async read/write/fsync methods and `IoPriority` enum (High, Background)
-  - [ ] 2.2 Implement `TokioScheduler` using `tokio::fs` for macOS/Windows fallback
-  - [ ] 2.3 Implement `IoUringScheduler` with separate HP and BK io_uring submission queues (Linux 5.10+ only, behind `#[cfg(target_os = "linux")]`)
-  - [ ] 2.4 Add HP-queue latency monitoring (100 ms windows) and `LatencyReport` struct for RateLimiter feedback
-  - [ ] 2.5 Add startup detection: check platform + `GALAXDB_IO_BACKEND` env var to select scheduler implementation
-  - [ ] 2.6 Write unit tests for both scheduler implementations
+- [x] 2. Implement I/O abstraction layer — galaxdb-io (Req 11)
+  - [x] 2.1 Define `IoScheduler` trait with async read/write/fsync methods and `IoPriority` enum (High, Background)
+  - [x] 2.2 Implement `TokioScheduler` using `tokio::fs` for macOS/Windows fallback
+  - [x] 2.3 Implement `IoUringScheduler` with separate HP and BK io_uring submission queues (Linux 5.10+ only, behind `#[cfg(target_os = "linux")]`)
+  - [x] 2.4 Add HP-queue latency monitoring (100 ms windows) and `LatencyReport` struct for RateLimiter feedback
+  - [x] 2.5 Add startup detection: check platform + `GALAXDB_IO_BACKEND` env var to select scheduler implementation
+  - [x] 2.6 Write unit tests for both scheduler implementations
 
-- [ ] 3. Implement WAL — galaxdb-storage (Req 7)
-  - [ ] 3.1 Define WAL record format: `[type: u8][seq_no: u64][length: u32][xxh3_checksum: u64][lz4_payload: bytes]`
-  - [ ] 3.2 Define record types: ROW_PUT (0x01), ROW_DELETE (0x02), DELTA_INSERT (0x03), DELTA_TOMBSTONE (0x04), CHECKPOINT (0x05), BLOB_REF (0x06)
-  - [ ] 3.3 Implement WAL writer with LZ4 compression and XXH3-64 checksums per record
-  - [ ] 3.4 Implement group commit: background task batches writes over configurable interval (default 10 ms), single fsync per batch
-  - [ ] 3.5 Implement DURABILITY STRICT mode: bypass group commit, fsync each commit individually
-  - [ ] 3.6 Implement DURABILITY RELAXED mode: use group commit batch window
-  - [ ] 3.7 Implement checkpoint trigger: when WAL exceeds 512 MB or 60 seconds since last checkpoint
-  - [ ] 3.8 Implement WAL recovery: replay from last CHECKPOINT, verify XXH3-64 per record, skip corrupt records, stop at first checksum failure
-  - [ ] 3.9 Write tests: WAL write/read round-trip, group commit batching, checkpoint trigger, recovery with corrupt records, recovery time < 30s
+- [x] 3. Implement WAL — galaxdb-storage (Req 7)
+  - [x] 3.1 Define WAL record format: `[type: u8][seq_no: u64][length: u32][xxh3_checksum: u64][lz4_payload: bytes]`
+  - [x] 3.2 Define record types: ROW_PUT (0x01), ROW_DELETE (0x02), DELTA_INSERT (0x03), DELTA_TOMBSTONE (0x04), CHECKPOINT (0x05), BLOB_REF (0x06)
+  - [x] 3.3 Implement WAL writer with LZ4 compression and XXH3-64 checksums per record
+  - [x] 3.4 Implement group commit: background task batches writes over configurable interval (default 10 ms), single fsync per batch
+  - [x] 3.5 Implement DURABILITY STRICT mode: bypass group commit, fsync each commit individually
+  - [x] 3.6 Implement DURABILITY RELAXED mode: use group commit batch window
+  - [x] 3.7 Implement checkpoint trigger: when WAL exceeds 512 MB or 60 seconds since last checkpoint
+  - [x] 3.8 Implement WAL recovery: replay from last CHECKPOINT, verify XXH3-64 per record, skip corrupt records, stop at first checksum failure
+  - [x] 3.9 Write tests: WAL write/read round-trip, group commit batching, checkpoint trigger, recovery with corrupt records, recovery time < 30s
 
-- [ ] 4. Implement Memtable — galaxdb-storage (Req 1)
-  - [ ] 4.1 Implement `Memtable` struct with 16-shard `Mutex<SkipMap>` using crossbeam-skiplist, shard selection via `xxh3_64(key) % 16`
-  - [ ] 4.2 Implement `VersionedValue` with MVCC version chains (timestamp, value, prev pointer)
-  - [ ] 4.3 Implement insert/update: acquire shard mutex, write versioned value, update AtomicU64 size counter
-  - [ ] 4.4 Implement seal logic: when size >= 64 MB, atomically swap to new empty memtable, enqueue sealed for flush
-  - [ ] 4.5 Implement back-pressure: Semaphore with 256 MB capacity tracking sealed-but-unflushed bytes, block writers when exceeded
-  - [ ] 4.6 Implement read path: copy value bytes out of Entry handle immediately, drop handle before any async boundary (epoch safety)
-  - [ ] 4.7 Write tests: concurrent writes to different shards (no contention), same-key serialization, seal threshold, back-pressure blocking, epoch safety
+- [x] 4. Implement Memtable — galaxdb-storage (Req 1)
+  - [x] 4.1 Implement `Memtable` struct with 16-shard `Mutex<SkipMap>` using crossbeam-skiplist, shard selection via `xxh3_64(key) % 16`
+  - [x] 4.2 Implement `VersionedValue` with MVCC version chains (timestamp, value, prev pointer)
+  - [x] 4.3 Implement insert/update: acquire shard mutex, write versioned value, update AtomicU64 size counter
+  - [x] 4.4 Implement seal logic: when size >= 64 MB, atomically swap to new empty memtable, enqueue sealed for flush
+  - [x] 4.5 Implement back-pressure: Semaphore with 256 MB capacity tracking sealed-but-unflushed bytes, block writers when exceeded
+  - [x] 4.6 Implement read path: copy value bytes out of Entry handle immediately, drop handle before any async boundary (epoch safety)
+  - [x] 4.7 Write tests: concurrent writes to different shards (no contention), same-key serialization, seal threshold, back-pressure blocking, epoch safety
 
-- [ ] 5. Implement PAX block format — galaxdb-storage (Req 2)
-  - [ ] 5.1 Define PAX block header: magic (0x47414C41), format_version, block_id, row_count, commit_timestamp, column_count, column_descriptors (col_type, codec, offset, compressed_len, zone_map_min, zone_map_max)
-  - [ ] 5.2 Implement column chunk writer: fixed-width columns with delta encoding + bit-packing (FastPFOR), variable-width with Zstandard L3, embedding columns uncompressed
-  - [ ] 5.3 Implement row offset table at end of block
-  - [ ] 5.4 Implement XXH3-64 checksum computation over entire block, stored at block footer
-  - [ ] 5.5 Implement block reader with checksum + magic number verification, reject on mismatch
-  - [ ] 5.6 Implement zone map extraction (min/max per column) during block write
-  - [ ] 5.7 Write tests: write/read round-trip, checksum verification, corrupt block rejection, compression correctness per column type
+- [x] 5. Implement PAX block format — galaxdb-storage (Req 2)
+  - [x] 5.1 Define PAX block header: magic (0x47414C41), format_version, block_id, row_count, commit_timestamp, column_count, column_descriptors (col_type, codec, offset, compressed_len, zone_map_min, zone_map_max)
+  - [x] 5.2 Implement column chunk writer: fixed-width columns with delta encoding + bit-packing (FastPFOR), variable-width with Zstandard L3, embedding columns uncompressed
+  - [x] 5.3 Implement row offset table at end of block
+  - [x] 5.4 Implement XXH3-64 checksum computation over entire block, stored at block footer
+  - [x] 5.5 Implement block reader with checksum + magic number verification, reject on mismatch
+  - [x] 5.6 Implement zone map extraction (min/max per column) during block write
+  - [x] 5.7 Write tests: write/read round-trip, checksum verification, corrupt block rejection, compression correctness per column type
 
 - [ ] 6. Implement memtable flush to SST — galaxdb-storage (Reqs 1, 2)
-  - [ ] 6.1 Implement flush pipeline: sealed memtable → sort by primary key → write PAX blocks → write to disk via IoScheduler → TDE encryption
-  - [ ] 6.2 Integrate WAL: write CHECKPOINT record after successful flush, truncate WAL
-  - [ ] 6.3 Write tests: flush produces valid PAX blocks, checkpoint advances WAL truncation point
+  - [~] 6.1 Implement flush pipeline: sealed memtable → sort by primary key → write PAX blocks → write to disk via IoScheduler → TDE encryption
+  - [~] 6.2 Integrate WAL: write CHECKPOINT record after successful flush, truncate WAL
+  - [~] 6.3 Write tests: flush produces valid PAX blocks, checkpoint advances WAL truncation point
 
 - [ ] 7. Implement ART primary key index — galaxdb-storage (Req 3)
-  - [ ] 7.1 Implement Adaptive Radix Tree with Node4, Node16, Node48, Node256 node types and path compression (Leis et al., ICDE 2013)
-  - [ ] 7.2 Implement `RowLocation` enum: Memtable { shard, key } or SST { sst_id, block_offset, row_offset }
-  - [ ] 7.3 Implement insert/lookup/delete operations on ART
-  - [ ] 7.4 Implement ART rebuild from SST files + WAL replay for crash recovery
-  - [ ] 7.5 Write tests: insert/lookup correctness, rebuild from SSTs, concurrent read/write safety
+  - [~] 7.1 Implement Adaptive Radix Tree with Node4, Node16, Node48, Node256 node types and path compression (Leis et al., ICDE 2013)
+  - [~] 7.2 Implement `RowLocation` enum: Memtable { shard, key } or SST { sst_id, block_offset, row_offset }
+  - [~] 7.3 Implement insert/lookup/delete operations on ART
+  - [~] 7.4 Implement ART rebuild from SST files + WAL replay for crash recovery
+  - [~] 7.5 Write tests: insert/lookup correctness, rebuild from SSTs, concurrent read/write safety
 
 - [ ] 8. Implement Bloom filters with Monkey allocation — galaxdb-storage (Req 4)
-  - [ ] 8.1 Implement per-SST Bloom filter construction with configurable bits-per-key
-  - [ ] 8.2 Implement Monkey-optimal FPR allocation: `FPR(level_i) = budget * (ratio^(L-i)) / sum(ratio^(L-j))` across LSM levels
-  - [ ] 8.3 Integrate Bloom filter check into point read path: consult filter before disk read, skip SST on negative
-  - [ ] 8.4 Write tests: false-positive rate within Monkey-allocated budget, correct skip behavior
+  - [~] 8.1 Implement per-SST Bloom filter construction with configurable bits-per-key
+  - [~] 8.2 Implement Monkey-optimal FPR allocation: `FPR(level_i) = budget * (ratio^(L-i)) / sum(ratio^(L-j))` across LSM levels
+  - [~] 8.3 Integrate Bloom filter check into point read path: consult filter before disk read, skip SST on negative
+  - [~] 8.4 Write tests: false-positive rate within Monkey-allocated budget, correct skip behavior
 
 - [ ] 9. Implement NUMA-aware buffer pool — galaxdb-storage (Req 5)
-  - [ ] 9.1 Implement `BufferPool` with HotSet (70% RAM, LRU eviction) and ScanBuffer (30% RAM, clock-sweep eviction)
-  - [ ] 9.2 Implement `NumaPartitioned<T>` wrapper: detect NUMA node via libnuma (Linux) or single partition fallback (macOS/Windows)
-  - [ ] 9.3 Implement routing: point lookups → HotSet, sequential scans → ScanBuffer
-  - [ ] 9.4 Implement eviction constraint: ScanBuffer never evicts a HotSet-resident block
-  - [ ] 9.5 Write tests: LRU eviction correctness, clock-sweep correctness, NUMA allocation on Linux, cross-partition isolation
+  - [~] 9.1 Implement `BufferPool` with HotSet (70% RAM, LRU eviction) and ScanBuffer (30% RAM, clock-sweep eviction)
+  - [~] 9.2 Implement `NumaPartitioned<T>` wrapper: detect NUMA node via libnuma (Linux) or single partition fallback (macOS/Windows)
+  - [~] 9.3 Implement routing: point lookups → HotSet, sequential scans → ScanBuffer
+  - [~] 9.4 Implement eviction constraint: ScanBuffer never evicts a HotSet-resident block
+  - [~] 9.5 Write tests: LRU eviction correctness, clock-sweep correctness, NUMA allocation on Linux, cross-partition isolation
 
 - [ ] 10. Implement Lazy Leveling compaction with MVCC GC — galaxdb-storage (Req 6)
-  - [ ] 10.1 Implement LSM level structure: L0 tiered (up to 4 files), L1-L3 tiered, L4 leveled
-  - [ ] 10.2 Implement compaction trigger: L0 file count threshold, level size ratio threshold
-  - [ ] 10.3 Implement merge iterator: merge sorted runs, apply MVCC GC (discard versions not needed by active snapshots or pinned tags)
-  - [ ] 10.4 Implement compaction output: write new SST files (64 MB default), build Bloom filters, update ART index
-  - [ ] 10.5 Implement pinned tag awareness: retain all versions referenced by any pinned VersionTag
-  - [ ] 10.6 Write tests: compaction produces correct merged output, MVCC GC discards old versions, pinned versions retained
+  - [~] 10.1 Implement LSM level structure: L0 tiered (up to 4 files), L1-L3 tiered, L4 leveled
+  - [~] 10.2 Implement compaction trigger: L0 file count threshold, level size ratio threshold
+  - [~] 10.3 Implement merge iterator: merge sorted runs, apply MVCC GC (discard versions not needed by active snapshots or pinned tags)
+  - [~] 10.4 Implement compaction output: write new SST files (64 MB default), build Bloom filters, update ART index
+  - [~] 10.5 Implement pinned tag awareness: retain all versions referenced by any pinned VersionTag
+  - [~] 10.6 Write tests: compaction produces correct merged output, MVCC GC discards old versions, pinned versions retained
 
 - [ ] 11. Implement KV separation — Blob Log (Req 8)
-  - [ ] 11.1 Implement `BlobLog` with multi-queue parallel writers (4 queues default)
-  - [ ] 11.2 Implement WAL-time separation: during WAL entry construction, if value > 1 KB, write to blob log, store 32-byte content hash + BlobRef in memtable
-  - [ ] 11.3 Implement transparent blob fetch on read: detect BlobRef in PAX block, fetch from blob log
-  - [ ] 11.4 Implement blob GC: background task compacts blob files when discardable space > 50%
-  - [ ] 11.5 Write tests: large value separation, transparent read, GC reclaims space
+  - [~] 11.1 Implement `BlobLog` with multi-queue parallel writers (4 queues default)
+  - [~] 11.2 Implement WAL-time separation: during WAL entry construction, if value > 1 KB, write to blob log, store 32-byte content hash + BlobRef in memtable
+  - [~] 11.3 Implement transparent blob fetch on read: detect BlobRef in PAX block, fetch from blob log
+  - [~] 11.4 Implement blob GC: background task compacts blob files when discardable space > 50%
+  - [~] 11.5 Write tests: large value separation, transparent read, GC reclaims space
 
 - [ ] 12. Implement TDE encryption — galaxdb-crypto (Req 9)
-  - [ ] 12.1 Implement `TdeModule` with AES-256-GCM encryption/decryption using `aes-gcm` crate
-  - [ ] 12.2 Implement AWS KMS integration: `GenerateDataKey` for DEK, cache plaintext DEK in memory
-  - [ ] 12.3 Implement counter-based 96-bit nonce generation per block/record
-  - [ ] 12.4 Integrate TDE into PAX block write path: encrypt before IoScheduler write
-  - [ ] 12.5 Integrate TDE into WAL write path: encrypt each record before disk write
-  - [ ] 12.6 Implement TDE into read path: decrypt after IoScheduler read
-  - [ ] 12.7 Write tests: encrypt/decrypt round-trip, AES-NI acceleration detection, nonce uniqueness
+  - [~] 12.1 Implement `TdeModule` with AES-256-GCM encryption/decryption using `aes-gcm` crate
+  - [~] 12.2 Implement AWS KMS integration: `GenerateDataKey` for DEK, cache plaintext DEK in memory
+  - [~] 12.3 Implement counter-based 96-bit nonce generation per block/record
+  - [~] 12.4 Integrate TDE into PAX block write path: encrypt before IoScheduler write
+  - [~] 12.5 Integrate TDE into WAL write path: encrypt each record before disk write
+  - [~] 12.6 Implement TDE into read path: decrypt after IoScheduler read
+  - [~] 12.7 Write tests: encrypt/decrypt round-trip, AES-NI acceleration detection, nonce uniqueness
 
 - [ ] 13. Implement statistics collection — galaxdb-storage (Req 10)
   - [ ] 13.1 Define `TableStatistics`, `ColumnStats` (NDV, null_fraction, equi-height histogram), `CorrelationStats` structs

@@ -1,0 +1,20 @@
+[package]
+name = "galaxdb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "LSM, PAX, WAL, Memtable, ART, Bloom, Buffer Pool, Blob Log, Compactor"
+
+[dependencies]
+galaxdb-common.workspace = true
+crossbeam-skiplist.workspace = true
+xxhash-rust.workspace = true
+lz4_flex.workspace = true
+zstd.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["full"] }
