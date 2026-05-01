@@ -45,17 +45,17 @@
   - [x] 5.6 Implement zone map extraction (min/max per column) during block write
   - [x] 5.7 Write tests: write/read round-trip, checksum verification, corrupt block rejection, compression correctness per column type
 
-- [ ] 6. Implement memtable flush to SST — galaxdb-storage (Reqs 1, 2)
-  - [~] 6.1 Implement flush pipeline: sealed memtable → sort by primary key → write PAX blocks → write to disk via IoScheduler → TDE encryption
-  - [~] 6.2 Integrate WAL: write CHECKPOINT record after successful flush, truncate WAL
-  - [~] 6.3 Write tests: flush produces valid PAX blocks, checkpoint advances WAL truncation point
+- [x] 6. Implement memtable flush to SST — galaxdb-storage (Reqs 1, 2)
+  - [x] 6.1 Implement flush pipeline: sealed memtable → sort by primary key → write PAX blocks → write to disk via IoScheduler → TDE encryption
+  - [x] 6.2 Integrate WAL: write CHECKPOINT record after successful flush, truncate WAL
+  - [x] 6.3 Write tests: flush produces valid PAX blocks, checkpoint advances WAL truncation point
 
-- [ ] 7. Implement ART primary key index — galaxdb-storage (Req 3)
-  - [~] 7.1 Implement Adaptive Radix Tree with Node4, Node16, Node48, Node256 node types and path compression (Leis et al., ICDE 2013)
-  - [~] 7.2 Implement `RowLocation` enum: Memtable { shard, key } or SST { sst_id, block_offset, row_offset }
-  - [~] 7.3 Implement insert/lookup/delete operations on ART
-  - [~] 7.4 Implement ART rebuild from SST files + WAL replay for crash recovery
-  - [~] 7.5 Write tests: insert/lookup correctness, rebuild from SSTs, concurrent read/write safety
+- [x] 7. Implement ART primary key index — galaxdb-storage (Req 3)
+  - [x] 7.1 Implement Adaptive Radix Tree with Node4, Node16, Node48, Node256 node types and path compression (Leis et al., ICDE 2013)
+  - [x] 7.2 Implement `RowLocation` enum: Memtable { shard, key } or SST { sst_id, block_offset, row_offset }
+  - [x] 7.3 Implement insert/lookup/delete operations on ART
+  - [x] 7.4 Implement ART rebuild from SST files + WAL replay for crash recovery
+  - [x] 7.5 Write tests: insert/lookup correctness, rebuild from SSTs, concurrent read/write safety
 
 - [ ] 8. Implement Bloom filters with Monkey allocation — galaxdb-storage (Req 4)
   - [~] 8.1 Implement per-SST Bloom filter construction with configurable bits-per-key

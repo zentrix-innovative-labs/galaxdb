@@ -18,4 +18,4 @@ mod writer;
 mod tests;
 
 pub use record::{WalRecord, WalRecordType};
-pub use writer::{DurabilityMode, WalWriter, WalWriterConfig, CheckpointInfo};
+pub use writer::{DurabilityMode, WalWriter, WalWriterConfig, CheckpointInfo, recover_wal};
