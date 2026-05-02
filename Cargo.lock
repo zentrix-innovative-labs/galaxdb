@@ -465,6 +465,7 @@ dependencies = [
  "galaxdb-storage",
  "hdrhistogram",
  "rand",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

@@ -497,7 +497,7 @@ fn create_pax_block_with_zone_map(
 async fn run_olap(
     duration_secs: u64,
     _warmup_secs: u64,
-    _num_threads: usize,
+    num_threads: usize,
 ) -> OlapResult {
     eprintln!("[OLAP] Creating 1000 PAX blocks with 10K rows each...");
 
@@ -519,81 +519,105 @@ async fn run_olap(
         blocks.push(block);
     }
 
-    eprintln!("[OLAP] Pre-population complete. Starting scan benchmark ({} seconds)...", duration_secs);
+    // Also serialize blocks to simulate reading from disk (measures decompression, not just in-memory access)
+    let serialized_blocks: Vec<Vec<u8>> = blocks
+        .iter()
+        .map(|b| b.serialize().expect("serialize"))
+        .collect();
 
-    let threshold = 100i32; // WHERE col < 100
-    let _threshold_bytes = threshold.to_le_bytes().to_vec();
+    eprintln!(
+        "[OLAP] Pre-population complete. {} blocks, {} bytes total serialized. Starting parallel scan ({} threads, {} seconds)...",
+        blocks.len(),
+        serialized_blocks.iter().map(|b| b.len() as u64).sum::<u64>(),
+        num_threads,
+        duration_secs
+    );
+
+    // Configure rayon thread pool to match requested thread count
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .expect("failed to build rayon thread pool");
+
+    let threshold = 100i32;
 
     let deadline = Instant::now() + Duration::from_secs(duration_secs);
-    let mut total_bytes_scanned: u64 = 0;
-    let mut total_blocks_scanned: u64 = 0;
-    let mut total_blocks_skipped: u64 = 0;
-    let mut scan_iterations: u64 = 0;
+    let total_bytes_scanned = AtomicU64::new(0);
+    let total_blocks_scanned = AtomicU64::new(0);
+    let total_blocks_skipped = AtomicU64::new(0);
+    let scan_iterations = AtomicU64::new(0);
 
-    while Instant::now() < deadline {
-        for block in &blocks {
-            if Instant::now() >= deadline {
-                break;
-            }
+    pool.install(|| {
+        while Instant::now() < deadline {
+            // Parallel scan: each thread picks up blocks and processes them
+            use rayon::prelude::*;
 
-            // Zone-map pruning: check if the Int32 column's max < threshold
-            let desc = &block.header.column_descriptors[0];
-            let zone_max = &desc.zone_map_max;
-
-            // Compare zone map max against threshold
-            // For Int32 LE bytes, we need to interpret as i32
-            let _block_max = if zone_max.len() >= 4 {
-                i32::from_le_bytes(zone_max[..4].try_into().unwrap_or([0; 4]))
-            } else {
-                i32::MAX
-            };
-
-            let block_min = {
-                let zone_min = &desc.zone_map_min;
-                if zone_min.len() >= 4 {
-                    i32::from_le_bytes(zone_min[..4].try_into().unwrap_or([0; 4]))
-                } else {
-                    i32::MIN
+            serialized_blocks.par_iter().for_each(|serialized| {
+                if Instant::now() >= deadline {
+                    return;
                 }
-            };
 
-            // Skip block if all values are >= threshold (min >= threshold)
-            if block_min >= threshold {
-                total_blocks_skipped += 1;
-                total_blocks_scanned += 1;
-                continue;
-            }
+                // Deserialize (simulates reading from NVMe + checksum verification)
+                let block = match PaxBlock::deserialize(serialized) {
+                    Ok(b) => b,
+                    Err(_) => return,
+                };
 
-            // Decompress and scan the Int32 column
-            let values = block.read_column(0).expect("failed to read column");
-            let _matching: usize = values
-                .iter()
-                .filter(|v| {
-                    if v.len() >= 4 {
-                        let val = i32::from_le_bytes(v[..4].try_into().unwrap());
-                        val < threshold
+                // Zone-map pruning
+                let desc = &block.header.column_descriptors[0];
+                let block_min = {
+                    let zone_min = &desc.zone_map_min;
+                    if zone_min.len() >= 4 {
+                        i32::from_le_bytes(zone_min[..4].try_into().unwrap_or([0; 4]))
                     } else {
-                        false
+                        i32::MIN
                     }
-                })
-                .count();
+                };
 
-            // Count bytes scanned (compressed column data size)
-            total_bytes_scanned += block.column_data.len() as u64;
-            total_blocks_scanned += 1;
+                total_blocks_scanned.fetch_add(1, Ordering::Relaxed);
+
+                // Skip block if all values are >= threshold
+                if block_min >= threshold {
+                    total_blocks_skipped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+
+                // Decompress and scan the Int32 column
+                let values = block.read_column(0).expect("failed to read column");
+                let _matching: usize = values
+                    .iter()
+                    .filter(|v| {
+                        if v.len() >= 4 {
+                            let val = i32::from_le_bytes(v[..4].try_into().unwrap());
+                            val < threshold
+                        } else {
+                            false
+                        }
+                    })
+                    .count();
+
+                // Count bytes processed (serialized block size = what we'd read from NVMe)
+                total_bytes_scanned.fetch_add(serialized.len() as u64, Ordering::Relaxed);
+            });
+
+            scan_iterations.fetch_add(1, Ordering::Relaxed);
         }
-        scan_iterations += 1;
-    }
+    });
+
+    let total_bytes = total_bytes_scanned.load(Ordering::Relaxed);
+    let total_scanned = total_blocks_scanned.load(Ordering::Relaxed);
+    let total_skipped = total_blocks_skipped.load(Ordering::Relaxed);
+    let iterations = scan_iterations.load(Ordering::Relaxed);
 
     let actual_secs = duration_secs as f64;
     let throughput_gbps = if actual_secs > 0.0 {
-        (total_bytes_scanned as f64) / (1024.0 * 1024.0 * 1024.0) / actual_secs
+        (total_bytes as f64) / (1024.0 * 1024.0 * 1024.0) / actual_secs
     } else {
         0.0
     };
 
-    let skip_pct = if total_blocks_scanned > 0 {
-        (total_blocks_skipped as f64 / total_blocks_scanned as f64) * 100.0
+    let skip_pct = if total_scanned > 0 {
+        (total_skipped as f64 / total_scanned as f64) * 100.0
     } else {
         0.0
     };
@@ -601,14 +625,14 @@ async fn run_olap(
     let pass = throughput_gbps >= 3.0 && skip_pct >= 80.0;
 
     eprintln!(
-        "[OLAP] Done. throughput={:.2} GB/s, scanned={}, skipped={}, skip_pct={:.1}%, iterations={}, pass={}",
-        throughput_gbps, total_blocks_scanned, total_blocks_skipped, skip_pct, scan_iterations, pass
+        "[OLAP] Done. throughput={:.2} GB/s, scanned={}, skipped={}, skip_pct={:.1}%, iterations={}, threads={}, pass={}",
+        throughput_gbps, total_scanned, total_skipped, skip_pct, iterations, num_threads, pass
     );
 
     OlapResult {
         scan_throughput_gbps: (throughput_gbps * 100.0).round() / 100.0,
-        blocks_scanned: total_blocks_scanned,
-        blocks_skipped: total_blocks_skipped,
+        blocks_scanned: total_scanned,
+        blocks_skipped: total_skipped,
         zone_map_skip_pct: (skip_pct * 10.0).round() / 10.0,
         duration_secs,
         pass,

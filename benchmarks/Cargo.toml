@@ -9,6 +9,7 @@ galaxdb-storage = { path = "../crates/galaxdb-storage" }
 galaxdb-io = { path = "../crates/galaxdb-io" }
 tokio = { version = "1", features = ["full"] }
 rand = { version = "0.8", features = ["small_rng"] }
+rayon = "1"
 hdrhistogram = "7"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
