@@ -123,17 +123,17 @@
 
 ## Month 2: SQL Layer & Wire Protocol
 
-- [ ] 17. Implement SQL parser with AuroraSQL extensions — galaxdb-sql (Req 12)
-  - [ ] 17.1 Add `sqlparser` crate dependency, create `AuroraSqlDialect` extending PostgreSQL dialect
-  - [ ] 17.2 Implement parsing for standard DDL: CREATE TABLE, DROP TABLE, ALTER TABLE
-  - [ ] 17.3 Implement parsing for standard DML: INSERT, SELECT, UPDATE, DELETE
-  - [ ] 17.4 Implement parsing for `EMBEDDING MODEL 'name' DIM n` in CREATE TABLE column definitions
-  - [ ] 17.5 Implement parsing for `SEMANTIC_MATCH(col, 'query', threshold)` predicate
-  - [ ] 17.6 Implement parsing for `AT VERSION timestamp_or_tag` with optional `CONSISTENCY 'ROW_SNAPSHOT'|'SEMANTIC_FRESH'`
-  - [ ] 17.7 Implement parsing for `CREATE VERSION TAG 'name' [FOR TRAINING [WITH TRAINING PRECISION 'sq8'|'rabitq'|'float32'] [TRAINING SEED n]]`
-  - [ ] 17.8 Implement parsing for `BULK INSERT`, `SHOW EMBEDDING HEALTH`, `BACKUP TO`, `RESTORE FROM`, `ANALYZE`
-  - [ ] 17.9 Implement descriptive parse error messages with byte offset position
-  - [ ] 17.10 Write tests: parse every AuroraSQL extension, error messages with positions, round-trip standard SQL
+- [x] 17. Implement SQL parser with AuroraSQL extensions — galaxdb-sql (Req 12)
+  - [x] 17.1 Add `sqlparser` crate dependency, create `AuroraSqlDialect` extending PostgreSQL dialect
+  - [x] 17.2 Implement parsing for standard DDL: CREATE TABLE, DROP TABLE, ALTER TABLE
+  - [x] 17.3 Implement parsing for standard DML: INSERT, SELECT, UPDATE, DELETE
+  - [x] 17.4 Implement parsing for `EMBEDDING MODEL 'name' DIM n` in CREATE TABLE column definitions
+  - [x] 17.5 Implement parsing for `SEMANTIC_MATCH(col, 'query', threshold)` predicate
+  - [x] 17.6 Implement parsing for `AT VERSION timestamp_or_tag` with optional `CONSISTENCY 'ROW_SNAPSHOT'|'SEMANTIC_FRESH'`
+  - [x] 17.7 Implement parsing for `CREATE VERSION TAG 'name' [FOR TRAINING [WITH TRAINING PRECISION 'sq8'|'rabitq'|'float32'] [TRAINING SEED n]]`
+  - [x] 17.8 Implement parsing for `BULK INSERT`, `SHOW EMBEDDING HEALTH`, `BACKUP TO`, `RESTORE FROM`, `ANALYZE`
+  - [x] 17.9 Implement descriptive parse error messages with byte offset position
+  - [x] 17.10 Write tests: parse every AuroraSQL extension, error messages with positions, round-trip standard SQL
 
 - [ ] 18. Implement query planner and executor — galaxdb-sql (Reqs 14, 15, 22)
   - [ ] 18.1 Define `QueryPlan` enum: PointLookup, FullScan, SemanticSearch, HybridSearch, Insert, Update, Delete, BulkInsert, CreateTable, DropTable, CreateVersionTag, Backup, Restore, Analyze, ShowEmbeddingHealth

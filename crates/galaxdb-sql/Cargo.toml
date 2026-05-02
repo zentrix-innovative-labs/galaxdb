@@ -8,3 +8,7 @@ description = "SQL Parser (sqlparser-rs + AuroraSQL), Query Planner, Query Execu
 
 [dependencies]
 galaxdb-common.workspace = true
+sqlparser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
