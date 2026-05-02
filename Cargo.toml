@@ -13,6 +13,8 @@ members = [
     "crates/galaxdb-observe",
     "crates/galaxdb-server",
     "crates/galaxdb-embedded",
+    "benchmarks",
+    "tests/chaos",
 ]
 
 [workspace.package]

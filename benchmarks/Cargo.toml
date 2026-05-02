@@ -1,0 +1,16 @@
+[package]
+name = "galaxdb-benchmarks"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+galaxdb-common = { path = "../crates/galaxdb-common" }
+galaxdb-storage = { path = "../crates/galaxdb-storage" }
+galaxdb-io = { path = "../crates/galaxdb-io" }
+tokio = { version = "1", features = ["full"] }
+rand = { version = "0.8", features = ["small_rng"] }
+hdrhistogram = "7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tempfile = "3"
