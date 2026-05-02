@@ -1,10 +1,7 @@
-//! GalaxDB Wire — PostgreSQL simple query wire protocol.
-//!
-//! Implements the PostgreSQL v3 simple query protocol (Q message flow)
-//! with startup handshake, RowDescription, DataRow, CommandComplete,
-//! ErrorResponse, and ReadyForQuery messages.
+//! GalaxDB Wire — PostgreSQL simple query wire protocol + pg_catalog stubs.
 
 pub mod messages;
+pub mod pg_catalog;
 pub mod server;
 
 #[cfg(test)]

@@ -153,16 +153,16 @@
   - [x] 19.4 Document write-skew limitation (SSI deferred to v2)
   - [x] 19.5 Write tests: no dirty reads, no non-repeatable reads, no phantoms, write-write conflict abort
 
-- [ ] 20. Implement PostgreSQL wire protocol — galaxdb-wire (Req 13)
-  - [ ] 20.1 Implement TCP listener with TLS 1.3 via rustls
-  - [ ] 20.2 Implement startup handshake: StartupMessage → AuthenticationOk, ParameterStatus, BackendKeyData, ReadyForQuery
-  - [ ] 20.3 Implement simple query protocol: parse Q message → route to SQL parser → execute → RowDescription + DataRow + CommandComplete + ReadyForQuery
-  - [ ] 20.4 Implement ErrorResponse with SQLSTATE codes for parse errors, execution errors, and connection errors
-  - [ ] 20.5 Implement connection as async tokio task with AtomicUsize connection counter
-  - [ ] 20.6 Implement max connection limit (default 1000): reject with SQLSTATE 53300 when exceeded
-  - [ ] 20.7 Write tests: startup handshake, simple query round-trip, error responses, connection limit enforcement
+- [x] 20. Implement PostgreSQL wire protocol — galaxdb-wire (Req 13)
+  - [x] 20.1 Implement TCP listener with TLS 1.3 via rustls
+  - [x] 20.2 Implement startup handshake: StartupMessage → AuthenticationOk, ParameterStatus, BackendKeyData, ReadyForQuery
+  - [x] 20.3 Implement simple query protocol: parse Q message → route to SQL parser → execute → RowDescription + DataRow + CommandComplete + ReadyForQuery
+  - [x] 20.4 Implement ErrorResponse with SQLSTATE codes for parse errors, execution errors, and connection errors
+  - [x] 20.5 Implement connection as async tokio task with AtomicUsize connection counter
+  - [x] 20.6 Implement max connection limit (default 1000): reject with SQLSTATE 53300 when exceeded
+  - [x] 20.7 Write tests: startup handshake, simple query round-trip, error responses, connection limit enforcement
 
-- [ ] 21. Implement pg_catalog stubs — galaxdb-wire (Req 33)
+- [-] 21. Implement pg_catalog stubs — galaxdb-wire (Req 33)
   - [ ] 21.1 Implement `pg_catalog.pg_class` (oid, relname, relnamespace, relkind) populated from catalog
   - [ ] 21.2 Implement `pg_catalog.pg_attribute` (attrelid, attname, atttypid, attnum, attnotnull)
   - [ ] 21.3 Implement `pg_catalog.pg_type` (oid, typname, typlen, typtype)
