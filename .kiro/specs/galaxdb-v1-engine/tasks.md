@@ -85,40 +85,40 @@
   - [x] 11.4 Implement blob GC: background task compacts blob files when discardable space > 50%
   - [x] 11.5 Write tests: large value separation, transparent read, GC reclaims space
 
-- [ ] 12. Implement TDE encryption — galaxdb-crypto (Req 9)
-  - [ ] 12.1 Implement `TdeModule` with AES-256-GCM encryption/decryption using `aes-gcm` crate
-  - [ ] 12.2 Implement AWS KMS integration: `GenerateDataKey` for DEK, cache plaintext DEK in memory
-  - [ ] 12.3 Implement counter-based 96-bit nonce generation per block/record
-  - [ ] 12.4 Integrate TDE into PAX block write path: encrypt before IoScheduler write
-  - [ ] 12.5 Integrate TDE into WAL write path: encrypt each record before disk write
-  - [ ] 12.6 Implement TDE into read path: decrypt after IoScheduler read
-  - [ ] 12.7 Write tests: encrypt/decrypt round-trip, AES-NI acceleration detection, nonce uniqueness
+- [x] 12. Implement TDE encryption — galaxdb-crypto (Req 9)
+  - [x] 12.1 Implement `TdeModule` with AES-256-GCM encryption/decryption using `aes-gcm` crate
+  - [x] 12.2 Implement pluggable key management via `KeyProvider` trait with LocalKeyProvider, EnvKeyProvider, and AwsKmsKeyProvider (stub behind feature flag)
+  - [x] 12.3 Implement counter-based 96-bit nonce generation per block/record
+  - [x] 12.4 Integrate TDE into PAX block write path: encrypt before IoScheduler write
+  - [x] 12.5 Integrate TDE into WAL write path: encrypt each record before disk write
+  - [x] 12.6 Implement TDE into read path: decrypt after IoScheduler read
+  - [x] 12.7 Write tests: encrypt/decrypt round-trip, AES-NI acceleration detection, nonce uniqueness
 
-- [ ] 13. Implement statistics collection — galaxdb-storage (Req 10)
-  - [ ] 13.1 Define `TableStatistics`, `ColumnStats` (NDV, null_fraction, equi-height histogram), `CorrelationStats` structs
-  - [ ] 13.2 Implement ANALYZE command: background tokio task, reservoir sampling of PAX blocks, HyperLogLog for NDV, histogram construction
-  - [ ] 13.3 Implement multi-column correlation statistics following PostgreSQL extended statistics model
-  - [ ] 13.4 Store statistics in catalog, expose to query planner for selectivity estimation
-  - [ ] 13.5 Write tests: NDV accuracy, histogram bucket distribution, correlation computation
+- [x] 13. Implement statistics collection — galaxdb-storage (Req 10)
+  - [x] 13.1 Define `TableStatistics`, `ColumnStats` (NDV, null_fraction, equi-height histogram), `CorrelationStats` structs
+  - [x] 13.2 Implement ANALYZE command: background tokio task, reservoir sampling of PAX blocks, HyperLogLog for NDV, histogram construction
+  - [x] 13.3 Implement multi-column correlation statistics following PostgreSQL extended statistics model
+  - [x] 13.4 Store statistics in catalog, expose to query planner for selectivity estimation
+  - [x] 13.5 Write tests: NDV accuracy, histogram bucket distribution, correlation computation
 
-- [ ] 14. Implement disk full handling — galaxdb-storage (Req 31)
-  - [ ] 14.1 Pre-allocate 32 MB reserve file (`_galaxdb_reserve`) at engine startup
-  - [ ] 14.2 On disk-full detection: delete reserve file, perform clean checkpoint, block writes, emit metric
-  - [ ] 14.3 Write tests: disk-full simulation, clean checkpoint before stop, no data corruption
+- [x] 14. Implement disk full handling — galaxdb-storage (Req 31)
+  - [x] 14.1 Pre-allocate 32 MB reserve file (`_galaxdb_reserve`) at engine startup
+  - [x] 14.2 On disk-full detection: delete reserve file, perform clean checkpoint, block writes, emit metric
+  - [x] 14.3 Write tests: disk-full simulation, clean checkpoint before stop, no data corruption
 
-- [ ] 15. Implement write stall mitigation — RateLimiter (Req 29)
-  - [ ] 15.1 Implement auto-tuned token-bucket `RateLimiter`: calibrate max rate at startup (70% of NVMe write bandwidth)
-  - [ ] 15.2 Integrate with IoScheduler latency reports: lower ceiling by 30% when HP-queue P99 exceeds 1.5× baseline for 3 consecutive 100 ms windows
-  - [ ] 15.3 Restore ceiling when latency returns to normal
-  - [ ] 15.4 Integrate with compactor and flush tasks: acquire tokens before I/O
-  - [ ] 15.5 Write tests: rate limiting under load, dynamic ceiling adjustment
+- [x] 15. Implement write stall mitigation — RateLimiter (Req 29)
+  - [x] 15.1 Implement auto-tuned token-bucket `RateLimiter`: calibrate max rate at startup (70% of NVMe write bandwidth)
+  - [x] 15.2 Integrate with IoScheduler latency reports: lower ceiling by 30% when HP-queue P99 exceeds 1.5× baseline for 3 consecutive 100 ms windows
+  - [x] 15.3 Restore ceiling when latency returns to normal
+  - [x] 15.4 Integrate with compactor and flush tasks: acquire tokens before I/O
+  - [x] 15.5 Write tests: rate limiting under load, dynamic ceiling adjustment
 
-- [ ] 16. Implement write stall mitigation — WriteController (Req 30)
-  - [ ] 16.1 Implement `WriteController` with soft limit (32 GB default) and hard limit (64 GB default)
-  - [ ] 16.2 Implement 1 ms check interval: read pending compaction bytes, apply proportional slowdown between soft and hard limits
-  - [ ] 16.3 Implement hard stop: block all writes when pending >= hard limit
-  - [ ] 16.4 Implement recovery: restore full throughput when pending < soft limit
-  - [ ] 16.5 Write tests: gradual slowdown, hard stop, recovery to full speed
+- [x] 16. Implement write stall mitigation — WriteController (Req 30)
+  - [x] 16.1 Implement `WriteController` with soft limit (32 GB default) and hard limit (64 GB default)
+  - [x] 16.2 Implement 1 ms check interval: read pending compaction bytes, apply proportional slowdown between soft and hard limits
+  - [x] 16.3 Implement hard stop: block all writes when pending >= hard limit
+  - [x] 16.4 Implement recovery: restore full throughput when pending < soft limit
+  - [x] 16.5 Write tests: gradual slowdown, hard stop, recovery to full speed
 
 
 ## Month 2: SQL Layer & Wire Protocol
