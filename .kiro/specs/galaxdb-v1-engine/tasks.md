@@ -135,18 +135,18 @@
   - [x] 17.9 Implement descriptive parse error messages with byte offset position
   - [x] 17.10 Write tests: parse every AuroraSQL extension, error messages with positions, round-trip standard SQL
 
-- [-] 18. Implement query planner and executor — galaxdb-sql (Reqs 14, 15, 22)
-  - [ ] 18.1 Define `QueryPlan` enum: PointLookup, FullScan, SemanticSearch, HybridSearch, Insert, Update, Delete, BulkInsert, CreateTable, DropTable, CreateVersionTag, Backup, Restore, Analyze, ShowEmbeddingHealth
-  - [ ] 18.2 Implement DDL executor: CREATE TABLE (allocate catalog entry, init ART index, create memtable, register embedding columns with sidecar), DROP TABLE (remove catalog, schedule file deletion)
-  - [ ] 18.3 Implement INSERT executor: write to memtable + WAL, update ART, trigger async embedding for embedding columns
-  - [ ] 18.4 Implement SELECT executor: ART point lookup or full scan with zone-map pruning + Bloom filter checks
-  - [ ] 18.5 Implement UPDATE executor: write new MVCC version; reject if target column is embedding source (return error with DELETE+INSERT suggestion)
-  - [ ] 18.6 Implement DELETE executor: write tombstone to memtable + WAL, write DELTA_TOMBSTONE for vector index
-  - [ ] 18.7 Implement BULK INSERT executor: bypass memtable, write sorted rows directly as PAX blocks
-  - [ ] 18.8 Implement adaptive query planner: estimate filter cardinality from statistics, choose BruteForceFiltered (< 1000 rows or < 0.1%) vs HnswWithPostFilter, log chosen strategy
-  - [ ] 18.9 Write tests: DDL create/drop, INSERT/SELECT/UPDATE/DELETE round-trip, UPDATE-of-embedding-source rejection, BULK INSERT, adaptive planner strategy selection
+- [x] 18. Implement query planner and executor — galaxdb-sql (Reqs 14, 15, 22)
+  - [x] 18.1 Define `QueryPlan` enum: PointLookup, FullScan, SemanticSearch, HybridSearch, Insert, Update, Delete, BulkInsert, CreateTable, DropTable, CreateVersionTag, Backup, Restore, Analyze, ShowEmbeddingHealth
+  - [x] 18.2 Implement DDL executor: CREATE TABLE (allocate catalog entry, init ART index, create memtable, register embedding columns with sidecar), DROP TABLE (remove catalog, schedule file deletion)
+  - [x] 18.3 Implement INSERT executor: write to memtable + WAL, update ART, trigger async embedding for embedding columns
+  - [x] 18.4 Implement SELECT executor: ART point lookup or full scan with zone-map pruning + Bloom filter checks
+  - [x] 18.5 Implement UPDATE executor: write new MVCC version; reject if target column is embedding source (return error with DELETE+INSERT suggestion)
+  - [x] 18.6 Implement DELETE executor: write tombstone to memtable + WAL, write DELTA_TOMBSTONE for vector index
+  - [x] 18.7 Implement BULK INSERT executor: bypass memtable, write sorted rows directly as PAX blocks
+  - [x] 18.8 Implement adaptive query planner: estimate filter cardinality from statistics, choose BruteForceFiltered (< 1000 rows or < 0.1%) vs HnswWithPostFilter, log chosen strategy
+  - [x] 18.9 Write tests: DDL create/drop, INSERT/SELECT/UPDATE/DELETE round-trip, UPDATE-of-embedding-source rejection, BULK INSERT, adaptive planner strategy selection
 
-- [ ] 19. Implement snapshot isolation — galaxdb-sql (Req 16)
+- [-] 19. Implement snapshot isolation — galaxdb-sql (Req 16)
   - [ ] 19.1 Implement `TransactionManager` with monotonic timestamp assignment and active snapshot tracking
   - [ ] 19.2 Implement snapshot read: filter MVCC versions where `commit_ts <= read_timestamp`
   - [ ] 19.3 Implement write-write conflict detection: abort second writer on same key
