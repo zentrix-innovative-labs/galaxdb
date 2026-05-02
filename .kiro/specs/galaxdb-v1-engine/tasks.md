@@ -57,42 +57,42 @@
   - [x] 7.4 Implement ART rebuild from SST files + WAL replay for crash recovery
   - [x] 7.5 Write tests: insert/lookup correctness, rebuild from SSTs, concurrent read/write safety
 
-- [ ] 8. Implement Bloom filters with Monkey allocation — galaxdb-storage (Req 4)
-  - [~] 8.1 Implement per-SST Bloom filter construction with configurable bits-per-key
-  - [~] 8.2 Implement Monkey-optimal FPR allocation: `FPR(level_i) = budget * (ratio^(L-i)) / sum(ratio^(L-j))` across LSM levels
-  - [~] 8.3 Integrate Bloom filter check into point read path: consult filter before disk read, skip SST on negative
-  - [~] 8.4 Write tests: false-positive rate within Monkey-allocated budget, correct skip behavior
+- [x] 8. Implement Bloom filters with Monkey allocation — galaxdb-storage (Req 4)
+  - [x] 8.1 Implement per-SST Bloom filter construction with configurable bits-per-key
+  - [x] 8.2 Implement Monkey-optimal FPR allocation: `FPR(level_i) = budget * (ratio^(L-i)) / sum(ratio^(L-j))` across LSM levels
+  - [x] 8.3 Integrate Bloom filter check into point read path: consult filter before disk read, skip SST on negative
+  - [x] 8.4 Write tests: false-positive rate within Monkey-allocated budget, correct skip behavior
 
-- [ ] 9. Implement NUMA-aware buffer pool — galaxdb-storage (Req 5)
-  - [~] 9.1 Implement `BufferPool` with HotSet (70% RAM, LRU eviction) and ScanBuffer (30% RAM, clock-sweep eviction)
-  - [~] 9.2 Implement `NumaPartitioned<T>` wrapper: detect NUMA node via libnuma (Linux) or single partition fallback (macOS/Windows)
-  - [~] 9.3 Implement routing: point lookups → HotSet, sequential scans → ScanBuffer
-  - [~] 9.4 Implement eviction constraint: ScanBuffer never evicts a HotSet-resident block
-  - [~] 9.5 Write tests: LRU eviction correctness, clock-sweep correctness, NUMA allocation on Linux, cross-partition isolation
+- [x] 9. Implement NUMA-aware buffer pool — galaxdb-storage (Req 5)
+  - [x] 9.1 Implement `BufferPool` with HotSet (70% RAM, LRU eviction) and ScanBuffer (30% RAM, clock-sweep eviction)
+  - [x] 9.2 Implement `NumaPartitioned<T>` wrapper: detect NUMA node via libnuma (Linux) or single partition fallback (macOS/Windows)
+  - [x] 9.3 Implement routing: point lookups → HotSet, sequential scans → ScanBuffer
+  - [x] 9.4 Implement eviction constraint: ScanBuffer never evicts a HotSet-resident block
+  - [x] 9.5 Write tests: LRU eviction correctness, clock-sweep correctness, NUMA allocation on Linux, cross-partition isolation
 
-- [ ] 10. Implement Lazy Leveling compaction with MVCC GC — galaxdb-storage (Req 6)
-  - [~] 10.1 Implement LSM level structure: L0 tiered (up to 4 files), L1-L3 tiered, L4 leveled
-  - [~] 10.2 Implement compaction trigger: L0 file count threshold, level size ratio threshold
-  - [~] 10.3 Implement merge iterator: merge sorted runs, apply MVCC GC (discard versions not needed by active snapshots or pinned tags)
-  - [~] 10.4 Implement compaction output: write new SST files (64 MB default), build Bloom filters, update ART index
-  - [~] 10.5 Implement pinned tag awareness: retain all versions referenced by any pinned VersionTag
-  - [~] 10.6 Write tests: compaction produces correct merged output, MVCC GC discards old versions, pinned versions retained
+- [x] 10. Implement Lazy Leveling compaction with MVCC GC — galaxdb-storage (Req 6)
+  - [x] 10.1 Implement LSM level structure: L0 tiered (up to 4 files), L1-L3 tiered, L4 leveled
+  - [x] 10.2 Implement compaction trigger: L0 file count threshold, level size ratio threshold
+  - [x] 10.3 Implement merge iterator: merge sorted runs, apply MVCC GC (discard versions not needed by active snapshots or pinned tags)
+  - [x] 10.4 Implement compaction output: write new SST files (64 MB default), build Bloom filters, update ART index
+  - [x] 10.5 Implement pinned tag awareness: retain all versions referenced by any pinned VersionTag
+  - [x] 10.6 Write tests: compaction produces correct merged output, MVCC GC discards old versions, pinned versions retained
 
-- [ ] 11. Implement KV separation — Blob Log (Req 8)
-  - [~] 11.1 Implement `BlobLog` with multi-queue parallel writers (4 queues default)
-  - [~] 11.2 Implement WAL-time separation: during WAL entry construction, if value > 1 KB, write to blob log, store 32-byte content hash + BlobRef in memtable
-  - [~] 11.3 Implement transparent blob fetch on read: detect BlobRef in PAX block, fetch from blob log
-  - [~] 11.4 Implement blob GC: background task compacts blob files when discardable space > 50%
-  - [~] 11.5 Write tests: large value separation, transparent read, GC reclaims space
+- [x] 11. Implement KV separation — Blob Log (Req 8)
+  - [x] 11.1 Implement `BlobLog` with multi-queue parallel writers (4 queues default)
+  - [x] 11.2 Implement WAL-time separation: during WAL entry construction, if value > 1 KB, write to blob log, store 32-byte content hash + BlobRef in memtable
+  - [x] 11.3 Implement transparent blob fetch on read: detect BlobRef in PAX block, fetch from blob log
+  - [x] 11.4 Implement blob GC: background task compacts blob files when discardable space > 50%
+  - [x] 11.5 Write tests: large value separation, transparent read, GC reclaims space
 
 - [ ] 12. Implement TDE encryption — galaxdb-crypto (Req 9)
-  - [~] 12.1 Implement `TdeModule` with AES-256-GCM encryption/decryption using `aes-gcm` crate
-  - [~] 12.2 Implement AWS KMS integration: `GenerateDataKey` for DEK, cache plaintext DEK in memory
-  - [~] 12.3 Implement counter-based 96-bit nonce generation per block/record
-  - [~] 12.4 Integrate TDE into PAX block write path: encrypt before IoScheduler write
-  - [~] 12.5 Integrate TDE into WAL write path: encrypt each record before disk write
-  - [~] 12.6 Implement TDE into read path: decrypt after IoScheduler read
-  - [~] 12.7 Write tests: encrypt/decrypt round-trip, AES-NI acceleration detection, nonce uniqueness
+  - [ ] 12.1 Implement `TdeModule` with AES-256-GCM encryption/decryption using `aes-gcm` crate
+  - [ ] 12.2 Implement AWS KMS integration: `GenerateDataKey` for DEK, cache plaintext DEK in memory
+  - [ ] 12.3 Implement counter-based 96-bit nonce generation per block/record
+  - [ ] 12.4 Integrate TDE into PAX block write path: encrypt before IoScheduler write
+  - [ ] 12.5 Integrate TDE into WAL write path: encrypt each record before disk write
+  - [ ] 12.6 Implement TDE into read path: decrypt after IoScheduler read
+  - [ ] 12.7 Write tests: encrypt/decrypt round-trip, AES-NI acceleration detection, nonce uniqueness
 
 - [ ] 13. Implement statistics collection — galaxdb-storage (Req 10)
   - [ ] 13.1 Define `TableStatistics`, `ColumnStats` (NDV, null_fraction, equi-height histogram), `CorrelationStats` structs
