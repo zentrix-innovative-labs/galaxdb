@@ -115,6 +115,30 @@ impl Engine {
         Ok(ts)
     }
 
+    /// Insert a row synchronously (memtable + ART, WAL skipped).
+    /// Use this from sync contexts (embedded mode, Python FFI).
+    /// For full durability, use the async `put` method.
+    pub fn put_sync(&self, key: Vec<u8>, value: Vec<u8>) -> GalaxResult<Timestamp> {
+        let ts = self.next_ts();
+
+        // Write to memtable
+        let active = self.memtable_mgr.active();
+        active.put(key.clone(), ts, Some(value));
+
+        // Update ART index
+        let shard = (xxhash_rust::xxh3::xxh3_64(&key) % 16) as u8;
+        self.art.insert(
+            key.clone(),
+            RowLocation::Memtable {
+                shard,
+                key: key.clone(),
+            },
+        );
+
+        self.row_count.fetch_add(1, Ordering::Relaxed);
+        Ok(ts)
+    }
+
     /// Get a row by primary key. Reads from memtable (via ART index).
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         // Check ART index first
