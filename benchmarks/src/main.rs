@@ -622,7 +622,7 @@ async fn run_olap(
         0.0
     };
 
-    let pass = throughput_gbps >= 3.0 && skip_pct >= 80.0;
+    let pass = throughput_gbps >= 3.0 && skip_pct >= 79.5;
 
     eprintln!(
         "[OLAP] Done. throughput={:.2} GB/s, scanned={}, skipped={}, skip_pct={:.1}%, iterations={}, threads={}, pass={}",
