@@ -18,4 +18,30 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { workspace = true }
+rand = "0.8"
 tokio = { workspace = true, features = ["full"] }
+
+[[bench]]
+name = "pax_bench"
+harness = false
+
+[[bench]]
+name = "wal_bench"
+harness = false
+
+[[bench]]
+name = "art_bench"
+harness = false
+
+[[bench]]
+name = "bloom_bench"
+harness = false
+
+[[bench]]
+name = "memtable_bench"
+harness = false
+
+[[bench]]
+name = "buffer_pool_bench"
+harness = false
