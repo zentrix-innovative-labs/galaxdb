@@ -4,11 +4,15 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Embedded library API (Python FFI via PyO3)"
-
-[lib]
-name = "galaxdb_embedded"
-crate-type = ["lib"]
+description = "Embedded library API for GalaxDB (Python FFI via PyO3)"
 
 [dependencies]
 galaxdb-common.workspace = true
+galaxdb-sql = { path = "../galaxdb-sql" }
+galaxdb-storage = { path = "../galaxdb-storage" }
+galaxdb-io = { path = "../galaxdb-io" }
+sqlparser.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }

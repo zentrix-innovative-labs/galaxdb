@@ -162,15 +162,15 @@
   - [x] 20.6 Implement max connection limit (default 1000): reject with SQLSTATE 53300 when exceeded
   - [x] 20.7 Write tests: startup handshake, simple query round-trip, error responses, connection limit enforcement
 
-- [-] 21. Implement pg_catalog stubs — galaxdb-wire (Req 33)
-  - [ ] 21.1 Implement `pg_catalog.pg_class` (oid, relname, relnamespace, relkind) populated from catalog
-  - [ ] 21.2 Implement `pg_catalog.pg_attribute` (attrelid, attname, atttypid, attnum, attnotnull)
-  - [ ] 21.3 Implement `pg_catalog.pg_type` (oid, typname, typlen, typtype)
-  - [ ] 21.4 Implement `pg_catalog.pg_namespace` (oid, nspname) and `pg_catalog.pg_database` (oid, datname)
-  - [ ] 21.5 Implement fallback: queries against unsupported pg_catalog tables return empty result set (not error)
-  - [ ] 21.6 Write tests: psycopg2 connection handshake succeeds, SQLAlchemy table reflection works
+- [x] 21. Implement pg_catalog stubs — galaxdb-wire (Req 33)
+  - [x] 21.1 Implement `pg_catalog.pg_class` (oid, relname, relnamespace, relkind) populated from catalog
+  - [x] 21.2 Implement `pg_catalog.pg_attribute` (attrelid, attname, atttypid, attnum, attnotnull)
+  - [x] 21.3 Implement `pg_catalog.pg_type` (oid, typname, typlen, typtype)
+  - [x] 21.4 Implement `pg_catalog.pg_namespace` (oid, nspname) and `pg_catalog.pg_database` (oid, datname)
+  - [x] 21.5 Implement fallback: queries against unsupported pg_catalog tables return empty result set (not error)
+  - [x] 21.6 Write tests: psycopg2 connection handshake succeeds, SQLAlchemy table reflection works
 
-- [ ] 22. Implement Python client — galaxdb-python (Req 32)
+- [-] 22. Implement Python client — galaxdb-python (Req 32)
   - [ ] 22.1 Create galaxdb-python package with PyO3 bindings for embedded mode (`galaxdb.Database(path)`)
   - [ ] 22.2 Implement remote mode: connect via PostgreSQL wire protocol (`galaxdb.connect(connstring)`)
   - [ ] 22.3 Implement `db.execute(sql)` returning list of row dicts
