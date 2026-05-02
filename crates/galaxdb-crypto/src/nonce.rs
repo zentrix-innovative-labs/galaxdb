@@ -76,10 +76,10 @@ mod tests {
 
     #[test]
     fn nonces_are_unique() {
-        let gen = NonceGenerator::new();
+        let nonce_gen = NonceGenerator::new();
         let mut seen = HashSet::new();
         for _ in 0..10_000 {
-            let nonce = gen.next_nonce();
+            let nonce = nonce_gen.next_nonce();
             assert!(seen.insert(nonce), "duplicate nonce detected");
         }
     }
@@ -87,33 +87,33 @@ mod tests {
     #[test]
     fn nonce_has_correct_layout() {
         let prefix = [0xDE, 0xAD, 0xBE, 0xEF];
-        let gen = NonceGenerator::with_prefix_and_counter(prefix, 0);
+        let nonce_gen = NonceGenerator::with_prefix_and_counter(prefix, 0);
 
-        let n0 = gen.next_nonce();
+        let n0 = nonce_gen.next_nonce();
         assert_eq!(&n0[..4], &prefix);
         assert_eq!(&n0[4..12], &0u64.to_be_bytes());
 
-        let n1 = gen.next_nonce();
+        let n1 = nonce_gen.next_nonce();
         assert_eq!(&n1[..4], &prefix);
         assert_eq!(&n1[4..12], &1u64.to_be_bytes());
     }
 
     #[test]
     fn counter_increments() {
-        let gen = NonceGenerator::with_prefix_and_counter([0; 4], 42);
-        assert_eq!(gen.current_counter(), 42);
-        let _ = gen.next_nonce();
-        assert_eq!(gen.current_counter(), 43);
+        let nonce_gen = NonceGenerator::with_prefix_and_counter([0; 4], 42);
+        assert_eq!(nonce_gen.current_counter(), 42);
+        let _ = nonce_gen.next_nonce();
+        assert_eq!(nonce_gen.current_counter(), 43);
     }
 
     #[test]
     fn concurrent_nonce_uniqueness() {
         use std::sync::Arc;
-        let gen = Arc::new(NonceGenerator::new());
+        let nonce_gen = Arc::new(NonceGenerator::new());
         let mut handles = Vec::new();
 
         for _ in 0..4 {
-            let g = Arc::clone(&gen);
+            let g = Arc::clone(&nonce_gen);
             handles.push(std::thread::spawn(move || {
                 let mut nonces = Vec::with_capacity(1000);
                 for _ in 0..1000 {

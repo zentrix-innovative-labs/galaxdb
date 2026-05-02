@@ -688,15 +688,15 @@ async fn test_concurrent_writers() -> TestResult {
             continue;
         }
         // The latest timestamp for this key should match
-        if let Some(&expected_ts) = expected_timestamps.get(key) {
-            if versioned.timestamp != expected_ts {
-                // The memtable stores the latest version at the head of the chain
-                // Check if the latest timestamp is accessible
-                if let Some(Some(_)) = memtable.get_at(key, expected_ts) {
-                    // Value is accessible at the expected timestamp — OK
-                } else {
-                    value_mismatches += 1;
-                }
+        if let Some(&expected_ts) = expected_timestamps.get(key)
+            && versioned.timestamp != expected_ts
+        {
+            // The memtable stores the latest version at the head of the chain
+            // Check if the latest timestamp is accessible
+            if let Some(Some(_)) = memtable.get_at(key, expected_ts) {
+                // Value is accessible at the expected timestamp — OK
+            } else {
+                value_mismatches += 1;
             }
         }
     }
@@ -850,6 +850,12 @@ async fn test_olap_scan_during_oltp() -> TestResult {
 
 #[tokio::main]
 async fn main() {
+    #[cfg(debug_assertions)]
+    {
+        eprintln!("WARNING: Running in debug mode. Results are not meaningful.");
+        eprintln!("Run with: cargo run --release -p galaxdb-chaos-tests");
+    }
+
     println!("=== GalaxDB Chaos Test Suite ===\n");
 
     let start = Instant::now();

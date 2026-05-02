@@ -7,7 +7,7 @@
 //!
 //! Outputs structured JSON results to stdout.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,6 +73,8 @@ struct HardwareInfo {
     cores: usize,
     ram_gb: u64,
     os: String,
+    arch: String,
+    aes_ni: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -126,16 +128,67 @@ fn detect_hardware() -> HardwareInfo {
 
     let os = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
-    let cpu = format!("{} ({})", arch, os);
 
-    // Rough RAM estimate — sysinfo would be better but we keep deps minimal
-    let ram_gb = 16; // default fallback
+    let (cpu, ram_gb) = if cfg!(target_os = "macos") {
+        let cpu = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| format!("{} ({})", arch, os));
+
+        let ram_gb = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .map(|bytes| bytes / (1024 * 1024 * 1024))
+            .unwrap_or(0);
+
+        (cpu, ram_gb)
+    } else if cfg!(target_os = "linux") {
+        let cpu = std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .find(|line| line.starts_with("model name"))
+                    .and_then(|line| line.split(':').nth(1))
+                    .map(|s| s.trim().to_string())
+            })
+            .unwrap_or_else(|| format!("{} ({})", arch, os));
+
+        let ram_gb = std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .find(|line| line.starts_with("MemTotal"))
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .map(|kb| kb / (1024 * 1024))
+            })
+            .unwrap_or(0);
+
+        (cpu, ram_gb)
+    } else {
+        (format!("{} ({})", arch, os), 0)
+    };
+
+    #[cfg(target_arch = "x86_64")]
+    let aes_ni = std::arch::is_x86_feature_detected!("aes");
+    #[cfg(not(target_arch = "x86_64"))]
+    let aes_ni = false;
 
     HardwareInfo {
         cpu,
         cores,
         ram_gb,
         os,
+        arch,
+        aes_ni,
     }
 }
 
@@ -177,7 +230,7 @@ async fn run_oltp(
     warmup_secs: u64,
     num_rows: u64,
     num_threads: usize,
-    data_dir: &PathBuf,
+    data_dir: &Path,
 ) -> OltpResult {
     eprintln!("[OLTP] Pre-populating {} rows...", num_rows);
 
@@ -221,7 +274,7 @@ async fn run_oltp(
     }
 
     let flush_config = galaxdb_storage::flush::FlushConfig {
-        data_dir: data_dir.clone(),
+        data_dir: data_dir.to_path_buf(),
         sst_size_bytes: 64 * 1024 * 1024,
         max_rows_per_block: 100_000,
     };
@@ -292,7 +345,7 @@ async fn run_oltp(
                 }
 
                 // Yield periodically to avoid starving the runtime
-                if local_ops % 1000 == 0 {
+                if local_ops.is_multiple_of(1000) {
                     tokio::task::yield_now().await;
                 }
             }
@@ -333,7 +386,7 @@ async fn run_oltp(
                     local_ops += 1;
                 }
 
-                if local_ops % 1000 == 0 {
+                if local_ops.is_multiple_of(1000) {
                     tokio::task::yield_now().await;
                 }
             }
@@ -571,7 +624,7 @@ async fn run_mixed(
     warmup_secs: u64,
     num_rows: u64,
     num_threads: usize,
-    _data_dir: &PathBuf,
+    _data_dir: &Path,
 ) -> MixedResult {
     eprintln!("[MIXED] Setting up buffer pool and data...");
 
@@ -786,6 +839,12 @@ async fn run_mixed(
 
 #[tokio::main]
 async fn main() {
+    #[cfg(debug_assertions)]
+    {
+        eprintln!("WARNING: Running in debug mode. Results are not meaningful.");
+        eprintln!("Run with: cargo run --release -p galaxdb-benchmarks");
+    }
+
     let cli = Cli::parse();
 
     let data_dir = cli

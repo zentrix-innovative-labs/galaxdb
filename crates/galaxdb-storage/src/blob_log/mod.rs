@@ -453,7 +453,7 @@ impl BlobLog {
         for entry in entries {
             let entry = entry?;
             let path = entry.path();
-            if !path.extension().is_some_and(|ext| ext == "dat") {
+            if path.extension().is_none_or(|ext| ext != "dat") {
                 continue;
             }
 

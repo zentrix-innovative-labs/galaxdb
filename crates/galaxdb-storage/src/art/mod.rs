@@ -205,7 +205,7 @@ impl AdaptiveRadixTree {
 
                     // Take the current node out and modify its prefix
                     let mut old_node = node_ref.take().unwrap();
-                    if let ArtNode::Inner(ref mut old_inner) = old_node.as_mut() {
+                    if let ArtNode::Inner(old_inner) = old_node.as_mut() {
                         old_inner.prefix = remaining_prefix;
                     }
 

@@ -226,18 +226,20 @@ fn detect_backend_defaults_to_tokio_on_macos() {
 #[test]
 fn detect_backend_respects_env_var_tokio() {
     // Temporarily set the env var
-    std::env::set_var("GALAXDB_IO_BACKEND", "tokio");
+    // SAFETY: This test is not run concurrently with other tests that read this env var.
+    unsafe { std::env::set_var("GALAXDB_IO_BACKEND", "tokio"); }
     let backend = detect_backend();
     assert_eq!(backend, IoBackend::Tokio);
-    std::env::remove_var("GALAXDB_IO_BACKEND");
+    unsafe { std::env::remove_var("GALAXDB_IO_BACKEND"); }
 }
 
 #[test]
 fn detect_backend_env_var_case_insensitive() {
-    std::env::set_var("GALAXDB_IO_BACKEND", "TOKIO");
+    // SAFETY: This test is not run concurrently with other tests that read this env var.
+    unsafe { std::env::set_var("GALAXDB_IO_BACKEND", "TOKIO"); }
     let backend = detect_backend();
     assert_eq!(backend, IoBackend::Tokio);
-    std::env::remove_var("GALAXDB_IO_BACKEND");
+    unsafe { std::env::remove_var("GALAXDB_IO_BACKEND"); }
 }
 
 #[tokio::test]
