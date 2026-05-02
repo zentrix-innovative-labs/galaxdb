@@ -1,11 +1,15 @@
-//! GalaxDB SQL — SQL Parser (sqlparser-rs + AuroraSQL), Query Planner, Query Executor.
+//! GalaxDB SQL — SQL Parser, Query Planner, Query Executor.
 //!
-//! The parser handles standard SQL via `sqlparser-rs` and extends it with
-//! AuroraSQL syntax: EMBEDDING MODEL, SEMANTIC_MATCH, AT VERSION,
-//! CREATE VERSION TAG, BULK INSERT, SHOW EMBEDDING HEALTH, BACKUP/RESTORE.
+//! Handles standard SQL via `sqlparser-rs` and extends it with AuroraSQL syntax.
 
 pub mod ast;
+pub mod executor;
 pub mod parser;
+pub mod planner;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod planner_tests;
+#[cfg(test)]
+mod executor_tests;

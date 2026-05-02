@@ -135,7 +135,7 @@
   - [x] 17.9 Implement descriptive parse error messages with byte offset position
   - [x] 17.10 Write tests: parse every AuroraSQL extension, error messages with positions, round-trip standard SQL
 
-- [ ] 18. Implement query planner and executor — galaxdb-sql (Reqs 14, 15, 22)
+- [-] 18. Implement query planner and executor — galaxdb-sql (Reqs 14, 15, 22)
   - [ ] 18.1 Define `QueryPlan` enum: PointLookup, FullScan, SemanticSearch, HybridSearch, Insert, Update, Delete, BulkInsert, CreateTable, DropTable, CreateVersionTag, Backup, Restore, Analyze, ShowEmbeddingHealth
   - [ ] 18.2 Implement DDL executor: CREATE TABLE (allocate catalog entry, init ART index, create memtable, register embedding columns with sidecar), DROP TABLE (remove catalog, schedule file deletion)
   - [ ] 18.3 Implement INSERT executor: write to memtable + WAL, update ART, trigger async embedding for embedding columns
