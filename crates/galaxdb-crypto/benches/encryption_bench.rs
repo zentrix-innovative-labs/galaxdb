@@ -52,12 +52,12 @@ fn decrypt_1mb(c: &mut Criterion) {
 }
 
 fn nonce_generation(c: &mut Criterion) {
-    let gen = NonceGenerator::new();
+    let nonce_gen = NonceGenerator::new();
 
     c.bench_function("nonce_generation_throughput", |b| {
         b.iter(|| {
             for _ in 0..1000 {
-                let nonce = gen.next_nonce();
+                let nonce = nonce_gen.next_nonce();
                 black_box(nonce);
             }
         });
