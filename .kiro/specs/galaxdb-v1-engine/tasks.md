@@ -146,12 +146,12 @@
   - [x] 18.8 Implement adaptive query planner: estimate filter cardinality from statistics, choose BruteForceFiltered (< 1000 rows or < 0.1%) vs HnswWithPostFilter, log chosen strategy
   - [x] 18.9 Write tests: DDL create/drop, INSERT/SELECT/UPDATE/DELETE round-trip, UPDATE-of-embedding-source rejection, BULK INSERT, adaptive planner strategy selection
 
-- [-] 19. Implement snapshot isolation — galaxdb-sql (Req 16)
-  - [ ] 19.1 Implement `TransactionManager` with monotonic timestamp assignment and active snapshot tracking
-  - [ ] 19.2 Implement snapshot read: filter MVCC versions where `commit_ts <= read_timestamp`
-  - [ ] 19.3 Implement write-write conflict detection: abort second writer on same key
-  - [ ] 19.4 Document write-skew limitation (SSI deferred to v2)
-  - [ ] 19.5 Write tests: no dirty reads, no non-repeatable reads, no phantoms, write-write conflict abort
+- [x] 19. Implement snapshot isolation — galaxdb-sql (Req 16)
+  - [x] 19.1 Implement `TransactionManager` with monotonic timestamp assignment and active snapshot tracking
+  - [x] 19.2 Implement snapshot read: filter MVCC versions where `commit_ts <= read_timestamp`
+  - [x] 19.3 Implement write-write conflict detection: abort second writer on same key
+  - [x] 19.4 Document write-skew limitation (SSI deferred to v2)
+  - [x] 19.5 Write tests: no dirty reads, no non-repeatable reads, no phantoms, write-write conflict abort
 
 - [ ] 20. Implement PostgreSQL wire protocol — galaxdb-wire (Req 13)
   - [ ] 20.1 Implement TCP listener with TLS 1.3 via rustls

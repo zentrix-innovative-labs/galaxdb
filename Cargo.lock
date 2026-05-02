@@ -588,6 +588,11 @@ name = "galaxdb-wire"
 version = "0.1.0"
 dependencies = [
  "galaxdb-common",
+ "galaxdb-sql",
+ "sqlparser",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
