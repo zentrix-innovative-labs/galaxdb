@@ -34,7 +34,11 @@ impl Database {
     pub fn open(path: &str) -> GalaxResult<Self> {
         let path = PathBuf::from(path);
         std::fs::create_dir_all(&path)?;
-        let config = EngineConfig { data_dir: path.clone(), ..Default::default() };
+        let config = EngineConfig {
+            data_dir: path.clone(),
+            wal_group_commit_ms: 1, // 1ms for fast embedded inserts
+            ..Default::default()
+        };
         let engine = Engine::new(config)?;
         Ok(Self { path, catalog: Catalog::new(), engine: Arc::new(engine), schemas: HashMap::new() })
     }

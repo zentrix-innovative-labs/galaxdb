@@ -64,7 +64,7 @@ impl Engine {
             checkpoint_interval: Duration::from_secs(60),
         };
 
-        let wal = WalWriter::new(wal_config).map_err(GalaxError::Io)?;
+        let wal = Arc::new(WalWriter::new(wal_config).map_err(GalaxError::Io)?);
 
         let memtable_mgr = MemtableManager::new(
             config.memtable_size_bytes,
@@ -75,7 +75,7 @@ impl Engine {
             config,
             memtable_mgr,
             art: Arc::new(ArtIndex::new()),
-            wal: Arc::new(wal),
+            wal,
             next_timestamp: AtomicU64::new(1),
             row_count: AtomicU64::new(0),
         })
@@ -115,11 +115,16 @@ impl Engine {
         Ok(ts)
     }
 
-    /// Insert a row synchronously (memtable + ART, WAL skipped).
+    /// Insert a row synchronously (memtable + ART + WAL sync).
     /// Use this from sync contexts (embedded mode, Python FFI).
-    /// For full durability, use the async `put` method.
     pub fn put_sync(&self, key: Vec<u8>, value: Vec<u8>) -> GalaxResult<Timestamp> {
         let ts = self.next_ts();
+
+        // Write to WAL first (durability — sync fsync)
+        let payload = encode_kv(&key, &value);
+        self.wal
+            .append_sync(WalRecordType::RowPut, payload)
+            .map_err(GalaxError::Io)?;
 
         // Write to memtable
         let active = self.memtable_mgr.active();
