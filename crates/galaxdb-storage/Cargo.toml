@@ -1,0 +1,47 @@
+[package]
+name = "galaxdb-storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "LSM, PAX, WAL, Memtable, ART, Bloom, Buffer Pool, Blob Log, Compactor"
+
+[dependencies]
+galaxdb-common.workspace = true
+galaxdb-io = { path = "../galaxdb-io" }
+crossbeam-skiplist.workspace = true
+xxhash-rust.workspace = true
+lz4_flex.workspace = true
+zstd.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { workspace = true }
+rand = "0.8"
+tokio = { workspace = true, features = ["full"] }
+
+[[bench]]
+name = "pax_bench"
+harness = false
+
+[[bench]]
+name = "wal_bench"
+harness = false
+
+[[bench]]
+name = "art_bench"
+harness = false
+
+[[bench]]
+name = "bloom_bench"
+harness = false
+
+[[bench]]
+name = "memtable_bench"
+harness = false
+
+[[bench]]
+name = "buffer_pool_bench"
+harness = false

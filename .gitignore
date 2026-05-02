@@ -1,0 +1,37 @@
+# Rust build artifacts
+/target/
+**/target/
+
+# Cargo lock is committed for binary crates, but ignore for library-only workspaces
+# We keep Cargo.lock since we have binary crates (galaxdb-server, galaxdb-sidecar)
+
+# IDE / editor files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS files
+Thumbs.db
+Desktop.ini
+
+# Debug files
+*.pdb
+
+# Test artifacts
+*.profraw
+*.profdata
+lcov.info
+tarpaulin-report.html
+
+# GalaxDB data directories (runtime)
+galaxdb_data/
+*.wal
+*.pax
+_galaxdb_reserve
+
+# Environment
+.env
+.env.local

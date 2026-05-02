@@ -1,0 +1,10 @@
+[package]
+name = "galaxdb-versioning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Merkle DAG, Version Tags, Lance Exporter, MinHash Dedup"
+
+[dependencies]
+galaxdb-common.workspace = true

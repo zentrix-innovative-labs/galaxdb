@@ -1,0 +1,10 @@
+[package]
+name = "galaxdb-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "SQL Parser (sqlparser-rs + AuroraSQL), Query Planner, Query Executor"
+
+[dependencies]
+galaxdb-common.workspace = true
