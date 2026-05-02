@@ -6,6 +6,7 @@ pub mod bloom;
 pub mod buffer_pool;
 pub mod compaction;
 pub mod disk_full;
+pub mod engine;
 pub mod flush;
 pub mod memtable;
 pub mod pax;

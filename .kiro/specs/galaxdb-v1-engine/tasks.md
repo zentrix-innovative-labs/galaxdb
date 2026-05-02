@@ -170,7 +170,7 @@
   - [x] 21.5 Implement fallback: queries against unsupported pg_catalog tables return empty result set (not error)
   - [x] 21.6 Write tests: psycopg2 connection handshake succeeds, SQLAlchemy table reflection works
 
-- [-] 22. Implement Python client — galaxdb-python (Req 32)
+- [x] 22. Implement Python client — galaxdb-python (Req 32)
   - [ ] 22.1 Create galaxdb-python package with PyO3 bindings for embedded mode (`galaxdb.Database(path)`)
   - [ ] 22.2 Implement remote mode: connect via PostgreSQL wire protocol (`galaxdb.connect(connstring)`)
   - [ ] 22.3 Implement `db.execute(sql)` returning list of row dicts

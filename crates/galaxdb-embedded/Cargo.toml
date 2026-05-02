@@ -12,6 +12,7 @@ galaxdb-sql = { path = "../galaxdb-sql" }
 galaxdb-storage = { path = "../galaxdb-storage" }
 galaxdb-io = { path = "../galaxdb-io" }
 sqlparser.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
