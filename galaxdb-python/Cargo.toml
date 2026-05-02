@@ -1,0 +1,19 @@
+[package]
+name = "galaxdb-python"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "GalaxDB Python client — embedded mode via PyO3"
+
+[lib]
+name = "galaxdb"
+crate-type = ["cdylib"]
+
+[dependencies]
+galaxdb-common = { path = "../crates/galaxdb-common" }
+galaxdb-sql = { path = "../crates/galaxdb-sql" }
+galaxdb-storage = { path = "../crates/galaxdb-storage" }
+galaxdb-io = { path = "../crates/galaxdb-io" }
+galaxdb-embedded = { path = "../crates/galaxdb-embedded" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+sqlparser = { version = "0.50", features = ["visitor"] }

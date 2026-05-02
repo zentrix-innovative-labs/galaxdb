@@ -133,11 +133,28 @@ impl Database {
                             .unwrap_or_default();
                         Ok(planner::plan_drop_table(name, *if_exists))
                     }
-                    sqlparser::ast::Statement::Insert(_) => {
-                        Ok(planner::plan_insert("unknown".to_string(), vec![], vec![]))
+                    sqlparser::ast::Statement::Insert(ins) => {
+                        let table = ins.table_name.to_string();
+                        Ok(planner::plan_insert(table, vec![], vec![]))
                     }
-                    sqlparser::ast::Statement::Query(_) => {
-                        Ok(planner::plan_select("unknown".to_string(), vec![], None))
+                    sqlparser::ast::Statement::Query(q) => {
+                        // Try to extract table name from FROM clause
+                        let table = extract_table_from_query(q);
+                        Ok(planner::plan_select(table, vec![], None))
+                    }
+                    sqlparser::ast::Statement::Update { table, .. } => {
+                        let table_name = table.relation.to_string();
+                        Ok(planner::plan_update(table_name, vec![], None))
+                    }
+                    sqlparser::ast::Statement::Delete(del) => {
+                        let table_name = format!("{:?}", del.from);
+                        // Extract just the table name from the debug output
+                        let table_name = table_name
+                            .split('"')
+                            .nth(1)
+                            .unwrap_or("unknown")
+                            .to_string();
+                        Ok(planner::plan_delete(table_name, None))
                     }
                     _ => Ok(planner::QueryPlan::Analyze { table: "noop".to_string() }),
                 }
@@ -176,6 +193,16 @@ fn format_value(v: &galaxdb_sql::planner::Value) -> String {
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Extract table name from a SELECT query's FROM clause.
+fn extract_table_from_query(query: &sqlparser::ast::Query) -> String {
+    if let sqlparser::ast::SetExpr::Select(select) = query.body.as_ref() {
+        if let Some(from) = select.from.first() {
+            return from.relation.to_string();
+        }
+    }
+    "unknown".to_string()
 }
 
 #[cfg(test)]
