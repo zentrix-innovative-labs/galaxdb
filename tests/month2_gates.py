@@ -231,13 +231,19 @@ try:
     db = galaxdb.Database(tempfile.mkdtemp())
     db.execute("CREATE TABLE perf (id INT, name TEXT, score INT)")
 
+    # Multi-row INSERT batching (100 rows per statement, 1 parse + 1 fsync per batch)
     N = 10000
+    BATCH = 100
     start = time.time()
-    for i in range(N):
-        db.execute(f"INSERT INTO perf (id, name, score) VALUES ({i}, 'user_{i}', {i*10})")
+    for batch_start in range(0, N, BATCH):
+        values = ', '.join(
+            f"({i}, 'user_{i}', {i*10})"
+            for i in range(batch_start, min(batch_start + BATCH, N))
+        )
+        db.execute(f"INSERT INTO perf (id, name, score) VALUES {values}")
     elapsed = time.time() - start
     tps = N / elapsed
-    check(f"Embedded INSERT {N} rows", True, f"{tps:.0f} rows/sec in {elapsed:.1f}s")
+    check(f"Embedded INSERT {N} rows (batched {BATCH}/stmt)", True, f"{tps:.0f} rows/sec in {elapsed:.1f}s")
     check("Embedded INSERT > 1000 rows/sec", tps > 1000, f"{tps:.0f}")
 
     # SELECT all
