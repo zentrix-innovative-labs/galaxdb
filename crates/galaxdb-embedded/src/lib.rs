@@ -245,14 +245,25 @@ impl Database {
 
     pub fn path(&self) -> &Path { &self.path }
 
-    /// Execute multiple SQL statements in a batch.
-    /// Multi-row INSERTs are automatically batched into a single WAL write.
-    pub fn execute_batch(&mut self, statements: &[&str]) -> GalaxResult<Vec<QueryResult>> {
-        let mut results = Vec::with_capacity(statements.len());
-        for sql in statements {
-            results.push(self.execute(sql)?);
+    /// Execute a read-only SQL statement (SELECT, SHOW) without &mut self.
+    /// This allows concurrent reads through RwLock.
+    pub fn execute_readonly(&self, sql: &str) -> GalaxResult<QueryResult> {
+        let stmts = parser::parse(sql)?;
+        let mut last = QueryResult::Ok("OK".to_string());
+        for stmt in &stmts {
+            last = match stmt {
+                AuroraStatement::Standard(s) => match s.as_ref() {
+                    sqlparser::ast::Statement::Query(q) => self.exec_select(q),
+                    _ => Ok(QueryResult::Ok("OK".to_string())),
+                },
+                AuroraStatement::ShowEmbeddingHealth { table } => {
+                    let msg = table.as_ref().map_or("SHOW EMBEDDING HEALTH".to_string(), |t| format!("SHOW EMBEDDING HEALTH FOR {}", t));
+                    Ok(QueryResult::Rows(vec![QueryRow { values: vec![("status".to_string(), msg)] }]))
+                }
+                _ => Ok(QueryResult::Ok("OK".to_string())),
+            }?;
         }
-        Ok(results)
+        Ok(last)
     }
 
     pub fn table_count(&self) -> usize { self.catalog.table_count() }

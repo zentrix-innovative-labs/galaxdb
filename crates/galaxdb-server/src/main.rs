@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::RwLock;
 
 use galaxdb_embedded::Database;
 use galaxdb_wire::messages::*;
@@ -47,7 +47,7 @@ async fn main() {
     tracing::info!(addr = %addr, data_dir = %data_dir, "GalaxDB server started");
     eprintln!("GalaxDB server listening on {}", addr);
 
-    let db = Arc::new(Mutex::new(
+    let db = Arc::new(RwLock::new(
         Database::open(&data_dir).expect("failed to open database"),
     ));
     let active = Arc::new(AtomicUsize::new(0));
@@ -86,7 +86,7 @@ async fn main() {
 
 async fn handle_connection(
     stream: TcpStream,
-    db: Arc<Mutex<Database>>,
+    db: Arc<RwLock<Database>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (read_half, write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -137,9 +137,17 @@ async fn handle_connection(
             continue;
         }
 
-        // Execute SQL
-        let result = {
-            let mut db = db.lock().await;
+        // Execute SQL — use write lock for DDL/DML, read lock for SELECT
+        let upper = sql.trim().to_uppercase();
+        let is_read = upper.starts_with("SELECT") || upper.starts_with("SHOW");
+
+        let result = if is_read {
+            // Read path — multiple concurrent readers allowed
+            let db = db.read().await;
+            db.execute_readonly(&sql)
+        } else {
+            // Write path — exclusive access
+            let mut db = db.write().await;
             db.execute_async(&sql).await
         };
 
