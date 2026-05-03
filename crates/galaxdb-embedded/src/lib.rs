@@ -155,10 +155,20 @@ impl Database {
         let mut count = 0u64;
         if let Some(source) = &ins.source {
             if let sqlparser::ast::SetExpr::Values(values) = source.body.as_ref() {
+                // Batch all rows into a single WAL write + fsync
+                let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(values.rows.len());
                 for row in &values.rows {
                     let (key, value) = self.build_kv(&table, &schema, row, count);
-                    self.engine.put_sync(key.into_bytes(), value.into_bytes())?;
+                    batch.push((key.into_bytes(), value.into_bytes()));
                     count += 1;
+                }
+                if batch.len() == 1 {
+                    // Single row — use put_sync directly
+                    let (k, v) = batch.into_iter().next().unwrap();
+                    self.engine.put_sync(k, v)?;
+                } else if !batch.is_empty() {
+                    // Multi-row — use batch write (one WAL entry, one fsync)
+                    self.engine.put_batch_sync(&batch)?;
                 }
             }
         }
@@ -234,6 +244,17 @@ impl Database {
     }
 
     pub fn path(&self) -> &Path { &self.path }
+
+    /// Execute multiple SQL statements in a batch.
+    /// Multi-row INSERTs are automatically batched into a single WAL write.
+    pub fn execute_batch(&mut self, statements: &[&str]) -> GalaxResult<Vec<QueryResult>> {
+        let mut results = Vec::with_capacity(statements.len());
+        for sql in statements {
+            results.push(self.execute(sql)?);
+        }
+        Ok(results)
+    }
+
     pub fn table_count(&self) -> usize { self.catalog.table_count() }
     pub fn table_exists(&self, name: &str) -> bool { self.catalog.table_exists(name) }
     pub fn row_count(&self) -> u64 { self.engine.row_count() }

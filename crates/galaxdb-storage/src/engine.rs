@@ -144,6 +144,50 @@ impl Engine {
         Ok(ts)
     }
 
+    /// Insert multiple rows in a single batch (one WAL entry, one fsync).
+    /// This is the fast path for multi-row INSERT statements.
+    pub fn put_batch_sync(&self, rows: &[(Vec<u8>, Vec<u8>)]) -> GalaxResult<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        // Build a single WAL payload containing all rows
+        let mut batch_payload = Vec::with_capacity(rows.len() * 128);
+        let row_count = rows.len() as u32;
+        batch_payload.extend_from_slice(&row_count.to_le_bytes());
+        for (key, value) in rows {
+            batch_payload.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            batch_payload.extend_from_slice(key);
+            batch_payload.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            batch_payload.extend_from_slice(value);
+        }
+
+        // Single WAL write + single fsync for the entire batch
+        self.wal
+            .append_sync(WalRecordType::RowPut, batch_payload)
+            .map_err(GalaxError::Io)?;
+
+        // Write all rows to memtable + ART
+        let active = self.memtable_mgr.active();
+        for (key, value) in rows {
+            let ts = self.next_ts();
+            active.put(key.clone(), ts, Some(value.clone()));
+
+            let shard = (xxhash_rust::xxh3::xxh3_64(key) % 16) as u8;
+            self.art.insert(
+                key.clone(),
+                RowLocation::Memtable {
+                    shard,
+                    key: key.clone(),
+                },
+            );
+        }
+
+        let count = rows.len() as u64;
+        self.row_count.fetch_add(count, Ordering::Relaxed);
+        Ok(count)
+    }
+
     /// Get a row by primary key. Reads from memtable (via ART index).
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         // Check ART index first

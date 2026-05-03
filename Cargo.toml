@@ -107,3 +107,14 @@ galaxdb-sidecar = { path = "crates/galaxdb-sidecar" }
 galaxdb-observe = { path = "crates/galaxdb-observe" }
 galaxdb-server = { path = "crates/galaxdb-server" }
 galaxdb-embedded = { path = "crates/galaxdb-embedded" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
