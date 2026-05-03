@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 use galaxdb_common::{BlockId, ColumnType};
 use galaxdb_storage::art::{ArtIndex, RowLocation};
 use galaxdb_storage::buffer_pool::{AccessType, BufferPool, CachedBlock};
+use galaxdb_storage::engine::{Engine, EngineConfig};
 use galaxdb_storage::memtable::Memtable;
 use galaxdb_storage::pax::{ColumnData, PaxBlock};
 
@@ -31,7 +32,7 @@ use galaxdb_storage::pax::{ColumnData, PaxBlock};
 #[derive(Parser, Debug)]
 #[command(name = "galaxdb-benchmarks", about = "GalaxDB macro-benchmark suite")]
 struct Cli {
-    /// Workload to run: oltp, olap, mixed, or all
+    /// Workload to run: oltp, olap, mixed, all, or coldcache
     #[arg(long, default_value = "all")]
     workload: String,
 
@@ -858,6 +859,123 @@ async fn run_mixed(
 }
 
 // ---------------------------------------------------------------------------
+// Workload 4: Cold-Cache Read (larger-than-RAM dataset)
+// ---------------------------------------------------------------------------
+
+async fn run_coldcache(
+    num_rows: u64,
+    num_reads: u64,
+    data_dir: &Path,
+) {
+    eprintln!("[COLDCACHE] Writing {} rows to engine...", num_rows);
+
+    let config = EngineConfig {
+        data_dir: data_dir.to_path_buf(),
+        memtable_size_bytes: 64 * 1024 * 1024,
+        back_pressure_bytes: 256 * 1024 * 1024,
+        wal_group_commit_ms: 1,
+    };
+    let engine = Engine::new(config).unwrap();
+
+    // Write rows in batches
+    let batch_size = 10_000u64;
+    let value_size = 600; // ~600 bytes per row → 50M rows = 30GB
+    // Write rows using spawn_blocking to avoid async/sync conflict
+    let engine = Arc::new(engine);
+    let start = Instant::now();
+
+    for batch_start in (0..num_rows).step_by(batch_size as usize) {
+        let batch_end = (batch_start + batch_size).min(num_rows);
+        let eng = engine.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity((batch_end - batch_start) as usize);
+            for i in batch_start..batch_end {
+                let key = format!("cc-key-{:012}", i).into_bytes();
+                let mut value = vec![0u8; value_size];
+                let seed = i.to_le_bytes();
+                for (j, byte) in value.iter_mut().enumerate() {
+                    *byte = seed[j % 8] ^ (j as u8);
+                }
+                batch.push((key, value));
+            }
+            eng.put_batch_sync(&batch).unwrap();
+        }).await.unwrap();
+
+        if (batch_start / batch_size) % 100 == 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rows_done = batch_end;
+            let rate = rows_done as f64 / elapsed;
+            eprintln!(
+                "[COLDCACHE]   {}/{} rows ({:.0} rows/sec, {:.1}s elapsed)",
+                rows_done, num_rows, rate, elapsed
+            );
+        }
+    }
+
+    let write_elapsed = start.elapsed();
+    let write_rate = num_rows as f64 / write_elapsed.as_secs_f64();
+    eprintln!(
+        "[COLDCACHE] Write complete: {} rows in {:.1}s ({:.0} rows/sec)",
+        num_rows, write_elapsed.as_secs_f64(), write_rate
+    );
+
+    // Flush memtable to SST
+    eprintln!("[COLDCACHE] Flushing memtable to SST...");
+    let flushed = engine.flush_memtable().await.unwrap();
+    eprintln!("[COLDCACHE] Flushed {} rows to SST", flushed);
+
+    // Now read random keys and measure latency
+    eprintln!("[COLDCACHE] Reading {} random keys...", num_reads);
+    let mut rng = SmallRng::seed_from_u64(42);
+    let mut hist = Histogram::<u64>::new(3).unwrap();
+
+    for i in 0..num_reads {
+        let key_id = rng.gen_range(0..num_rows);
+        let key = format!("cc-key-{:012}", key_id).into_bytes();
+
+        let read_start = Instant::now();
+        let result = engine.get(&key);
+        let elapsed_us = read_start.elapsed().as_micros() as u64;
+
+        let _ = hist.record(elapsed_us.min(60_000_000));
+
+        if result.is_none() {
+            eprintln!("[COLDCACHE] WARNING: key {} not found", key_id);
+        }
+
+        if i > 0 && i % 10_000 == 0 {
+            eprintln!("[COLDCACHE]   {}/{} reads done", i, num_reads);
+        }
+    }
+
+    let p50 = hist.value_at_quantile(0.50);
+    let p99 = hist.value_at_quantile(0.99);
+    let p999 = hist.value_at_quantile(0.999);
+
+    eprintln!("[COLDCACHE] Results:");
+    eprintln!("  Rows: {}", num_rows);
+    eprintln!("  Reads: {}", num_reads);
+    eprintln!("  Read p50: {} µs", p50);
+    eprintln!("  Read p99: {} µs", p99);
+    eprintln!("  Read p999: {} µs", p999);
+
+    // Output as JSON
+    println!("{{");
+    println!("  \"coldcache\": {{");
+    println!("    \"rows\": {},", num_rows);
+    println!("    \"reads\": {},", num_reads);
+    println!("    \"read_p50_us\": {},", p50);
+    println!("    \"read_p99_us\": {},", p99);
+    println!("    \"read_p999_us\": {},", p999);
+    println!("    \"write_rate_rows_per_sec\": {:.0}", write_rate);
+    println!("  }}");
+    println!("}}");
+
+    engine.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -923,6 +1041,13 @@ async fn main() {
             )
             .await,
         );
+    }
+
+    if workload == "coldcache" {
+        // Cold-cache benchmark: NOT included in "all" because it takes 10+ minutes
+        // Usage: --workload coldcache --rows 50000000
+        run_coldcache(cli.rows, 100_000, &data_dir).await;
+        return;
     }
 
     let results = BenchmarkResults {

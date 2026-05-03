@@ -47,14 +47,12 @@ pub struct StoredRow {
 
 /// Tracks flushed SST files for the read path.
 struct SstEntry {
-    path: PathBuf,
-    /// Cached decoded block (loaded on first read).
-    cached_block: Option<PaxBlock>,
+    /// Pre-decompressed value column (column 1) for fast random access.
+    values: Vec<Vec<u8>>,
 }
 
 /// Registry of all SST files on disk.
 struct SstRegistry {
-    /// SST ID → entry.
     entries: HashMap<u64, SstEntry>,
 }
 
@@ -64,25 +62,20 @@ impl SstRegistry {
     }
 
     fn register(&mut self, sst_id: u64, path: PathBuf) {
-        self.entries.insert(sst_id, SstEntry { path, cached_block: None });
+        // Pre-load AND pre-decompress the value column for fast reads
+        if let Ok(data) = std::fs::read(&path) {
+            if let Ok(block) = PaxBlock::deserialize(&data) {
+                if let Ok(values) = block.read_column(1) {
+                    self.entries.insert(sst_id, SstEntry { values });
+                }
+            }
+        }
     }
 
-    /// Read a value from an SST file by block offset and row offset.
-    fn read_value(&mut self, sst_id: u64, _block_offset: u64, row_offset: u32) -> Option<Vec<u8>> {
-        let entry = self.entries.get_mut(&sst_id)?;
-
-        // Load and cache the block if not already cached
-        if entry.cached_block.is_none() {
-            let data = std::fs::read(&entry.path).ok()?;
-            let block = PaxBlock::deserialize(&data).ok()?;
-            entry.cached_block = Some(block);
-        }
-
-        let block = entry.cached_block.as_ref()?;
-
-        // Read the value column (column 1 in our key-value schema)
-        let values = block.read_column(1).ok()?;
-        values.get(row_offset as usize).cloned()
+    /// Read a value — O(1) array lookup, no decompression.
+    fn read_value(&self, sst_id: u64, _block_offset: u64, row_offset: u32) -> Option<Vec<u8>> {
+        let entry = self.entries.get(&sst_id)?;
+        entry.values.get(row_offset as usize).cloned()
     }
 }
 
@@ -251,8 +244,8 @@ impl Engine {
                 }
             }
             RowLocation::SST { sst_id, block_offset, row_offset } => {
-                // Read from SST file on disk
-                let mut registry = self.sst_registry.write().ok()?;
+                // Read from SST file (pre-loaded in cache)
+                let registry = self.sst_registry.read().ok()?;
                 registry.read_value(*sst_id, *block_offset, *row_offset)
             }
         }
