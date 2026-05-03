@@ -600,6 +600,7 @@ dependencies = [
  "criterion",
  "crossbeam-skiplist",
  "galaxdb-common",
+ "galaxdb-crypto",
  "galaxdb-io",
  "libc",
  "lz4_flex",

@@ -271,4 +271,36 @@ impl IoScheduler for IoUringScheduler {
     fn backend(&self) -> IoBackend {
         IoBackend::IoUring
     }
+
+    /// Synchronous read using io_uring HP queue.
+    ///
+    /// Reads `len` bytes from `file` at `offset` via io_uring submit+wait.
+    /// This is used for targeted block reads during point lookups.
+    fn read_sync(
+        &self,
+        file: &Path,
+        offset: u64,
+        len: usize,
+        priority: IoPriority,
+    ) -> GalaxResult<Vec<u8>> {
+        let start = std::time::Instant::now();
+
+        let f = File::open(file)?;
+        let fd = f.as_raw_fd();
+
+        let mut buf = vec![0u8; len];
+        let queue = self.get_queue(priority);
+
+        let bytes_read = {
+            let mut q = queue.lock().expect("uring queue lock poisoned");
+            q.read_sync(fd, &mut buf, offset)?
+        };
+
+        buf.truncate(bytes_read);
+
+        let elapsed_us = start.elapsed().as_micros() as u64;
+        self.latency.record(priority, elapsed_us);
+
+        Ok(buf)
+    }
 }

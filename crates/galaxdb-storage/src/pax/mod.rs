@@ -167,8 +167,33 @@ impl PaxBlock {
         commit_timestamp: Timestamp,
         columns: &[ColumnData],
     ) -> GalaxResult<Self> {
+        // Use default codec selection per column type
+        let codecs: Vec<CodecId> = columns.iter()
+            .map(|col| CodecId::for_column_type(&col.col_type))
+            .collect();
+        Self::write_with_codecs(block_id, commit_timestamp, columns, &codecs)
+    }
+
+    /// Write a PAX block with explicit codec selection per column.
+    ///
+    /// This allows the caller to override the default codec for specific columns.
+    /// For example, the KV storage flush path uses `CodecId::None` for the value
+    /// column to enable fast single-row point reads without decompressing the
+    /// entire column.
+    pub fn write_with_codecs(
+        block_id: BlockId,
+        commit_timestamp: Timestamp,
+        columns: &[ColumnData],
+        codecs: &[CodecId],
+    ) -> GalaxResult<Self> {
         if columns.is_empty() {
             return Err(GalaxError::Internal("PAX block must have at least one column".into()));
+        }
+        if codecs.len() != columns.len() {
+            return Err(GalaxError::Internal(format!(
+                "codec count ({}) must match column count ({})",
+                codecs.len(), columns.len()
+            )));
         }
 
         let row_count = columns[0].values.len();
@@ -184,8 +209,8 @@ impl PaxBlock {
         let mut column_descriptors = Vec::with_capacity(columns.len());
         let mut column_data = Vec::new();
 
-        for col in columns {
-            let codec = CodecId::for_column_type(&col.col_type);
+        for (col_idx, col) in columns.iter().enumerate() {
+            let codec = codecs[col_idx];
             let zone_map = extract_zone_map(&col.col_type, &col.values);
             let offset = column_data.len() as u64;
 
@@ -350,6 +375,54 @@ impl PaxBlock {
 
         let compressed = &self.column_data[start..end];
         codec::decompress(&desc.col_type, desc.codec, compressed, self.header.row_count)
+    }
+
+    /// Read a single row from a specific column.
+    ///
+    /// For uncompressed columns (CodecId::None), this scans length prefixes
+    /// to the target row without decompressing the entire column — much faster
+    /// for point lookups.
+    ///
+    /// For compressed columns (Zstd, FastPFor), falls back to decompressing
+    /// the entire column and extracting the target row.
+    pub fn read_column_row(&self, col_index: usize, row_offset: u32) -> GalaxResult<Vec<u8>> {
+        if col_index >= self.header.column_descriptors.len() {
+            return Err(GalaxError::Internal(format!(
+                "column index {} out of range (block has {} columns)",
+                col_index,
+                self.header.column_descriptors.len()
+            )));
+        }
+
+        if row_offset >= self.header.row_count {
+            return Err(GalaxError::Internal(format!(
+                "row offset {} out of range (block has {} rows)",
+                row_offset, self.header.row_count
+            )));
+        }
+
+        let desc = &self.header.column_descriptors[col_index];
+        let start = desc.offset as usize;
+        let end = start + desc.compressed_len as usize;
+
+        if end > self.column_data.len() {
+            return Err(GalaxError::Internal("column chunk extends beyond column data".into()));
+        }
+
+        let column_bytes = &self.column_data[start..end];
+
+        match desc.codec {
+            CodecId::None => {
+                // Fast path: scan length prefixes to target row
+                codec::decompress_none_single_row(column_bytes, row_offset)
+            }
+            _ => {
+                // Slow path: decompress entire column, extract target row
+                let values = codec::decompress(&desc.col_type, desc.codec, column_bytes, self.header.row_count)?;
+                values.into_iter().nth(row_offset as usize)
+                    .ok_or_else(|| GalaxError::Internal("row offset out of range after decompression".into()))
+            }
+        }
     }
 }
 

@@ -279,7 +279,7 @@ async fn run_oltp(
         sst_size_bytes: 64 * 1024 * 1024,
         max_rows_per_block: 100_000,
     };
-    let _ = galaxdb_storage::flush::flush_memtable(&flush_memtable, &flush_config, 1).await;
+    let _ = galaxdb_storage::flush::flush_memtable(&flush_memtable, &flush_config, 1, &galaxdb_io::TokioScheduler::new()).await;
 
     // Update ART entries for flushed rows to point to SST
     for i in 0..flush_count {
@@ -868,21 +868,36 @@ async fn run_coldcache(
     data_dir: &Path,
 ) {
     eprintln!("[COLDCACHE] Writing {} rows to engine...", num_rows);
+    eprintln!("[COLDCACHE] Methodology: SST cache = 10 MB (forces NVMe reads),");
+    eprintln!("[COLDCACHE]   SST size = 8 MB (~13K rows/SST), periodic flush every 100K rows");
 
     let config = EngineConfig {
         data_dir: data_dir.to_path_buf(),
         memtable_size_bytes: 64 * 1024 * 1024,
         back_pressure_bytes: 256 * 1024 * 1024,
         wal_group_commit_ms: 1,
+        // Cold-cache settings: minimal SST cache forces NVMe reads.
+        sst_cache_bytes: 10 * 1024 * 1024, // 10 MB — forces cold reads
+        // 8 MB SSTs with 100-row blocks (~62KB each).
+        // A cold point read does a targeted pread of one ~62KB block
+        // from NVMe = ~18µs at 3.5 GB/s. The block index (in memory)
+        // maps block_offset → (file_offset, length) for O(1) lookup.
+        sst_size_bytes: 8 * 1024 * 1024,
+        max_rows_per_sst: 100, // ~62KB per block for fast point reads
     };
     let engine = Engine::new(config).unwrap();
 
-    // Write rows in batches
+    // Write rows in batches, flushing to SST periodically to avoid OOM.
+    // With 50M rows × 600 bytes = 30GB, we can't hold everything in memory.
+    // Flush every 100K rows (~60MB) to keep memory usage under control
+    // and produce many small SST files for realistic cold-cache behavior.
     let batch_size = 10_000u64;
+    let flush_interval = 100_000u64; // Flush to SST every 100K rows
     let value_size = 600; // ~600 bytes per row → 50M rows = 30GB
-    // Write rows using spawn_blocking to avoid async/sync conflict
     let engine = Arc::new(engine);
     let start = Instant::now();
+    let mut rows_since_flush = 0u64;
+    let mut total_flushed = 0u64;
 
     for batch_start in (0..num_rows).step_by(batch_size as usize) {
         let batch_end = (batch_start + batch_size).min(num_rows);
@@ -902,13 +917,22 @@ async fn run_coldcache(
             eng.put_batch_sync(&batch).unwrap();
         }).await.unwrap();
 
-        if (batch_start / batch_size) % 100 == 0 {
+        rows_since_flush += batch_end - batch_start;
+
+        // Flush to SST periodically to keep memory bounded
+        if rows_since_flush >= flush_interval {
+            let flushed = engine.flush_memtable().await.unwrap();
+            total_flushed += flushed;
+            rows_since_flush = 0;
+        }
+
+        if (batch_start / batch_size) % 500 == 0 {
             let elapsed = start.elapsed().as_secs_f64();
             let rows_done = batch_end;
             let rate = rows_done as f64 / elapsed;
             eprintln!(
-                "[COLDCACHE]   {}/{} rows ({:.0} rows/sec, {:.1}s elapsed)",
-                rows_done, num_rows, rate, elapsed
+                "[COLDCACHE]   {}/{} rows ({:.0} rows/sec, {:.1}s elapsed, {} flushed to SST)",
+                rows_done, num_rows, rate, elapsed, total_flushed
             );
         }
     }
@@ -920,15 +944,44 @@ async fn run_coldcache(
         num_rows, write_elapsed.as_secs_f64(), write_rate
     );
 
-    // Flush memtable to SST
-    eprintln!("[COLDCACHE] Flushing memtable to SST...");
-    let flushed = engine.flush_memtable().await.unwrap();
-    eprintln!("[COLDCACHE] Flushed {} rows to SST", flushed);
+    // Final flush for any remaining rows in memtable
+    eprintln!("[COLDCACHE] Final flush of remaining memtable rows...");
+    let final_flushed = engine.flush_memtable().await.unwrap();
+    total_flushed += final_flushed;
+    eprintln!("[COLDCACHE] Total flushed to SST: {} rows across multiple SST files", total_flushed);
+
+    // Drop the OS page cache to ensure truly cold reads.
+    // On Linux, we can use sync + drop_caches.
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!("[COLDCACHE] Dropping OS page cache for cold reads...");
+        // Sync all pending writes to disk
+        let _ = std::process::Command::new("sync").status();
+        // Drop page cache (requires root or appropriate permissions)
+        let drop_result = std::fs::write("/proc/sys/vm/drop_caches", "3");
+        if drop_result.is_err() {
+            eprintln!("[COLDCACHE] WARNING: Could not drop page cache (need sudo). Results may include OS cache hits.");
+        } else {
+            eprintln!("[COLDCACHE] Page cache dropped successfully.");
+        }
+    }
+
+    // Count SST files on disk
+    let sst_count = std::fs::read_dir(data_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |ext| ext == "pax"))
+                .count()
+        })
+        .unwrap_or(0);
+    eprintln!("[COLDCACHE] SST files on disk: {}", sst_count);
 
     // Now read random keys and measure latency
     eprintln!("[COLDCACHE] Reading {} random keys...", num_reads);
     let mut rng = SmallRng::seed_from_u64(42);
     let mut hist = Histogram::<u64>::new(3).unwrap();
+    let mut missing_count = 0u64;
 
     for i in 0..num_reads {
         let key_id = rng.gen_range(0..num_rows);
@@ -941,11 +994,11 @@ async fn run_coldcache(
         let _ = hist.record(elapsed_us.min(60_000_000));
 
         if result.is_none() {
-            eprintln!("[COLDCACHE] WARNING: key {} not found", key_id);
+            missing_count += 1;
         }
 
         if i > 0 && i % 10_000 == 0 {
-            eprintln!("[COLDCACHE]   {}/{} reads done", i, num_reads);
+            eprintln!("[COLDCACHE]   {}/{} reads done (missing so far: {})", i, num_reads, missing_count);
         }
     }
 
@@ -954,8 +1007,11 @@ async fn run_coldcache(
     let p999 = hist.value_at_quantile(0.999);
 
     eprintln!("[COLDCACHE] Results:");
-    eprintln!("  Rows: {}", num_rows);
+    eprintln!("  Rows written: {}", num_rows);
+    eprintln!("  Rows flushed to SST: {}", total_flushed);
+    eprintln!("  SST files: {}", sst_count);
     eprintln!("  Reads: {}", num_reads);
+    eprintln!("  Missing keys: {} ({:.1}%)", missing_count, missing_count as f64 / num_reads as f64 * 100.0);
     eprintln!("  Read p50: {} µs", p50);
     eprintln!("  Read p99: {} µs", p99);
     eprintln!("  Read p999: {} µs", p999);
@@ -964,7 +1020,10 @@ async fn run_coldcache(
     println!("{{");
     println!("  \"coldcache\": {{");
     println!("    \"rows\": {},", num_rows);
+    println!("    \"rows_flushed\": {},", total_flushed);
+    println!("    \"sst_files\": {},", sst_count);
     println!("    \"reads\": {},", num_reads);
+    println!("    \"missing_keys\": {},", missing_count);
     println!("    \"read_p50_us\": {},", p50);
     println!("    \"read_p99_us\": {},", p99);
     println!("    \"read_p999_us\": {},", p999);

@@ -126,7 +126,7 @@ async fn test_kill_mid_flush() -> TestResult {
     };
 
     // Simulate partial flush (don't checkpoint WAL — simulates kill)
-    let _ = flush_memtable(&memtable_clone, &flush_config, 1).await;
+    let _ = flush_memtable(&memtable_clone, &flush_config, 1, &galaxdb_io::TokioScheduler::new()).await;
     println!("  Simulated kill mid-flush (no WAL checkpoint)");
 
     // Step 3: Drop the WAL writer without shutdown (simulates kill)

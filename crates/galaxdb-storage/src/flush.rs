@@ -7,23 +7,27 @@
 //!
 //! 1. Get all entries from the sealed memtable (sorted by primary key via `iter_all()`)
 //! 2. Group entries into PAX blocks (respecting the configured SST target size)
-//! 3. Write each PAX block to disk as an SST file
-//! 4. After successful flush, write a CHECKPOINT record to the WAL
-//! 5. Truncate the WAL to the checkpoint point
-//! 6. Notify the MemtableManager that flush is complete (releases back-pressure)
+//! 3. Encrypt each PAX block with AEGIS-256 (if TDE is enabled)
+//! 4. Write each encrypted PAX block to disk as an SST file
+//! 5. After successful flush, write a CHECKPOINT record to the WAL
+//! 6. Truncate the WAL to the checkpoint point
+//! 7. Notify the MemtableManager that flush is complete (releases back-pressure)
 //!
 //! ## TDE Encryption
 //!
-//! TDE encryption is not yet implemented (Task 12). The flush pipeline includes
-//! a hook/placeholder for encryption but writes unencrypted data for now.
+//! When the `aegis-tde` feature is enabled, PAX blocks are encrypted with
+//! AEGIS-256 before writing to disk. AEGIS-256 achieves 6-10 GB/s on modern
+//! CPUs with AES-NI — 4-8× faster than AES-256-GCM.
+//! WAL records continue to use AES-256-GCM (append-only sequential writes).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use galaxdb_common::{BlockId, ColumnType, GalaxError, GalaxResult, Timestamp};
+use galaxdb_io::{IoScheduler, IoPriority};
 
 use crate::memtable::{Memtable, VersionedValue};
-use crate::pax::{ColumnData, PaxBlock};
+use crate::pax::{CodecId, ColumnData, PaxBlock};
 use crate::wal::WalWriter;
 
 /// Configuration for the flush pipeline.
@@ -31,12 +35,13 @@ use crate::wal::WalWriter;
 pub struct FlushConfig {
     /// Directory where SST files are written.
     pub data_dir: PathBuf,
-    /// Target SST file size in bytes (default: 64 MB).
-    /// Each PAX block is written as a separate SST file.
+    /// Target SST file size in bytes (default: 8 MB).
+    /// Multiple PAX blocks are packed into each SST file.
     pub sst_size_bytes: u64,
-    /// Maximum number of rows per PAX block.
-    /// This is derived from `sst_size_bytes` and average row size,
-    /// but we also enforce a hard cap for safety.
+    /// Maximum number of rows per PAX block within an SST (default: 100).
+    /// Smaller blocks = faster point reads (one NVMe read per block).
+    /// With 100 rows × ~625 bytes = ~62KB per block, a cold point read
+    /// loads ~64KB from NVMe = ~18µs at 3.5 GB/s.
     pub max_rows_per_block: usize,
 }
 
@@ -44,8 +49,8 @@ impl Default for FlushConfig {
     fn default() -> Self {
         Self {
             data_dir: PathBuf::from("galaxdb_data"),
-            sst_size_bytes: 64 * 1024 * 1024, // 64 MB
-            max_rows_per_block: 1_000_000,     // safety cap
+            sst_size_bytes: 8 * 1024 * 1024,  // 8 MB
+            max_rows_per_block: 100,           // ~64KB per block for fast point reads
         }
     }
 }
@@ -81,15 +86,65 @@ pub struct FlushResult {
     pub bytes_written: u64,
     /// The WAL checkpoint sequence number (if WAL integration was used).
     pub checkpoint_seq_no: Option<u64>,
+    /// Per-SST block metadata: (sst_index, block_index_within_sst, rows_in_block).
+    /// Used by the Engine to update ART entries with correct block_offset values.
+    pub block_map: Vec<SstBlockInfo>,
 }
 
-/// Placeholder hook for TDE encryption.
+/// Metadata about one PAX block within an SST file.
+#[derive(Debug, Clone)]
+pub struct SstBlockInfo {
+    /// Index of the SST file in `sst_paths`.
+    pub sst_index: usize,
+    /// Block index within the SST file (used as `block_offset` in ART).
+    pub block_index: u32,
+    /// Number of rows in this block.
+    pub row_count: usize,
+}
+
+/// Encrypt a PAX block using AEGIS-256 TDE.
 ///
-/// In v1, this is a no-op that returns the data unchanged. When Task 12
-/// (TDE encryption) is implemented, this will encrypt the PAX block bytes
-/// using AES-256-GCM before writing to disk.
-fn encrypt_block_data(data: &[u8]) -> GalaxResult<Vec<u8>> {
-    // TODO(Task 12): Encrypt with AES-256-GCM via TdeModule
+/// When the `aegis-tde` feature is enabled and a TDE module is provided,
+/// the block data is encrypted with AEGIS-256 (6-10 GB/s on AES-NI hardware).
+/// When TDE is not configured, the data is returned unchanged.
+#[cfg(feature = "aegis-tde")]
+fn encrypt_block_data(
+    data: &[u8],
+    tde: Option<&galaxdb_crypto::AegisTdeModule>,
+) -> GalaxResult<Vec<u8>> {
+    match tde {
+        Some(module) => module.encrypt(data),
+        None => Ok(data.to_vec()),
+    }
+}
+
+#[cfg(not(feature = "aegis-tde"))]
+fn encrypt_block_data(
+    data: &[u8],
+    _tde: Option<&()>,
+) -> GalaxResult<Vec<u8>> {
+    Ok(data.to_vec())
+}
+
+/// Decrypt a PAX block using AEGIS-256 TDE.
+///
+/// Counterpart to `encrypt_block_data`. Used when reading SST files from disk.
+#[cfg(feature = "aegis-tde")]
+pub fn decrypt_block_data(
+    data: &[u8],
+    tde: Option<&galaxdb_crypto::AegisTdeModule>,
+) -> GalaxResult<Vec<u8>> {
+    match tde {
+        Some(module) => module.decrypt(data),
+        None => Ok(data.to_vec()),
+    }
+}
+
+#[cfg(not(feature = "aegis-tde"))]
+pub fn decrypt_block_data(
+    data: &[u8],
+    _tde: Option<&()>,
+) -> GalaxResult<Vec<u8>> {
     Ok(data.to_vec())
 }
 
@@ -172,15 +227,55 @@ fn split_into_blocks<'a>(
 /// This is the core flush pipeline:
 /// 1. Extract all entries from the memtable (already sorted by key)
 /// 2. Split entries into chunks based on SST size target
-/// 3. For each chunk, create a PAX block and write it to disk
+/// 3. For each chunk, create a PAX block, encrypt with AEGIS-256 (if TDE enabled), and write to disk
 /// 4. Return the flush result with paths and metadata
 ///
 /// This function does NOT handle WAL checkpoint or MemtableManager notification.
 /// Use [`flush_memtable_with_wal`] for the full pipeline.
+///
+/// # TDE Encryption
+///
+/// Pass `Some(&aegis_module)` to encrypt PAX blocks with AEGIS-256 before writing.
+/// Pass `None` to write unencrypted blocks (for testing or when TDE is disabled).
+#[cfg(feature = "aegis-tde")]
 pub async fn flush_memtable(
     memtable: &Memtable,
     config: &FlushConfig,
     commit_timestamp: Timestamp,
+    io: &dyn IoScheduler,
+) -> GalaxResult<FlushResult> {
+    flush_memtable_inner(memtable, config, commit_timestamp, None, io).await
+}
+
+/// Flush a sealed memtable with AEGIS-256 TDE encryption.
+#[cfg(feature = "aegis-tde")]
+pub async fn flush_memtable_encrypted(
+    memtable: &Memtable,
+    config: &FlushConfig,
+    commit_timestamp: Timestamp,
+    tde: &galaxdb_crypto::AegisTdeModule,
+    io: &dyn IoScheduler,
+) -> GalaxResult<FlushResult> {
+    flush_memtable_inner(memtable, config, commit_timestamp, Some(tde), io).await
+}
+
+#[cfg(not(feature = "aegis-tde"))]
+pub async fn flush_memtable(
+    memtable: &Memtable,
+    config: &FlushConfig,
+    commit_timestamp: Timestamp,
+    io: &dyn IoScheduler,
+) -> GalaxResult<FlushResult> {
+    flush_memtable_inner(memtable, config, commit_timestamp, None, io).await
+}
+
+#[cfg(feature = "aegis-tde")]
+async fn flush_memtable_inner(
+    memtable: &Memtable,
+    config: &FlushConfig,
+    commit_timestamp: Timestamp,
+    tde: Option<&galaxdb_crypto::AegisTdeModule>,
+    io: &dyn IoScheduler,
 ) -> GalaxResult<FlushResult> {
     // Step 1: Get all entries sorted by primary key
     let entries = memtable.iter_all();
@@ -192,6 +287,7 @@ pub async fn flush_memtable(
             rows_flushed: 0,
             bytes_written: 0,
             checkpoint_seq_no: None,
+            block_map: Vec::new(),
         });
     }
 
@@ -200,39 +296,90 @@ pub async fn flush_memtable(
         .await
         .map_err(GalaxError::Io)?;
 
-    // Step 2: Split entries into block-sized chunks
+    // Step 2: Split entries into small block-sized chunks (~100 rows each).
+    // Following RocksDB's BlockBasedTable pattern: each SST file contains
+    // multiple small data blocks with a block index at the end. A point read
+    // loads one block (~64KB) from NVMe instead of the entire SST file.
     let chunks = split_into_blocks(&entries, config);
 
-    let mut sst_paths = Vec::with_capacity(chunks.len());
-    let mut block_ids = Vec::with_capacity(chunks.len());
+    let mut sst_paths: Vec<PathBuf> = Vec::new();
+    let mut block_ids: Vec<BlockId> = Vec::new();
+    let mut block_map: Vec<SstBlockInfo> = Vec::new();
     let mut total_bytes: u64 = 0;
     let total_rows = entries.len();
 
-    // Step 3: Write each chunk as a PAX block to disk
-    for chunk in chunks {
+    // Step 3: Pack multiple PAX blocks into SST files with block indexes.
+    // Each SST file holds blocks until it reaches sst_size_bytes.
+    let mut current_sst_data: Vec<u8> = Vec::new();
+    let mut current_sst_index = crate::sst::SstBlockIndex::new();
+    let mut current_sst_block_count: u32 = 0;
+    let sst_index_in_result = std::cell::Cell::new(0usize);
+
+    for chunk in &chunks {
         let block_id = allocate_block_id();
         let columns = entries_to_columns(chunk);
 
-        // Create the PAX block
-        let pax_block = PaxBlock::write(block_id, commit_timestamp, &columns)?;
-
-        // Serialize the block
+        // Create the PAX block with KV-optimized codecs:
+        // Key column (0): Zstd — keys are small, compression helps.
+        // Value column (1): None — uncompressed for fast single-row reads.
+        let kv_codecs = [CodecId::Zstd, CodecId::None];
+        let pax_block = PaxBlock::write_with_codecs(block_id, commit_timestamp, &columns, &kv_codecs)?;
         let block_bytes = pax_block.serialize()?;
+        let encrypted_bytes = encrypt_block_data(&block_bytes, tde)?;
 
-        // Apply TDE encryption (placeholder — currently a no-op)
-        let encrypted_bytes = encrypt_block_data(&block_bytes)?;
+        // Record block position within the SST file
+        let block_file_offset = current_sst_data.len() as u64;
+        let block_len = encrypted_bytes.len() as u32;
+        current_sst_index.add_block(block_file_offset, block_len);
 
-        // Write to disk
-        let sst_filename = format!("sst_{}.pax", block_id);
-        let sst_path = config.data_dir.join(&sst_filename);
+        // Track block metadata for ART updates
+        block_map.push(SstBlockInfo {
+            sst_index: sst_index_in_result.get(),
+            block_index: current_sst_block_count,
+            row_count: chunk.len(),
+        });
 
-        tokio::fs::write(&sst_path, &encrypted_bytes)
-            .await
-            .map_err(GalaxError::Io)?;
-
-        total_bytes += encrypted_bytes.len() as u64;
-        sst_paths.push(sst_path);
+        current_sst_data.extend_from_slice(&encrypted_bytes);
         block_ids.push(block_id);
+        current_sst_block_count += 1;
+
+        // Check if current SST has reached size limit
+        if current_sst_data.len() as u64 >= config.sst_size_bytes {
+            // Append block index + footer
+            let index_offset = current_sst_data.len() as u64;
+            let index_footer = current_sst_index.serialize_with_footer(index_offset);
+            current_sst_data.extend_from_slice(&index_footer);
+
+            // Write SST file to disk via IoScheduler BK queue
+            let sst_id = allocate_block_id();
+            let sst_filename = format!("sst_{}.pax", sst_id);
+            let sst_path = config.data_dir.join(&sst_filename);
+            io.write(&sst_path, 0, &current_sst_data, IoPriority::Background).await?;
+
+            total_bytes += current_sst_data.len() as u64;
+            sst_paths.push(sst_path);
+
+            // Reset for next SST
+            current_sst_data.clear();
+            current_sst_index = crate::sst::SstBlockIndex::new();
+            current_sst_block_count = 0;
+            sst_index_in_result.set(sst_index_in_result.get() + 1);
+        }
+    }
+
+    // Flush remaining blocks to a final SST file
+    if !current_sst_data.is_empty() {
+        let index_offset = current_sst_data.len() as u64;
+        let index_footer = current_sst_index.serialize_with_footer(index_offset);
+        current_sst_data.extend_from_slice(&index_footer);
+
+        let sst_id = allocate_block_id();
+        let sst_filename = format!("sst_{}.pax", sst_id);
+        let sst_path = config.data_dir.join(&sst_filename);
+        io.write(&sst_path, 0, &current_sst_data, IoPriority::Background).await?;
+
+        total_bytes += current_sst_data.len() as u64;
+        sst_paths.push(sst_path);
     }
 
     Ok(FlushResult {
@@ -241,6 +388,115 @@ pub async fn flush_memtable(
         rows_flushed: total_rows,
         bytes_written: total_bytes,
         checkpoint_seq_no: None,
+        block_map,
+    })
+}
+
+#[cfg(not(feature = "aegis-tde"))]
+async fn flush_memtable_inner(
+    memtable: &Memtable,
+    config: &FlushConfig,
+    commit_timestamp: Timestamp,
+    _tde: Option<&()>,
+    io: &dyn IoScheduler,
+) -> GalaxResult<FlushResult> {
+    // Step 1: Get all entries sorted by primary key
+    let entries = memtable.iter_all();
+
+    if entries.is_empty() {
+        return Ok(FlushResult {
+            sst_paths: Vec::new(),
+            block_ids: Vec::new(),
+            rows_flushed: 0,
+            bytes_written: 0,
+            checkpoint_seq_no: None,
+            block_map: Vec::new(),
+        });
+    }
+
+    // Ensure the data directory exists
+    tokio::fs::create_dir_all(&config.data_dir)
+        .await
+        .map_err(GalaxError::Io)?;
+
+    // Step 2: Split entries into small block-sized chunks (~100 rows each).
+    let chunks = split_into_blocks(&entries, config);
+
+    let mut sst_paths: Vec<PathBuf> = Vec::new();
+    let mut block_ids: Vec<BlockId> = Vec::new();
+    let mut block_map: Vec<SstBlockInfo> = Vec::new();
+    let mut total_bytes: u64 = 0;
+    let total_rows = entries.len();
+
+    // Step 3: Pack multiple PAX blocks into SST files with block indexes.
+    let mut current_sst_data: Vec<u8> = Vec::new();
+    let mut current_sst_index = crate::sst::SstBlockIndex::new();
+    let mut current_sst_block_count: u32 = 0;
+    let sst_index_in_result = std::cell::Cell::new(0usize);
+
+    for chunk in &chunks {
+        let block_id = allocate_block_id();
+        let columns = entries_to_columns(chunk);
+
+        let kv_codecs = [CodecId::Zstd, CodecId::None];
+        let pax_block = PaxBlock::write_with_codecs(block_id, commit_timestamp, &columns, &kv_codecs)?;
+        let block_bytes = pax_block.serialize()?;
+
+        let block_file_offset = current_sst_data.len() as u64;
+        let block_len = block_bytes.len() as u32;
+        current_sst_index.add_block(block_file_offset, block_len);
+
+        block_map.push(SstBlockInfo {
+            sst_index: sst_index_in_result.get(),
+            block_index: current_sst_block_count,
+            row_count: chunk.len(),
+        });
+
+        current_sst_data.extend_from_slice(&block_bytes);
+        block_ids.push(block_id);
+        current_sst_block_count += 1;
+
+        if current_sst_data.len() as u64 >= config.sst_size_bytes {
+            let index_offset = current_sst_data.len() as u64;
+            let index_footer = current_sst_index.serialize_with_footer(index_offset);
+            current_sst_data.extend_from_slice(&index_footer);
+
+            let sst_id = allocate_block_id();
+            let sst_filename = format!("sst_{}.pax", sst_id);
+            let sst_path = config.data_dir.join(&sst_filename);
+            io.write(&sst_path, 0, &current_sst_data, IoPriority::Background).await?;
+
+            total_bytes += current_sst_data.len() as u64;
+            sst_paths.push(sst_path);
+
+            current_sst_data.clear();
+            current_sst_index = crate::sst::SstBlockIndex::new();
+            current_sst_block_count = 0;
+            sst_index_in_result.set(sst_index_in_result.get() + 1);
+        }
+    }
+
+    if !current_sst_data.is_empty() {
+        let index_offset = current_sst_data.len() as u64;
+        let index_footer = current_sst_index.serialize_with_footer(index_offset);
+        current_sst_data.extend_from_slice(&index_footer);
+
+        let sst_id = allocate_block_id();
+        let sst_filename = format!("sst_{}.pax", sst_id);
+        let sst_path = config.data_dir.join(&sst_filename);
+        io.write(&sst_path, 0, &current_sst_data, IoPriority::Background).await?;
+
+        total_bytes += current_sst_data.len() as u64;
+        sst_paths.push(sst_path);
+    }
+
+    Ok(FlushResult {
+        sst_paths,
+        block_ids,
+        rows_flushed: total_rows,
+        bytes_written: total_bytes,
+        checkpoint_seq_no: None,
+        block_map,
     })
 }
 
@@ -258,9 +514,10 @@ pub async fn flush_memtable_with_wal(
     config: &FlushConfig,
     commit_timestamp: Timestamp,
     wal_writer: &WalWriter,
+    io: &dyn IoScheduler,
 ) -> GalaxResult<FlushResult> {
     // Step 1: Flush memtable to SST files
-    let mut result = flush_memtable(memtable, config, commit_timestamp).await?;
+    let mut result = flush_memtable(memtable, config, commit_timestamp, io).await?;
 
     // Step 2: Write CHECKPOINT record to WAL
     let checkpoint_seq_no = wal_writer
@@ -285,7 +542,13 @@ mod tests {
     use crate::memtable::Memtable;
     use crate::pax::PaxBlock;
     use crate::wal::{WalWriter, WalWriterConfig};
+    use galaxdb_io::TokioScheduler;
     use std::time::Duration;
+
+    /// Helper: create a TokioScheduler for tests.
+    fn test_io() -> TokioScheduler {
+        TokioScheduler::new()
+    }
 
     /// Helper: create a memtable with some test data.
     fn create_test_memtable(num_entries: usize) -> Memtable {
@@ -309,7 +572,7 @@ mod tests {
         };
 
         let memtable = Memtable::new(1024 * 1024 * 1024);
-        let result = flush_memtable(&memtable, &config, 100).await.unwrap();
+        let result = flush_memtable(&memtable, &config, 100, &test_io()).await.unwrap();
 
         assert!(result.sst_paths.is_empty());
         assert!(result.block_ids.is_empty());
@@ -331,35 +594,46 @@ mod tests {
         let memtable = create_test_memtable(num_entries);
         memtable.seal();
 
-        let result = flush_memtable(&memtable, &config, 42).await.unwrap();
+        let result = flush_memtable(&memtable, &config, 42, &test_io()).await.unwrap();
 
         assert_eq!(result.rows_flushed, num_entries);
         assert!(!result.sst_paths.is_empty());
         assert!(!result.block_ids.is_empty());
         assert!(result.bytes_written > 0);
 
-        // Read back each SST file and verify it's a valid PAX block
+        // Read back each SST file and verify blocks via the block index
         for sst_path in &result.sst_paths {
             assert!(sst_path.exists());
 
-            let data = tokio::fs::read(sst_path).await.unwrap();
-            let block = PaxBlock::deserialize(&data)
-                .expect("SST file should contain a valid PAX block");
+            let file_data = tokio::fs::read(sst_path).await.unwrap();
+            let block_index = crate::sst::SstBlockIndex::from_file_data(&file_data)
+                .expect("SST file should have a valid block index");
 
-            // Verify block metadata
-            assert_eq!(block.header.commit_timestamp, 42);
-            assert_eq!(block.header.column_count, 2); // key + value columns
-            assert!(block.header.row_count > 0);
+            assert!(block_index.block_count() > 0, "SST should have at least one block");
 
-            // Verify we can read back the columns
-            let keys = block.read_column(0).unwrap();
-            let values = block.read_column(1).unwrap();
-            assert_eq!(keys.len(), block.header.row_count as usize);
-            assert_eq!(values.len(), block.header.row_count as usize);
+            for entry in &block_index.entries {
+                let start = entry.file_offset as usize;
+                let end = start + entry.block_len as usize;
+                let block_bytes = &file_data[start..end];
 
-            // Verify keys are sorted
-            for window in keys.windows(2) {
-                assert!(window[0] <= window[1], "keys should be sorted");
+                let block = PaxBlock::deserialize(block_bytes)
+                    .expect("each block in SST should be a valid PAX block");
+
+                // Verify block metadata
+                assert_eq!(block.header.commit_timestamp, 42);
+                assert_eq!(block.header.column_count, 2); // key + value columns
+                assert!(block.header.row_count > 0);
+
+                // Verify we can read back the columns
+                let keys = block.read_column(0).unwrap();
+                let values = block.read_column(1).unwrap();
+                assert_eq!(keys.len(), block.header.row_count as usize);
+                assert_eq!(values.len(), block.header.row_count as usize);
+
+                // Verify keys are sorted
+                for window in keys.windows(2) {
+                    assert!(window[0] <= window[1], "keys should be sorted");
+                }
             }
         }
     }
@@ -378,7 +652,7 @@ mod tests {
         let memtable = create_test_memtable(num_entries);
         memtable.seal();
 
-        let result = flush_memtable(&memtable, &config, 1).await.unwrap();
+        let result = flush_memtable(&memtable, &config, 1, &test_io()).await.unwrap();
 
         // Should have multiple SST files
         assert!(
@@ -388,12 +662,17 @@ mod tests {
         );
         assert_eq!(result.rows_flushed, num_entries);
 
-        // Verify total row count across all blocks
+        // Verify total row count across all blocks in all SSTs
         let mut total_rows = 0;
         for sst_path in &result.sst_paths {
             let data = tokio::fs::read(sst_path).await.unwrap();
-            let block = PaxBlock::deserialize(&data).unwrap();
-            total_rows += block.header.row_count as usize;
+            let block_index = crate::sst::SstBlockIndex::from_file_data(&data).unwrap();
+            for entry in &block_index.entries {
+                let start = entry.file_offset as usize;
+                let end = start + entry.block_len as usize;
+                let block = PaxBlock::deserialize(&data[start..end]).unwrap();
+                total_rows += block.header.row_count as usize;
+            }
         }
         assert_eq!(total_rows, num_entries);
     }
@@ -408,12 +687,13 @@ mod tests {
         };
 
         let memtable = create_test_memtable(10);
-        let result = flush_memtable(&memtable, &config, 1).await.unwrap();
+        let result = flush_memtable(&memtable, &config, 1, &test_io()).await.unwrap();
 
-        for (path, block_id) in result.sst_paths.iter().zip(result.block_ids.iter()) {
+        // SST files should follow the sst_N.pax naming convention
+        for path in &result.sst_paths {
             let filename = path.file_name().unwrap().to_str().unwrap();
-            let expected = format!("sst_{}.pax", block_id);
-            assert_eq!(filename, expected);
+            assert!(filename.starts_with("sst_"), "SST filename should start with sst_");
+            assert!(filename.ends_with(".pax"), "SST filename should end with .pax");
         }
     }
 
@@ -434,14 +714,20 @@ mod tests {
         // Insert another live value
         memtable.put(b"key-c".to_vec(), 3, Some(b"value-c".to_vec()));
 
-        let result = flush_memtable(&memtable, &config, 10).await.unwrap();
+        let result = flush_memtable(&memtable, &config, 10, &test_io()).await.unwrap();
 
         assert_eq!(result.rows_flushed, 3);
         assert_eq!(result.sst_paths.len(), 1);
 
-        // Read back and verify
+        // Read back and verify via block index
         let data = tokio::fs::read(&result.sst_paths[0]).await.unwrap();
-        let block = PaxBlock::deserialize(&data).unwrap();
+        let block_index = crate::sst::SstBlockIndex::from_file_data(&data).unwrap();
+        assert!(block_index.block_count() > 0);
+
+        // Read the first block (all 3 rows should be in one block with max_rows_per_block=1M)
+        let entry = &block_index.entries[0];
+        let block_bytes = &data[entry.file_offset as usize..(entry.file_offset as usize + entry.block_len as usize)];
+        let block = PaxBlock::deserialize(block_bytes).unwrap();
         assert_eq!(block.header.row_count, 3);
 
         let keys = block.read_column(0).unwrap();
@@ -493,7 +779,7 @@ mod tests {
         let memtable = create_test_memtable(50);
         memtable.seal();
 
-        let result = flush_memtable_with_wal(&memtable, &flush_config, 100, &wal_writer)
+        let result = flush_memtable_with_wal(&memtable, &flush_config, 100, &wal_writer, &test_io())
             .await
             .unwrap();
 
@@ -555,7 +841,7 @@ mod tests {
 
         let memtable1 = create_test_memtable(20);
         memtable1.seal();
-        let result1 = flush_memtable_with_wal(&memtable1, &flush_config, 50, &wal_writer)
+        let result1 = flush_memtable_with_wal(&memtable1, &flush_config, 50, &wal_writer, &test_io())
             .await
             .unwrap();
         let cp1 = result1.checkpoint_seq_no.unwrap();
@@ -574,7 +860,7 @@ mod tests {
 
         let memtable2 = create_test_memtable(10);
         memtable2.seal();
-        let result2 = flush_memtable_with_wal(&memtable2, &flush_config, 100, &wal_writer)
+        let result2 = flush_memtable_with_wal(&memtable2, &flush_config, 100, &wal_writer, &test_io())
             .await
             .unwrap();
         let cp2 = result2.checkpoint_seq_no.unwrap();

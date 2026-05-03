@@ -11,6 +11,7 @@ pub mod flush;
 pub mod memtable;
 pub mod pax;
 pub mod rate_limiter;
+pub mod sst;
 pub mod statistics;
 pub mod wal;
 pub mod write_controller;
