@@ -3,15 +3,18 @@
 //! Connects: Memtable + WAL + ART Index + Flush + Buffer Pool + Compaction
 //! into a single coherent interface for reading and writing rows.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use galaxdb_common::{GalaxError, GalaxResult, Timestamp};
 
 use crate::art::{ArtIndex, RowLocation};
+use crate::flush::{self, FlushConfig};
 use crate::memtable::MemtableManager;
+use crate::pax::PaxBlock;
 use crate::wal::{DurabilityMode, WalRecordType, WalWriter, WalWriterConfig};
 
 /// Configuration for the storage engine.
@@ -42,13 +45,56 @@ pub struct StoredRow {
     pub timestamp: Timestamp,
 }
 
+/// Tracks flushed SST files for the read path.
+struct SstEntry {
+    path: PathBuf,
+    /// Cached decoded block (loaded on first read).
+    cached_block: Option<PaxBlock>,
+}
+
+/// Registry of all SST files on disk.
+struct SstRegistry {
+    /// SST ID → entry.
+    entries: HashMap<u64, SstEntry>,
+}
+
+impl SstRegistry {
+    fn new() -> Self {
+        Self { entries: HashMap::new() }
+    }
+
+    fn register(&mut self, sst_id: u64, path: PathBuf) {
+        self.entries.insert(sst_id, SstEntry { path, cached_block: None });
+    }
+
+    /// Read a value from an SST file by block offset and row offset.
+    fn read_value(&mut self, sst_id: u64, _block_offset: u64, row_offset: u32) -> Option<Vec<u8>> {
+        let entry = self.entries.get_mut(&sst_id)?;
+
+        // Load and cache the block if not already cached
+        if entry.cached_block.is_none() {
+            let data = std::fs::read(&entry.path).ok()?;
+            let block = PaxBlock::deserialize(&data).ok()?;
+            entry.cached_block = Some(block);
+        }
+
+        let block = entry.cached_block.as_ref()?;
+
+        // Read the value column (column 1 in our key-value schema)
+        let values = block.read_column(1).ok()?;
+        values.get(row_offset as usize).cloned()
+    }
+}
+
 /// The storage engine — unified read/write API.
 pub struct Engine {
     config: EngineConfig,
     memtable_mgr: MemtableManager,
     art: Arc<ArtIndex>,
     wal: Arc<WalWriter>,
+    sst_registry: RwLock<SstRegistry>,
     next_timestamp: AtomicU64,
+    next_sst_id: AtomicU64,
     row_count: AtomicU64,
 }
 
@@ -76,7 +122,9 @@ impl Engine {
             memtable_mgr,
             art: Arc::new(ArtIndex::new()),
             wal,
+            sst_registry: RwLock::new(SstRegistry::new()),
             next_timestamp: AtomicU64::new(1),
+            next_sst_id: AtomicU64::new(1),
             row_count: AtomicU64::new(0),
         })
     }
@@ -188,17 +236,73 @@ impl Engine {
         Ok(count)
     }
 
-    /// Get a row by primary key. Reads from memtable (via ART index).
+    /// Get a row by primary key. Checks memtable first, then SST files on disk.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         // Check ART index first
-        let _location = self.art.lookup(key)?;
+        let location = self.art.lookup(key)?;
 
-        // Read from memtable (checks active + sealed)
-        match self.memtable_mgr.get(key) {
-            Some(Some(value)) => Some(value),
-            Some(None) => None, // tombstone
-            None => None,       // not found
+        match &location {
+            RowLocation::Memtable { .. } => {
+                // Read from memtable (checks active + sealed)
+                match self.memtable_mgr.get(key) {
+                    Some(Some(value)) => Some(value),
+                    Some(None) => None, // tombstone
+                    None => None,
+                }
+            }
+            RowLocation::SST { sst_id, block_offset, row_offset } => {
+                // Read from SST file on disk
+                let mut registry = self.sst_registry.write().ok()?;
+                registry.read_value(*sst_id, *block_offset, *row_offset)
+            }
         }
+    }
+
+    /// Flush the active memtable to an SST file on disk.
+    /// Updates ART entries to point to the SST instead of the memtable.
+    pub async fn flush_memtable(&self) -> GalaxResult<u64> {
+        let active = self.memtable_mgr.active();
+        let entries = active.iter_all();
+
+        if entries.is_empty() {
+            return Ok(0);
+        }
+
+        let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
+        let flush_config = FlushConfig {
+            data_dir: self.config.data_dir.clone(),
+            sst_size_bytes: 64 * 1024 * 1024,
+            max_rows_per_block: 1_000_000,
+        };
+
+        let result = flush::flush_memtable(&active, &flush_config, sst_id).await?;
+
+        // Register SST files and update ART entries
+        if let Some(sst_path) = result.sst_paths.first() {
+            {
+                let mut registry = self.sst_registry.write()
+                    .map_err(|_| GalaxError::Internal("sst registry lock".to_string()))?;
+                registry.register(sst_id, sst_path.clone());
+            }
+
+            // Update ART entries: memtable → SST
+            for (row_idx, (key, _)) in entries.iter().enumerate() {
+                self.art.insert(
+                    key.clone(),
+                    RowLocation::SST {
+                        sst_id,
+                        block_offset: 0,
+                        row_offset: row_idx as u32,
+                    },
+                );
+            }
+        }
+
+        // Seal the memtable so new writes go to a fresh one
+        active.seal();
+        self.memtable_mgr.on_flush_complete(active.size());
+
+        Ok(result.rows_flushed as u64)
     }
 
     /// Delete a row by primary key. Writes tombstone to WAL + memtable.
@@ -395,6 +499,41 @@ mod tests {
         let rows = engine.scan_all();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].0, b"b");
+    }
+
+    #[tokio::test]
+    async fn flush_and_read_from_sst() {
+        let engine = test_engine();
+
+        // Write 100 rows
+        for i in 0..100u32 {
+            let key = format!("sst-key-{:04}", i).into_bytes();
+            let value = format!("sst-value-{:04}", i).into_bytes();
+            engine.put(key, value).await.unwrap();
+        }
+
+        assert_eq!(engine.row_count(), 100);
+
+        // Verify reads work from memtable
+        assert_eq!(
+            engine.get(b"sst-key-0050"),
+            Some(b"sst-value-0050".to_vec())
+        );
+
+        // Flush to SST
+        let flushed = engine.flush_memtable().await.unwrap();
+        assert_eq!(flushed, 100);
+
+        // Reads should now come from SST (ART points to SST location)
+        let result = engine.get(b"sst-key-0050");
+        assert_eq!(result, Some(b"sst-value-0050".to_vec()));
+
+        // Verify all 100 rows are readable from SST
+        for i in 0..100u32 {
+            let key = format!("sst-key-{:04}", i).into_bytes();
+            let expected = format!("sst-value-{:04}", i).into_bytes();
+            assert_eq!(engine.get(&key), Some(expected), "failed at key {}", i);
+        }
     }
 
     #[tokio::test]
