@@ -13,6 +13,7 @@ aws-kms = []
 [dependencies]
 galaxdb-common.workspace = true
 aes-gcm.workspace = true
+aegis.workspace = true
 rand.workspace = true
 
 [dev-dependencies]

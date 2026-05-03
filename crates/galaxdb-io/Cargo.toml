@@ -11,6 +11,10 @@ galaxdb-common.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
 tempfile = "3"

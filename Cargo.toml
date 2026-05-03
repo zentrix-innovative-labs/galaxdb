@@ -48,6 +48,7 @@ memmap2 = "0.9"
 
 # Encryption
 aes-gcm = "0.10"
+aegis = "0.9"
 
 # AWS KMS
 aws-sdk-kms = "1"
@@ -92,7 +93,7 @@ axum = "0.7"
 # ort = "2"
 
 # io_uring (Linux only)
-# io-uring = "0.7"
+io-uring = "0.7"
 
 # Internal crates
 galaxdb-common = { path = "crates/galaxdb-common" }
