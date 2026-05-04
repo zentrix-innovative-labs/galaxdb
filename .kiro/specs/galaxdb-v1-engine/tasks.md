@@ -180,14 +180,14 @@
 
 ## Month 3: Vector Index & Embedding Sidecar
 
-- [ ] 23. Implement HNSW base graph — galaxdb-vector (Req 17)
-  - [ ] 23.1 Implement HNSW graph construction algorithm (insert with layer selection, neighbor selection with heuristic pruning)
-  - [ ] 23.2 Implement mmap'd graph file format: metadata header (M, ef_construction, max_level, entry_point) + adjacency lists + quantized vector payloads
-  - [ ] 23.3 Implement graph search: greedy beam search from entry point through layers, ef parameter for search width
-  - [ ] 23.4 Implement cosine similarity distance computation with SIMD acceleration
-  - [ ] 23.5 Write tests: graph construction correctness, recall@10 >= 0.95 on SIFT-1M equivalent, mmap read-only access
+- [x] 23. Implement HNSW base graph — galaxdb-vector (Req 17)
+  - [x] 23.1 Implement HNSW graph construction algorithm (insert with layer selection, neighbor selection with heuristic pruning)
+  - [x] 23.2 Implement mmap'd graph file format: metadata header (M, ef_construction, max_level, entry_point) + adjacency lists + quantized vector payloads
+  - [x] 23.3 Implement graph search: greedy beam search from entry point through layers, ef parameter for search width
+  - [x] 23.4 Implement cosine similarity distance computation with SIMD acceleration
+  - [x] 23.5 Write tests: graph construction correctness, recall@10 >= 0.95 on SIFT-1M equivalent, mmap read-only access
 
-- [ ] 24. Implement delta buffer — galaxdb-vector (Req 17)
+- [-] 24. Implement delta buffer — galaxdb-vector (Req 17)
   - [ ] 24.1 Implement `DeltaBuffer` with in-memory vector storage, tombstone set, and quantized copies
   - [ ] 24.2 Implement WAL integration: DELTA_INSERT and DELTA_TOMBSTONE record types written to unified WAL
   - [ ] 24.3 Implement exact brute-force k-NN search over delta buffer

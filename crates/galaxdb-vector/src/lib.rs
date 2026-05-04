@@ -9,6 +9,8 @@
 
 pub mod distance;
 pub mod hnsw;
+pub mod hnsw_file;
 
 pub use distance::{cosine_distance, cosine_similarity, normalize};
 pub use hnsw::{HnswConfig, HnswGraph};
+pub use hnsw_file::{MmapHnswGraph, write_hnsw_file};

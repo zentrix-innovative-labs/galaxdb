@@ -443,6 +443,19 @@ impl HnswGraph {
         self.nodes.get(node_idx as usize).map(|n| n.external_id)
     }
 
+    /// Get the max layer for a node.
+    pub fn node_max_layer(&self, node_idx: u32) -> usize {
+        self.nodes.get(node_idx as usize).map_or(0, |n| n.max_layer)
+    }
+
+    /// Get the neighbors of a node at a specific layer.
+    pub fn get_neighbors(&self, node_idx: u32, layer: usize) -> &[u32] {
+        self.nodes
+            .get(node_idx as usize)
+            .and_then(|n| n.neighbors.get(layer))
+            .map_or(&[], |v| v.as_slice())
+    }
+
     /// Get the config.
     pub fn config(&self) -> &HnswConfig {
         &self.config
