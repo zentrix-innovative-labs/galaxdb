@@ -7,6 +7,8 @@ edition = "2024"
 galaxdb-common = { path = "../crates/galaxdb-common" }
 galaxdb-storage = { path = "../crates/galaxdb-storage" }
 galaxdb-io = { path = "../crates/galaxdb-io" }
+galaxdb-vector = { path = "../crates/galaxdb-vector" }
+galaxdb-sidecar = { path = "../crates/galaxdb-sidecar" }
 tokio = { version = "1", features = ["full"] }
 rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1"

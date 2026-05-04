@@ -1,11 +1,15 @@
 //! GalaxDB Macro-Benchmark Suite
 //!
-//! Standalone binary that runs three production-pattern workloads:
+//! Standalone binary that runs production-pattern workloads:
 //! 1. OLTP Write + Point Read
 //! 2. OLAP Column Scan
 //! 3. Mixed OLTP + OLAP
+//! 4. Cold-Cache Read (50M rows)
+//! 5. Vector Search (HNSW + SEMANTIC_MATCH)
 //!
 //! Outputs structured JSON results to stdout.
+
+mod vector_bench;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1106,6 +1110,20 @@ async fn main() {
         // Cold-cache benchmark: NOT included in "all" because it takes 10+ minutes
         // Usage: --workload coldcache --rows 50000000
         run_coldcache(cli.rows, 100_000, &data_dir).await;
+        return;
+    }
+
+    if workload == "vector" || workload == "vector1m" {
+        // Vector search benchmark: 1M vectors, 128-dim
+        // Usage: --workload vector1m
+        vector_bench::run_vector_benchmark(1_000_000, 128, 500);
+        return;
+    }
+
+    if workload == "vector10m" {
+        // Vector search benchmark: 10M vectors, 128-dim
+        // Usage: --workload vector10m
+        vector_bench::run_vector_benchmark(10_000_000, 128, 200);
         return;
     }
 
