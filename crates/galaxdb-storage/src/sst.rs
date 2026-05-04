@@ -37,9 +37,6 @@
 //! 4. `IoScheduler::read(file, file_offset, block_len, High)` — one NVMe read (~18µs for 64KB)
 //! 5. `PaxBlock::deserialize(block_data)` → `read_column_row(1, row_offset)`
 
-use std::io::Write;
-use std::path::Path;
-
 use galaxdb_common::{GalaxError, GalaxResult};
 
 /// SST file footer magic number.

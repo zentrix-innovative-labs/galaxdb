@@ -10,7 +10,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self};
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::pin::Pin;

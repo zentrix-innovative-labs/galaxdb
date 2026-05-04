@@ -12,11 +12,11 @@
 
 use std::io::{BufReader, BufWriter};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use galaxdb_common::{GalaxError, GalaxResult};
 
@@ -337,6 +337,8 @@ impl Drop for SidecarManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::time::Instant;
 
     fn test_config(socket_path: &Path) -> SidecarConfig {
         // Find the sidecar binary in the target directory

@@ -21,7 +21,7 @@
 //! - RaBitQ: "Quantizing High-Dimensional Vectors with a Theoretical Error
 //!   Bound for Approximate Nearest Neighbor Search" (arXiv:2405.12497)
 
-use galaxdb_common::{GalaxError, GalaxResult};
+
 
 /// Quantizer trait — all quantization methods implement this.
 pub trait Quantizer: Send + Sync {

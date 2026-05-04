@@ -15,7 +15,7 @@ use galaxdb_io::{IoScheduler, IoPriority};
 use crate::art::{ArtIndex, RowLocation};
 use crate::flush::{self, FlushConfig};
 use crate::memtable::MemtableManager;
-use crate::pax::PaxBlock;
+
 use crate::wal::{DurabilityMode, WalRecordType, WalWriter, WalWriterConfig};
 
 /// Configuration for the storage engine.

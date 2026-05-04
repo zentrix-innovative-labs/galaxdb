@@ -14,11 +14,7 @@
 //! If the sidecar is unavailable, returns an error:
 //! "semantic search temporarily unavailable — embedding sidecar is down"
 
-use std::collections::HashSet;
-
-use galaxdb_common::{GalaxError, GalaxResult};
-
-use crate::delta_buffer::{DeltaBuffer, DeltaSearchResult, union_and_rerank};
+use crate::delta_buffer::{DeltaBuffer, union_and_rerank};
 use crate::distance::cosine_distance;
 use crate::hnsw::HnswGraph;
 
@@ -191,6 +187,7 @@ pub fn execute_brute_force_filtered(
 mod tests {
     use super::*;
     use crate::hnsw::HnswConfig;
+    use galaxdb_common::GalaxError;
     use rand::rngs::SmallRng;
     use rand::{Rng, SeedableRng};
 

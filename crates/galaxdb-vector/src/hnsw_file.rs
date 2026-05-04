@@ -43,7 +43,7 @@ use std::path::Path;
 use galaxdb_common::{GalaxError, GalaxResult};
 use memmap2::Mmap;
 
-use crate::hnsw::{HnswConfig, HnswGraph};
+use crate::hnsw::HnswGraph;
 
 /// Magic number for HNSW files.
 const HNSW_MAGIC: u32 = 0x484E5357; // "HNSW"
@@ -101,7 +101,7 @@ pub fn write_hnsw_file(graph: &HnswGraph, path: &Path) -> GalaxResult<()> {
     // Write node metadata
     for i in 0..graph.len() {
         let ext_id = graph.get_external_id(i as u32).unwrap_or(0);
-        let vector = graph.get_vector(i as u32).unwrap();
+        let _vector = graph.get_vector(i as u32).unwrap();
         // We need max_layer from the node — get it from the graph
         // For now, infer from the adjacency structure
         let max_layer = graph.node_max_layer(i as u32);

@@ -10,9 +10,7 @@
 //!
 //! Emergency merge is triggered when tombstones > 20% of indexed vectors.
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
 use galaxdb_common::{GalaxError, GalaxResult};
 

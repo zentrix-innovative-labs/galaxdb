@@ -359,7 +359,7 @@ impl HnswGraph {
     /// all edges from pointing in the same direction.
     fn select_neighbors_heuristic(
         &self,
-        query: &[f32],
+        _query: &[f32],
         candidates: &[Candidate],
         max_neighbors: usize,
     ) -> Vec<Candidate> {
@@ -644,5 +644,48 @@ mod tests {
         // The entry point's neighbors should include the outlier
         // for directional diversity, not just the 3 nearest cluster members
         assert_eq!(graph.len(), 5);
+    }
+
+    #[test]
+    fn recall_at_10_on_10000_vectors() {
+        // Test recall at 10K scale to catch scaling bugs
+        let dim = 64; // smaller dim for faster test
+        let n = 10_000;
+        let k = 10;
+        let ef_search = 100;
+        let num_queries = 20;
+
+        let config = HnswConfig::new(dim).with_m(16).with_ef_construction(200);
+        let mut graph = HnswGraph::new(config);
+        let mut rng = SmallRng::seed_from_u64(123);
+
+        let mut vectors: Vec<Vec<f32>> = Vec::new();
+        for i in 0..n {
+            let v = random_vector(&mut rng, dim);
+            vectors.push(v.clone());
+            graph.insert(i as u64, v);
+        }
+
+        let mut total_recall = 0.0;
+        for _ in 0..num_queries {
+            let query = random_vector(&mut rng, dim);
+            let mut distances: Vec<(u64, f32)> = vectors.iter().enumerate()
+                .map(|(i, v)| (i as u64, cosine_distance(&query, v)))
+                .collect();
+            distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+            let ground_truth: HashSet<u64> = distances.iter().take(k).map(|d| d.0).collect();
+
+            let results = graph.search(&query, k, ef_search);
+            let found: HashSet<u64> = results.iter().map(|r| r.0).collect();
+            total_recall += ground_truth.intersection(&found).count() as f64 / k as f64;
+        }
+
+        let avg_recall = total_recall / num_queries as f64;
+        eprintln!("10K recall@{}: {:.4}", k, avg_recall);
+        assert!(
+            avg_recall >= 0.90,
+            "recall@{} at 10K should be >= 0.90, got {:.4}",
+            k, avg_recall
+        );
     }
 }

@@ -64,6 +64,7 @@ fn cosine_similarity_scalar(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,fma")]
 unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f32 {
+    unsafe {
     use std::arch::x86_64::*;
 
     let n = a.len();
@@ -111,6 +112,7 @@ unsafe fn cosine_similarity_avx2(a: &[f32], b: &[f32]) -> f32 {
         return 0.0;
     }
     dot_r / denom
+    }
 }
 
 /// Horizontal sum of 8 f32 values in a __m256 register.

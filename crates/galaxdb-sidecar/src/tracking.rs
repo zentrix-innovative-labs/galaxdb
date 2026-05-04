@@ -15,7 +15,7 @@
 //! 4. Re-embedding completes → `_embedding_stale = false`, `_embedding_model_version = "v2.0"`
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 
 /// Embedding metadata for a single row.
 #[derive(Debug, Clone)]

@@ -158,7 +158,7 @@ pub fn run_vector_benchmark(num_vectors: usize, dim: usize, num_queries: usize) 
         // Simulate a filter that selects 1% of vectors
         let filter_size = (num_vectors as f64 * 0.01) as usize;
         let filtered: Vec<(u64, Vec<f32>)> = (0..filter_size)
-            .map(|i| {
+            .map(|_i| {
                 let idx = rng.gen_range(0..num_vectors);
                 (idx as u64, vectors[idx].clone())
             })
