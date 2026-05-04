@@ -227,21 +227,21 @@
   - [x] 28.6 Implement backlog drain: background scanner drains FIFO when sidecar capacity recovers
   - [x] 28.7 Write tests: sidecar spawn/kill/restart, backlog overflow and drain, degraded mode behavior
 
-- [-] 29. Implement model-version tracking — galaxdb-sidecar (Req 20)
-  - [ ] 29.1 Store `_embedding_model_version` system column with each embedded row
-  - [ ] 29.2 Implement model version change detection: compare sidecar-reported version with stored versions
-  - [ ] 29.3 Implement stale marking: set `_embedding_stale = true` on rows with old model version, enqueue for re-embedding
-  - [ ] 29.4 Implement `SHOW EMBEDDING HEALTH`: query catalog for version distribution and re-embedding progress
-  - [ ] 29.5 Write tests: version tracking on insert, stale marking on model change, SHOW EMBEDDING HEALTH output
+- [x] 29. Implement model-version tracking — galaxdb-sidecar (Req 20)
+  - [x] 29.1 Store `_embedding_model_version` system column with each embedded row
+  - [x] 29.2 Implement model version change detection: compare sidecar-reported version with stored versions
+  - [x] 29.3 Implement stale marking: set `_embedding_stale = true` on rows with old model version, enqueue for re-embedding
+  - [x] 29.4 Implement `SHOW EMBEDDING HEALTH`: query catalog for version distribution and re-embedding progress
+  - [x] 29.5 Write tests: version tracking on insert, stale marking on model change, SHOW EMBEDDING HEALTH output
 
-- [ ] 30. Implement embedding staleness tracking — galaxdb-sidecar (Req 39)
-  - [ ] 30.1 Add `_embedding_stale: bool` system column to rows with embedding columns
-  - [ ] 30.2 Set `_embedding_stale = true` on INSERT (before embedding generated), clear on embedding completion
-  - [ ] 30.3 Set `_embedding_stale = true` on model version change for affected rows
-  - [ ] 30.4 Write staleness flag through standard LSM update path (same WAL, same MVCC) for reader consistency
-  - [ ] 30.5 Write tests: stale flag lifecycle (insert → stale → embedded → not stale), model change → stale
+- [x] 30. Implement embedding staleness tracking — galaxdb-sidecar (Req 39)
+  - [x] 30.1 Add `_embedding_stale: bool` system column to rows with embedding columns
+  - [x] 30.2 Set `_embedding_stale = true` on INSERT (before embedding generated), clear on embedding completion
+  - [x] 30.3 Set `_embedding_stale = true` on model version change for affected rows
+  - [x] 30.4 Write staleness flag through standard LSM update path (same WAL, same MVCC) for reader consistency
+  - [x] 30.5 Write tests: stale flag lifecycle (insert → stale → embedded → not stale), model change → stale
 
-- [ ] 31. Implement SEMANTIC_MATCH execution — galaxdb-sql, galaxdb-vector (Req 21)
+- [-] 31. Implement SEMANTIC_MATCH execution — galaxdb-sql, galaxdb-vector (Req 21)
   - [ ] 31.1 Implement query-time embedding: send query text to sidecar, receive query vector
   - [ ] 31.2 Implement HNSW + delta buffer search with union + re-rank pipeline
   - [ ] 31.3 Implement similarity threshold filtering on results
