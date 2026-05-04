@@ -617,6 +617,7 @@ name = "galaxdb-vector"
 version = "0.1.0"
 dependencies = [
  "galaxdb-common",
+ "half",
  "memmap2",
  "rand",
  "tempfile",

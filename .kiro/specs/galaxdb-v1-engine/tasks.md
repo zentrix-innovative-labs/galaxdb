@@ -202,15 +202,15 @@
   - [x] 25.5 Implement crash recovery: replay WAL delta records in batches of 1000 to rebuild delta buffer
   - [x] 25.6 Write tests: merge produces correct graph, atomic rename crash safety, recovery rebuilds delta buffer
 
-- [-] 26. Implement platform-aware quantization — galaxdb-vector (Req 18)
-  - [ ] 26.1 Define `Quantizer` trait: quantize, dequantize, distance (SIMD-accelerated), compression_ratio
-  - [ ] 26.2 Implement `Sq8Quantizer`: int8 scalar quantization with AVX2/AVX-512 SIMD distance kernels (4× compression)
-  - [ ] 26.3 Implement `Fp16Quantizer`: half-precision float with ARM NEON SIMD distance kernels (2× compression)
-  - [ ] 26.4 Implement `RabitqQuantizer` (opt-in): random orthogonal rotation matrix + binary quantization (32× compression)
-  - [ ] 26.5 Implement platform detection at startup: x86-64+AVX2 → SQ8, ARM64 → FP16, configurable override
-  - [ ] 26.6 Write tests: quantize/dequantize round-trip accuracy, distance computation correctness, platform detection
+- [x] 26. Implement platform-aware quantization — galaxdb-vector (Req 18)
+  - [x] 26.1 Define `Quantizer` trait: quantize, dequantize, distance (SIMD-accelerated), compression_ratio
+  - [x] 26.2 Implement `Sq8Quantizer`: int8 scalar quantization with AVX2/AVX-512 SIMD distance kernels (4× compression)
+  - [x] 26.3 Implement `Fp16Quantizer`: half-precision float with ARM NEON SIMD distance kernels (2× compression)
+  - [x] 26.4 Implement `RabitqQuantizer` (opt-in): random orthogonal rotation matrix + binary quantization (32× compression)
+  - [x] 26.5 Implement platform detection at startup: x86-64+AVX2 → SQ8, ARM64 → FP16, configurable override
+  - [x] 26.6 Write tests: quantize/dequantize round-trip accuracy, distance computation correctness, platform detection
 
-- [ ] 27. Implement embedding sidecar binary — galaxdb-sidecar (Req 19)
+- [-] 27. Implement embedding sidecar binary — galaxdb-sidecar (Req 19)
   - [ ] 27.1 Create galaxdb-sidecar binary crate with `ort` (ONNX Runtime) dependency
   - [ ] 27.2 Implement ONNX model loading and session creation for sentence-transformer models
   - [ ] 27.3 Implement Unix socket server with length-prefixed JSON protocol (request: row_id + text, response: row_id + embedding + model_version)
