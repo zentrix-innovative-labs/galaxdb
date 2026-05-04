@@ -153,12 +153,9 @@ impl SstRegistry {
         io: &dyn IoScheduler,
     ) -> Option<Vec<u8>> {
         let entry = self.entries.get(&sst_id)?;
-
-        // Look up the block in the index → exact file offset + length
         let block_info = entry.block_index.get_block(block_offset)?;
 
-        // Targeted pread: read ONLY the specific block (~64KB), not the whole SST (~8MB).
-        // This is the key optimization: one NVMe read of ~64KB = ~18µs.
+        // Targeted pread: one NVMe read of ~62KB via io_uring HP queue
         let block_bytes = io.read_sync(
             &entry.path,
             block_info.file_offset,
@@ -177,8 +174,10 @@ impl SstRegistry {
             block_bytes
         };
 
-        let block = PaxBlock::deserialize(&data).ok()?;
-        block.read_column_row(1, row_offset).ok()
+        // Zero-copy row extraction: parses minimal header, slices directly
+        // into column data, scans length prefixes to target row.
+        // No PaxBlock struct allocation, no 62KB memcpy.
+        crate::pax::read_value_from_raw_block(&data, 1, row_offset).ok()
     }
 
     #[cfg(not(feature = "aegis-tde"))]
@@ -190,10 +189,9 @@ impl SstRegistry {
         io: &dyn IoScheduler,
     ) -> Option<Vec<u8>> {
         let entry = self.entries.get(&sst_id)?;
-
         let block_info = entry.block_index.get_block(block_offset)?;
 
-        // Targeted pread: read ONLY the specific block
+        // Targeted pread: one NVMe read of ~62KB
         let block_bytes = io.read_sync(
             &entry.path,
             block_info.file_offset,
@@ -201,8 +199,8 @@ impl SstRegistry {
             IoPriority::High,
         ).ok()?;
 
-        let block = PaxBlock::deserialize(&block_bytes).ok()?;
-        block.read_column_row(1, row_offset).ok()
+        // Zero-copy row extraction
+        crate::pax::read_value_from_raw_block(&block_bytes, 1, row_offset).ok()
     }
 }
 
