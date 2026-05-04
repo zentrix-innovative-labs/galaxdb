@@ -210,15 +210,15 @@
   - [x] 26.5 Implement platform detection at startup: x86-64+AVX2 → SQ8, ARM64 → FP16, configurable override
   - [x] 26.6 Write tests: quantize/dequantize round-trip accuracy, distance computation correctness, platform detection
 
-- [-] 27. Implement embedding sidecar binary — galaxdb-sidecar (Req 19)
-  - [ ] 27.1 Create galaxdb-sidecar binary crate with `ort` (ONNX Runtime) dependency
-  - [ ] 27.2 Implement ONNX model loading and session creation for sentence-transformer models
-  - [ ] 27.3 Implement Unix socket server with length-prefixed JSON protocol (request: row_id + text, response: row_id + embedding + model_version)
-  - [ ] 27.4 Implement parent PID monitoring: Linux `prctl(PR_SET_PDEATHSIG)`, macOS `kqueue` EVFILT_PROC
-  - [ ] 27.5 Implement heartbeat: ping every 5 seconds, engine expects response within 2 seconds
-  - [ ] 27.6 Write tests: model loading, embedding generation correctness, Unix socket communication, parent death detection
+- [x] 27. Implement embedding sidecar binary — galaxdb-sidecar (Req 19)
+  - [x] 27.1 Create galaxdb-sidecar binary crate with `ort` (ONNX Runtime) dependency
+  - [x] 27.2 Implement ONNX model loading and session creation for sentence-transformer models
+  - [x] 27.3 Implement Unix socket server with length-prefixed JSON protocol (request: row_id + text, response: row_id + embedding + model_version)
+  - [x] 27.4 Implement parent PID monitoring: Linux `prctl(PR_SET_PDEATHSIG)`, macOS `kqueue` EVFILT_PROC
+  - [x] 27.5 Implement heartbeat: ping every 5 seconds, engine expects response within 2 seconds
+  - [x] 27.6 Write tests: model loading, embedding generation correctness, Unix socket communication, parent death detection
 
-- [ ] 28. Implement sidecar manager in engine — galaxdb-sidecar (Req 19)
+- [-] 28. Implement sidecar manager in engine — galaxdb-sidecar (Req 19)
   - [ ] 28.1 Implement `SidecarManager`: spawn sidecar as child process, manage lifecycle
   - [ ] 28.2 Implement crash detection: 3 missed heartbeats → enter degraded mode
   - [ ] 28.3 Implement restart with exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s cap

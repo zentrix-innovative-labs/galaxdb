@@ -582,6 +582,12 @@ name = "galaxdb-sidecar"
 version = "0.1.0"
 dependencies = [
  "galaxdb-common",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
