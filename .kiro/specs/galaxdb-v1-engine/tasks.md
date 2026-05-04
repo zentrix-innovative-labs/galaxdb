@@ -187,14 +187,14 @@
   - [x] 23.4 Implement cosine similarity distance computation with SIMD acceleration
   - [x] 23.5 Write tests: graph construction correctness, recall@10 >= 0.95 on SIFT-1M equivalent, mmap read-only access
 
-- [-] 24. Implement delta buffer — galaxdb-vector (Req 17)
-  - [ ] 24.1 Implement `DeltaBuffer` with in-memory vector storage, tombstone set, and quantized copies
-  - [ ] 24.2 Implement WAL integration: DELTA_INSERT and DELTA_TOMBSTONE record types written to unified WAL
-  - [ ] 24.3 Implement exact brute-force k-NN search over delta buffer
-  - [ ] 24.4 Implement union + re-rank: combine HNSW candidates with delta buffer candidates, re-rank by exact cosine similarity from PAX blocks
-  - [ ] 24.5 Write tests: delta insert/search, tombstone exclusion, union+re-rank correctness
+- [x] 24. Implement delta buffer — galaxdb-vector (Req 17)
+  - [x] 24.1 Implement `DeltaBuffer` with in-memory vector storage, tombstone set, and quantized copies
+  - [x] 24.2 Implement WAL integration: DELTA_INSERT and DELTA_TOMBSTONE record types written to unified WAL
+  - [x] 24.3 Implement exact brute-force k-NN search over delta buffer
+  - [x] 24.4 Implement union + re-rank: combine HNSW candidates with delta buffer candidates, re-rank by exact cosine similarity from PAX blocks
+  - [x] 24.5 Write tests: delta insert/search, tombstone exclusion, union+re-rank correctness
 
-- [ ] 25. Implement HNSW merge — galaxdb-vector (Req 17)
+- [-] 25. Implement HNSW merge — galaxdb-vector (Req 17)
   - [ ] 25.1 Implement merge trigger: `max(10_000, total_indexed * 0.01)` threshold check
   - [ ] 25.2 Implement emergency merge trigger: tombstones > 20% of indexed vectors
   - [ ] 25.3 Implement shadow file merge: build new HNSW graph in `.hnsw.new`, fsync, atomic `rename()` to `.hnsw`
