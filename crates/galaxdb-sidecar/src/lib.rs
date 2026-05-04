@@ -5,4 +5,5 @@
 //! - The sidecar binary (`galaxdb-sidecar`) uses these types for the server side
 //! - The engine uses these types via `SidecarClient` for the client side
 
+pub mod manager;
 pub mod protocol;

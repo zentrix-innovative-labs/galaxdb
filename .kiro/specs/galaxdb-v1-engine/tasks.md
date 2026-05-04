@@ -218,16 +218,16 @@
   - [x] 27.5 Implement heartbeat: ping every 5 seconds, engine expects response within 2 seconds
   - [x] 27.6 Write tests: model loading, embedding generation correctness, Unix socket communication, parent death detection
 
-- [-] 28. Implement sidecar manager in engine — galaxdb-sidecar (Req 19)
-  - [ ] 28.1 Implement `SidecarManager`: spawn sidecar as child process, manage lifecycle
-  - [ ] 28.2 Implement crash detection: 3 missed heartbeats → enter degraded mode
-  - [ ] 28.3 Implement restart with exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s cap
-  - [ ] 28.4 Implement `EmbeddingManager` with in-flight semaphore (capacity 10,000)
-  - [ ] 28.5 Implement backlog overflow: when semaphore full, write to `_galaxdb_embedding_backlog` system table with DURABILITY STRICT
-  - [ ] 28.6 Implement backlog drain: background scanner drains FIFO when sidecar capacity recovers
-  - [ ] 28.7 Write tests: sidecar spawn/kill/restart, backlog overflow and drain, degraded mode behavior
+- [x] 28. Implement sidecar manager in engine — galaxdb-sidecar (Req 19)
+  - [x] 28.1 Implement `SidecarManager`: spawn sidecar as child process, manage lifecycle
+  - [x] 28.2 Implement crash detection: 3 missed heartbeats → enter degraded mode
+  - [x] 28.3 Implement restart with exponential backoff: 1s, 2s, 4s, 8s, 16s, 32s, 60s cap
+  - [x] 28.4 Implement `EmbeddingManager` with in-flight semaphore (capacity 10,000)
+  - [x] 28.5 Implement backlog overflow: when semaphore full, write to `_galaxdb_embedding_backlog` system table with DURABILITY STRICT
+  - [x] 28.6 Implement backlog drain: background scanner drains FIFO when sidecar capacity recovers
+  - [x] 28.7 Write tests: sidecar spawn/kill/restart, backlog overflow and drain, degraded mode behavior
 
-- [ ] 29. Implement model-version tracking — galaxdb-sidecar (Req 20)
+- [-] 29. Implement model-version tracking — galaxdb-sidecar (Req 20)
   - [ ] 29.1 Store `_embedding_model_version` system column with each embedded row
   - [ ] 29.2 Implement model version change detection: compare sidecar-reported version with stored versions
   - [ ] 29.3 Implement stale marking: set `_embedding_stale = true` on rows with old model version, enqueue for re-embedding
