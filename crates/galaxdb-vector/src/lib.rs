@@ -11,8 +11,10 @@ pub mod delta_buffer;
 pub mod distance;
 pub mod hnsw;
 pub mod hnsw_file;
+pub mod merge;
 
 pub use delta_buffer::{DeltaBuffer, DeltaSearchResult, union_and_rerank};
 pub use distance::{cosine_distance, cosine_similarity, normalize};
 pub use hnsw::{HnswConfig, HnswGraph};
 pub use hnsw_file::{MmapHnswGraph, write_hnsw_file};
+pub use merge::merge_hnsw;

@@ -194,15 +194,15 @@
   - [x] 24.4 Implement union + re-rank: combine HNSW candidates with delta buffer candidates, re-rank by exact cosine similarity from PAX blocks
   - [x] 24.5 Write tests: delta insert/search, tombstone exclusion, union+re-rank correctness
 
-- [-] 25. Implement HNSW merge — galaxdb-vector (Req 17)
-  - [ ] 25.1 Implement merge trigger: `max(10_000, total_indexed * 0.01)` threshold check
-  - [ ] 25.2 Implement emergency merge trigger: tombstones > 20% of indexed vectors
-  - [ ] 25.3 Implement shadow file merge: build new HNSW graph in `.hnsw.new`, fsync, atomic `rename()` to `.hnsw`
-  - [ ] 25.4 Implement Arc-based reference counting for old graph: release when all in-flight queries complete
-  - [ ] 25.5 Implement crash recovery: replay WAL delta records in batches of 1000 to rebuild delta buffer
-  - [ ] 25.6 Write tests: merge produces correct graph, atomic rename crash safety, recovery rebuilds delta buffer
+- [x] 25. Implement HNSW merge — galaxdb-vector (Req 17)
+  - [x] 25.1 Implement merge trigger: `max(10_000, total_indexed * 0.01)` threshold check
+  - [x] 25.2 Implement emergency merge trigger: tombstones > 20% of indexed vectors
+  - [x] 25.3 Implement shadow file merge: build new HNSW graph in `.hnsw.new`, fsync, atomic `rename()` to `.hnsw`
+  - [x] 25.4 Implement Arc-based reference counting for old graph: release when all in-flight queries complete
+  - [x] 25.5 Implement crash recovery: replay WAL delta records in batches of 1000 to rebuild delta buffer
+  - [x] 25.6 Write tests: merge produces correct graph, atomic rename crash safety, recovery rebuilds delta buffer
 
-- [ ] 26. Implement platform-aware quantization — galaxdb-vector (Req 18)
+- [-] 26. Implement platform-aware quantization — galaxdb-vector (Req 18)
   - [ ] 26.1 Define `Quantizer` trait: quantize, dequantize, distance (SIMD-accelerated), compression_ratio
   - [ ] 26.2 Implement `Sq8Quantizer`: int8 scalar quantization with AVX2/AVX-512 SIMD distance kernels (4× compression)
   - [ ] 26.3 Implement `Fp16Quantizer`: half-precision float with ARM NEON SIMD distance kernels (2× compression)
