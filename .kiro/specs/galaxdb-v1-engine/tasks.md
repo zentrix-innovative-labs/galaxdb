@@ -171,11 +171,11 @@
   - [x] 21.6 Write tests: psycopg2 connection handshake succeeds, SQLAlchemy table reflection works
 
 - [x] 22. Implement Python client — galaxdb-python (Req 32)
-  - [ ] 22.1 Create galaxdb-python package with PyO3 bindings for embedded mode (`galaxdb.Database(path)`)
+  - [x] 22.1 Create galaxdb-python package with PyO3 bindings for embedded mode (`galaxdb.Database(path)`)
   - [ ] 22.2 Implement remote mode: connect via PostgreSQL wire protocol (`galaxdb.connect(connstring)`)
-  - [ ] 22.3 Implement `db.execute(sql)` returning list of row dicts
+  - [x] 22.3 Implement `db.execute(sql)` returning list of row dicts
   - [ ] 22.4 Implement `db.training_dataset(tag)` returning PyTorch IterableDataset backed by Lance
-  - [ ] 22.5 Ensure Python 3.9+ compatibility
+  - [x] 22.5 Ensure Python 3.9+ compatibility
   - [ ] 22.6 Write tests: embedded mode CRUD, remote mode CRUD, training_dataset returns valid IterableDataset
 
 ## Month 3: Vector Index & Embedding Sidecar
