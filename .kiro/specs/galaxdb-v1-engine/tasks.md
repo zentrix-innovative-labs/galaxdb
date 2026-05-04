@@ -241,13 +241,13 @@
   - [x] 30.4 Write staleness flag through standard LSM update path (same WAL, same MVCC) for reader consistency
   - [x] 30.5 Write tests: stale flag lifecycle (insert → stale → embedded → not stale), model change → stale
 
-- [-] 31. Implement SEMANTIC_MATCH execution — galaxdb-sql, galaxdb-vector (Req 21)
-  - [ ] 31.1 Implement query-time embedding: send query text to sidecar, receive query vector
-  - [ ] 31.2 Implement HNSW + delta buffer search with union + re-rank pipeline
-  - [ ] 31.3 Implement similarity threshold filtering on results
-  - [ ] 31.4 Implement sidecar-unavailable error: return "semantic search temporarily unavailable" when degraded
-  - [ ] 31.5 Integrate adaptive planner: use statistics to choose BruteForceFiltered vs HnswWithPostFilter (Req 22)
-  - [ ] 31.6 Write tests: SEMANTIC_MATCH returns correct results, threshold filtering, sidecar-down error, adaptive strategy selection
+- [x] 31. Implement SEMANTIC_MATCH execution — galaxdb-sql, galaxdb-vector (Req 21)
+  - [x] 31.1 Implement query-time embedding: send query text to sidecar, receive query vector
+  - [x] 31.2 Implement HNSW + delta buffer search with union + re-rank pipeline
+  - [x] 31.3 Implement similarity threshold filtering on results
+  - [x] 31.4 Implement sidecar-unavailable error: return "semantic search temporarily unavailable" when degraded
+  - [x] 31.5 Integrate adaptive planner: use statistics to choose BruteForceFiltered vs HnswWithPostFilter (Req 22)
+  - [x] 31.6 Write tests: SEMANTIC_MATCH returns correct results, threshold filtering, sidecar-down error, adaptive strategy selection
 
 
 ## Month 4: Versioning, Training, Hardening & Observability
