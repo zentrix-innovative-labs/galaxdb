@@ -127,7 +127,7 @@ pub fn write_hnsw_file(graph: &HnswGraph, path: &Path) -> GalaxResult<()> {
             let neighbors = graph.get_neighbors(i as u32, layer);
             let count = neighbors.len() as u16;
             file.write_all(&count.to_le_bytes())?;
-            for &n in neighbors {
+            for n in &neighbors {
                 file.write_all(&n.to_le_bytes())?;
             }
         }
@@ -352,10 +352,16 @@ mod tests {
         let mmap_graph = MmapHnswGraph::open(&path).unwrap();
 
         // get_vector returns a slice into the mmap — no allocation
+        // Vectors are normalized on insert, so compare against normalized values
+        let mut expected0 = vec![1.0f32, 2.0, 3.0, 4.0];
+        crate::distance::normalize(&mut expected0);
         let v0 = mmap_graph.get_vector(0);
-        assert_eq!(v0, &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(v0, expected0.as_slice());
+
+        let mut expected1 = vec![5.0f32, 6.0, 7.0, 8.0];
+        crate::distance::normalize(&mut expected1);
         let v1 = mmap_graph.get_vector(1);
-        assert_eq!(v1, &[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(v1, expected1.as_slice());
     }
 
     #[test]

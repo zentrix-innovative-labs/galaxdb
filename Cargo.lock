@@ -627,7 +627,9 @@ dependencies = [
  "galaxdb-common",
  "half",
  "memmap2",
+ "parking_lot",
  "rand",
+ "rayon",
  "tempfile",
 ]
 

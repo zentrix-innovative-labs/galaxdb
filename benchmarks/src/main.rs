@@ -10,6 +10,8 @@
 //! Outputs structured JSON results to stdout.
 
 mod vector_bench;
+mod sift_bench;
+mod integration_test;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1117,6 +1119,25 @@ async fn main() {
         // Vector search benchmark: 1M vectors, 128-dim
         // Usage: --workload vector1m
         vector_bench::run_vector_benchmark(1_000_000, 128, 500);
+        return;
+    }
+
+    if workload == "vector100k" {
+        // Quick vector benchmark: 100K vectors for fast iteration
+        vector_bench::run_vector_benchmark(100_000, 128, 100);
+        return;
+    }
+
+    if workload == "sift" || workload == "sift1m" {
+        // SIFT1M — the standard ANN benchmark dataset
+        let sift_dir = std::env::var("SIFT_DIR").unwrap_or_else(|_| "/home/ubuntu/sift".to_string());
+        sift_bench::run_sift_benchmark(&sift_dir);
+        return;
+    }
+
+    if workload == "integration" || workload == "e2e" {
+        // Full end-to-end integration test: Storage → SQL → HNSW → Delta → SEMANTIC_MATCH
+        integration_test::run_integration_test();
         return;
     }
 

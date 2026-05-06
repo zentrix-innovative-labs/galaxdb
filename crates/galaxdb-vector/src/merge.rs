@@ -83,7 +83,6 @@ pub fn should_merge(delta: &DeltaBuffer, total_indexed: usize) -> bool {
 mod tests {
     use super::*;
     use crate::hnsw::HnswConfig;
-    use crate::distance::cosine_distance;
 
     #[test]
     fn merge_empty_base_with_delta() {

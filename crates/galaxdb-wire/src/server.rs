@@ -259,7 +259,8 @@ async fn execute_statement<W: AsyncWriteExt + Unpin>(
     };
 
     // Execute
-    let result = galaxdb_sql::executor::execute(&plan, catalog);
+    let no_op_backend = galaxdb_sql::executor::NoOpVectorBackend;
+    let result = galaxdb_sql::executor::execute(&plan, catalog, &no_op_backend);
 
     // Write response
     match result {

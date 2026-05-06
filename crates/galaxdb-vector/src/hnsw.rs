@@ -1,691 +1,657 @@
-//! HNSW (Hierarchical Navigable Small World) graph index.
-//!
-//! Implementation follows Malkov & Yashunin (2018):
-//! "Efficient and robust approximate nearest neighbor search using
-//! Hierarchical Navigable Small World graphs"
-//! https://arxiv.org/abs/1603.09320
-//!
-//! Key parameters:
-//! - M: max edges per node (upper layers). Default 16.
-//! - M0: max edges per node (layer 0). Default 2*M = 32.
-//! - ef_construction: search width during insertion. Default 200.
-//! - mL: level generation factor = 1/ln(M).
-//!
-//! The graph is built incrementally. Each inserted vector is assigned a
-//! random maximum layer from a geometric distribution. Insertion navigates
-//! from the top layer down, wiring edges at each layer using the diversity
-//! heuristic (Algorithm 4 from the paper).
+use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::sync::atomic::{AtomicUsize, AtomicU32, Ordering as AtomicOrdering};
+use std::cell::UnsafeCell;
 
-use std::collections::{BinaryHeap, HashSet};
-use std::cmp::Ordering as CmpOrdering;
+use parking_lot::{RwLock, Mutex};
+use rand::{Rng, SeedableRng};
+use rand::rngs::SmallRng;
+use rayon::prelude::*;
 
-use crate::distance::cosine_distance;
+use crate::distance::{cosine_distance_normalized, normalize};
 
-/// HNSW graph configuration.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct HnswConfig {
-    /// Max edges per node in upper layers. Default: 16.
     pub m: usize,
-    /// Max edges per node in layer 0. Default: 2*M.
     pub m0: usize,
-    /// Search width during construction. Default: 200.
     pub ef_construction: usize,
-    /// Level generation factor: 1/ln(M).
-    pub ml: f64,
-    /// Vector dimensionality.
     pub dim: usize,
+    pub max_elements: usize,
 }
 
 impl HnswConfig {
     pub fn new(dim: usize) -> Self {
-        let m = 16;
         Self {
-            m,
-            m0: m * 2,
+            m: 16,
+            m0: 32,
             ef_construction: 200,
-            ml: 1.0 / (m as f64).ln(),
             dim,
+            max_elements: 1_000_000,
         }
     }
-
     pub fn with_m(mut self, m: usize) -> Self {
         self.m = m;
         self.m0 = m * 2;
-        self.ml = 1.0 / (m as f64).ln();
         self
     }
-
     pub fn with_ef_construction(mut self, ef: usize) -> Self {
         self.ef_construction = ef;
         self
     }
-
-    /// Max edges for a given layer.
-    fn max_edges(&self, layer: usize) -> usize {
+    pub fn with_max_elements(mut self, max: usize) -> Self {
+        self.max_elements = max;
+        self
+    }
+    pub fn max_edges(&self, layer: usize) -> usize {
         if layer == 0 { self.m0 } else { self.m }
     }
 }
 
-/// A node in the HNSW graph.
-#[derive(Debug, Clone)]
-struct HnswNode {
-    /// The vector data (f32 × dim).
-    vector: Vec<f32>,
-    /// External ID (e.g., row_id from the storage engine).
-    external_id: u64,
-    /// Maximum layer this node is present in.
-    max_layer: usize,
-    /// Adjacency lists per layer. neighbors[layer] = vec of node indices.
-    neighbors: Vec<Vec<u32>>,
+struct VisitedList {
+    visited: Vec<u32>,
+    visited_gen: u32,
 }
 
-/// Candidate entry for the search heaps.
-#[derive(Debug, Clone)]
-struct Candidate {
-    distance: f32,
-    node_idx: u32,
-}
-
-impl PartialEq for Candidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.distance == other.distance
+impl VisitedList {
+    fn new(size: usize) -> Self {
+        Self {
+            visited: vec![0; size],
+            visited_gen: 1,
+        }
     }
+
+    fn mark_visited(&mut self, node: u32) -> bool {
+        if self.visited[node as usize] == self.visited_gen {
+            true
+        } else {
+            self.visited[node as usize] = self.visited_gen;
+            false
+        }
+    }
+
+    fn next_gen(&mut self) {
+        if self.visited_gen == u32::MAX {
+            self.visited.fill(0);
+            self.visited_gen = 1;
+        } else {
+            self.visited_gen += 1;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Candidate {
+    id: u32,
+    dist: f32,
+}
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool { self.dist == other.dist && self.id == other.id }
 }
 impl Eq for Candidate {}
-
-/// Min-heap ordering (smallest distance first).
-impl Ord for Candidate {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        // Reverse for min-heap (BinaryHeap is max-heap by default)
-        other.distance.partial_cmp(&self.distance).unwrap_or(CmpOrdering::Equal)
-    }
-}
 impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        other.dist.partial_cmp(&self.dist)
+    }
+}
+impl Ord for Candidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
     }
 }
 
-/// Max-heap candidate (for the result set W — farthest first).
-#[derive(Debug, Clone)]
-struct FarCandidate {
-    distance: f32,
-    node_idx: u32,
+#[derive(Clone, Copy)]
+struct MaxCandidate {
+    id: u32,
+    dist: f32,
 }
-
-impl PartialEq for FarCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.distance == other.distance
+impl PartialEq for MaxCandidate {
+    fn eq(&self, other: &Self) -> bool { self.dist == other.dist && self.id == other.id }
+}
+impl Eq for MaxCandidate {}
+impl PartialOrd for MaxCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        self.dist.partial_cmp(&other.dist)
     }
 }
-impl Eq for FarCandidate {}
-
-impl Ord for FarCandidate {
-    fn cmp(&self, other: &Self) -> CmpOrdering {
-        self.distance.partial_cmp(&other.distance).unwrap_or(CmpOrdering::Equal)
-    }
-}
-impl PartialOrd for FarCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
-        Some(self.cmp(other))
+impl Ord for MaxCandidate {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.partial_cmp(other).unwrap_or(Ordering::Equal)
     }
 }
 
-/// In-memory HNSW graph index.
-///
-/// Supports incremental insertion and k-NN search.
-/// For persistence, use `HnswFile` (mmap'd format).
+struct ConcurrentVec<T> {
+    inner: UnsafeCell<Vec<T>>,
+}
+unsafe impl<T: Send> Send for ConcurrentVec<T> {}
+unsafe impl<T: Sync> Sync for ConcurrentVec<T> {}
+
+impl<T> ConcurrentVec<T> {
+    fn new() -> Self {
+        Self { inner: UnsafeCell::new(Vec::new()) }
+    }
+    fn resize(&mut self, new_len: usize, value: T) where T: Clone {
+        self.inner.get_mut().resize(new_len, value);
+    }
+    fn as_mut_slice(&mut self) -> &mut [T] {
+        self.inner.get_mut().as_mut_slice()
+    }
+    unsafe fn get_slice_mut(&self, start: usize, len: usize) -> &mut [T] {
+        unsafe { std::slice::from_raw_parts_mut((*self.inner.get()).as_mut_ptr().add(start), len) }
+    }
+    unsafe fn as_mut_ptr(&self) -> *mut T {
+        unsafe { (*self.inner.get()).as_mut_ptr() }
+    }
+    fn get(&self) -> &[T] {
+        unsafe { &*self.inner.get() }
+    }
+}
+
 pub struct HnswGraph {
     config: HnswConfig,
-    nodes: Vec<HnswNode>,
-    /// Index of the entry point node (top of the hierarchy).
-    entry_point: Option<u32>,
-    /// Current maximum layer in the graph.
-    max_layer: usize,
+    vectors: ConcurrentVec<f32>,
+    external_ids: ConcurrentVec<u64>,
+    node_max_layers: ConcurrentVec<usize>,
+
+    neighbors0: ConcurrentVec<u32>,
+    neighbors0_counts: ConcurrentVec<u16>,
+    neighbors_upper: ConcurrentVec<Vec<Vec<u32>>>,
+
+    node_locks: RwLock<Vec<RwLock<()>>>,
+
+    entry_point: RwLock<Option<u32>>,
+    max_layer: AtomicUsize,
+
+    visited_pool: Mutex<Vec<VisitedList>>,
+    total_gens: AtomicU32,
+    
+    len: AtomicUsize,
 }
 
 impl HnswGraph {
-    /// Create a new empty HNSW graph.
     pub fn new(config: HnswConfig) -> Self {
         Self {
             config,
-            nodes: Vec::new(),
-            entry_point: None,
-            max_layer: 0,
+            vectors: ConcurrentVec::new(),
+            external_ids: ConcurrentVec::new(),
+            node_max_layers: ConcurrentVec::new(),
+            neighbors0: ConcurrentVec::new(),
+            neighbors0_counts: ConcurrentVec::new(),
+            neighbors_upper: ConcurrentVec::new(),
+            node_locks: RwLock::new(Vec::new()),
+            entry_point: RwLock::new(None),
+            max_layer: AtomicUsize::new(0),
+            visited_pool: Mutex::new(Vec::new()),
+            total_gens: AtomicU32::new(0),
+            len: AtomicUsize::new(0),
         }
     }
 
-    /// Number of vectors in the graph.
-    pub fn len(&self) -> usize {
-        self.nodes.len()
+    pub fn len(&self) -> usize { self.len.load(AtomicOrdering::Acquire) }
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+    pub fn config(&self) -> &HnswConfig { &self.config }
+    pub fn entry_point(&self) -> Option<u32> { *self.entry_point.read() }
+    pub fn max_layer(&self) -> usize { self.max_layer.load(AtomicOrdering::Acquire) }
+    pub fn node_max_layer(&self, id: u32) -> usize { self.node_max_layers.get()[id as usize] }
+    pub fn visited_gen(&self) -> u32 { self.total_gens.load(AtomicOrdering::Relaxed) }
+
+    pub fn get_external_id(&self, id: u32) -> Option<u64> {
+        if id as usize >= self.len() { None } else { Some(self.external_ids.get()[id as usize]) }
     }
 
-    /// Whether the graph is empty.
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-
-    /// Insert a vector into the graph.
-    ///
-    /// Follows Algorithm 1 from Malkov & Yashunin (2018):
-    /// 1. Assign random max layer from geometric distribution
-    /// 2. Navigate from top layer down to max_layer+1 (coarse, ef=1)
-    /// 3. At each layer from max_layer down to 0, search with ef_construction
-    ///    and wire edges using the diversity heuristic
-    pub fn insert(&mut self, external_id: u64, vector: Vec<f32>) {
-        assert_eq!(vector.len(), self.config.dim, "vector dimension mismatch");
-
-        let node_idx = self.nodes.len() as u32;
-
-        // Assign random max layer (geometric distribution)
-        let node_layer = self.random_layer();
-
-        // Create the node with empty neighbor lists
-        let node = HnswNode {
-            vector,
-            external_id,
-            max_layer: node_layer,
-            neighbors: vec![Vec::new(); node_layer + 1],
-        };
-
-        // Push the node first so it's accessible during edge wiring.
-        self.nodes.push(node);
-
-        // First node — just set as entry point, no edges to wire
-        if self.entry_point.is_none() {
-            self.entry_point = Some(node_idx);
-            self.max_layer = node_layer;
-            return;
+    pub fn get_vector(&self, id: u32) -> Option<&[f32]> {
+        let start = id as usize * self.config.dim;
+        let end = start + self.config.dim;
+        if end <= self.vectors.get().len() {
+            Some(&self.vectors.get()[start..end])
+        } else {
+            None
         }
+    }
 
-        let mut ep_idx = self.entry_point.unwrap();
-
-        // Phase 1: Navigate from top layer down to node_layer+1 (coarse, ef=1)
-        // Find the closest node at each layer as the entry point for the next
-        for layer in (node_layer + 1..=self.max_layer).rev() {
-            let candidates = self.search_layer(&self.nodes[node_idx as usize].vector, ep_idx, 1, layer);
-            if let Some(nearest) = candidates.first() {
-                ep_idx = nearest.node_idx;
+    pub fn get_neighbors(&self, id: u32, layer: usize) -> Vec<u32> {
+        if layer == 0 {
+            // Lock-free read for layer 0: fixed-size pre-allocated slots.
+            // Safe because writes only overwrite within the pre-allocated m0 slots
+            // and atomically update the count.
+            let m0 = self.config.m0;
+            let count = unsafe { *self.neighbors0_counts.as_mut_ptr().add(id as usize) } as usize;
+            if count == 0 { return Vec::new(); }
+            let slice = unsafe { self.neighbors0.get_slice_mut(id as usize * m0, count) };
+            slice.to_vec()
+        } else {
+            // Upper layers use Vec<u32> which requires locking for safe concurrent access
+            let guards = self.node_locks.read();
+            let _lock = guards[id as usize].read();
+            let upper = unsafe { &*self.neighbors_upper.as_mut_ptr().add(id as usize) };
+            if layer - 1 < upper.len() {
+                upper[layer - 1].clone()
+            } else {
+                Vec::new()
             }
         }
-
-        // Phase 2: Insert at layers min(max_layer, node_layer) down to 0
-        let insert_from = node_layer.min(self.max_layer);
-        for layer in (0..=insert_from).rev() {
-            let query_vec = self.nodes[node_idx as usize].vector.clone();
-            let candidates = self.search_layer(
-                &query_vec,
-                ep_idx,
-                self.config.ef_construction,
-                layer,
-            );
-
-            // Select neighbors using diversity heuristic (Algorithm 4)
-            let max_edges = self.config.max_edges(layer);
-            let selected = self.select_neighbors_heuristic(&query_vec, &candidates, max_edges);
-
-            // Wire bidirectional edges
-            self.nodes[node_idx as usize].neighbors[layer] = selected.iter().map(|c| c.node_idx).collect();
-
-            for neighbor in &selected {
-                let n_idx = neighbor.node_idx as usize;
-                self.nodes[n_idx].neighbors[layer].push(node_idx);
-
-                // Prune neighbor's edges if over capacity
-                let n_max = self.config.max_edges(layer);
-                if self.nodes[n_idx].neighbors[layer].len() > n_max {
-                    self.prune_neighbors(n_idx, layer, n_max);
-                }
-            }
-
-            if let Some(nearest) = candidates.first() {
-                ep_idx = nearest.node_idx;
-            }
-        }
-
-        // Update entry point if new node is in a higher layer
-        if node_layer > self.max_layer {
-            self.entry_point = Some(node_idx);
-            self.max_layer = node_layer;
-        }
     }
 
-    /// Search for the k nearest neighbors of a query vector.
-    ///
-    /// Follows Algorithm 5 from the paper:
-    /// 1. Navigate from top layer down to layer 1 (coarse, ef=1)
-    /// 2. Search layer 0 with ef=ef_search
-    /// 3. Return top-k from the result set
-    ///
-    /// Returns (external_id, distance) pairs sorted by distance (nearest first).
-    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(u64, f32)> {
-        assert_eq!(query.len(), self.config.dim, "query dimension mismatch");
-
-        if self.entry_point.is_none() {
-            return Vec::new();
+    fn get_visited_list(&self) -> VisitedList {
+        self.total_gens.fetch_add(1, AtomicOrdering::Relaxed);
+        let mut pool = self.visited_pool.lock();
+        if let Some(mut list) = pool.pop() {
+            list.next_gen();
+            list
+        } else {
+            VisitedList::new(self.config.max_elements.max(1_000_000))
         }
-
-        let mut ep_idx = self.entry_point.unwrap();
-        let ef = ef_search.max(k);
-
-        // Phase 1: Coarse navigation from top to layer 1 (ef=1)
-        for layer in (1..=self.max_layer).rev() {
-            let candidates = self.search_layer(query, ep_idx, 1, layer);
-            if let Some(nearest) = candidates.first() {
-                ep_idx = nearest.node_idx;
-            }
-        }
-
-        // Phase 2: Fine search at layer 0 with ef candidates
-        let candidates = self.search_layer(query, ep_idx, ef, 0);
-
-        // Return top-k results
-        candidates
-            .into_iter()
-            .take(k)
-            .map(|c| (self.nodes[c.node_idx as usize].external_id, c.distance))
-            .collect()
+    }
+    
+    fn put_visited_list(&self, list: VisitedList) {
+        self.visited_pool.lock().push(list);
     }
 
-    /// Search within a single layer (Algorithm 2 from the paper).
-    ///
-    /// Best-first beam search with beam width `ef`.
-    /// Returns candidates sorted by distance (nearest first).
     fn search_layer(
         &self,
         query: &[f32],
         entry_point: u32,
+        ep_dist: f32,
         ef: usize,
         layer: usize,
-    ) -> Vec<Candidate> {
-        let ep_dist = cosine_distance(query, &self.nodes[entry_point as usize].vector);
-
-        let mut visited = HashSet::new();
-        visited.insert(entry_point);
-
-        // C = min-heap of candidates (nearest first)
+        visited: &mut VisitedList,
+    ) -> BinaryHeap<MaxCandidate> {
         let mut candidates = BinaryHeap::new();
-        candidates.push(Candidate { distance: ep_dist, node_idx: entry_point });
-
-        // W = max-heap of results (farthest first, capped at ef)
         let mut results = BinaryHeap::new();
-        results.push(FarCandidate { distance: ep_dist, node_idx: entry_point });
 
-        while let Some(closest) = candidates.pop() {
-            // Termination: if closest candidate is farther than farthest result, stop
-            let farthest_dist = results.peek().map_or(f32::MAX, |f| f.distance);
-            if closest.distance > farthest_dist {
+        candidates.push(Candidate { id: entry_point, dist: ep_dist });
+        results.push(MaxCandidate { id: entry_point, dist: ep_dist });
+        visited.mark_visited(entry_point);
+
+        let m0 = self.config.m0;
+
+        while let Some(c) = candidates.pop() {
+            let farthest_dist = results.peek().unwrap().dist;
+            if results.len() >= ef && c.dist > farthest_dist {
                 break;
             }
 
-            // Expand neighbors of the closest candidate
-            let node = &self.nodes[closest.node_idx as usize];
-            if layer < node.neighbors.len() {
-                for &neighbor_idx in &node.neighbors[layer] {
-                    if visited.contains(&neighbor_idx) {
-                        continue;
+            // Inline neighbor access to avoid Vec allocation in hot path
+            if layer == 0 {
+                let count = unsafe { *self.neighbors0_counts.as_mut_ptr().add(c.id as usize) } as usize;
+                let nb_slice = unsafe { self.neighbors0.get_slice_mut(c.id as usize * m0, count) };
+                for i in 0..count {
+                    let nb = nb_slice[i];
+                    if !visited.mark_visited(nb) {
+                        let d = cosine_distance_normalized(query, self.get_vector(nb).unwrap());
+                        let farthest_dist = results.peek().unwrap().dist;
+                        if results.len() < ef || d < farthest_dist {
+                            candidates.push(Candidate { id: nb, dist: d });
+                            results.push(MaxCandidate { id: nb, dist: d });
+                            if results.len() > ef {
+                                results.pop();
+                            }
+                        }
                     }
-                    visited.insert(neighbor_idx);
-
-                    let dist = cosine_distance(query, &self.nodes[neighbor_idx as usize].vector);
-                    let farthest_dist = results.peek().map_or(f32::MAX, |f| f.distance);
-
-                    if dist < farthest_dist || results.len() < ef {
-                        candidates.push(Candidate { distance: dist, node_idx: neighbor_idx });
-                        results.push(FarCandidate { distance: dist, node_idx: neighbor_idx });
-
-                        if results.len() > ef {
-                            results.pop(); // remove farthest
+                }
+            } else {
+                let neighbors = self.get_neighbors(c.id, layer);
+                for &nb in &neighbors {
+                    if !visited.mark_visited(nb) {
+                        let d = cosine_distance_normalized(query, self.get_vector(nb).unwrap());
+                        let farthest_dist = results.peek().unwrap().dist;
+                        if results.len() < ef || d < farthest_dist {
+                            candidates.push(Candidate { id: nb, dist: d });
+                            results.push(MaxCandidate { id: nb, dist: d });
+                            if results.len() > ef {
+                                results.pop();
+                            }
                         }
                     }
                 }
             }
         }
-
-        // Convert results to sorted vec (nearest first)
-        let mut result_vec: Vec<Candidate> = results
-            .into_iter()
-            .map(|f| Candidate { distance: f.distance, node_idx: f.node_idx })
-            .collect();
-        result_vec.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(CmpOrdering::Equal));
-        result_vec
+        results
     }
 
-    /// Select neighbors using the diversity heuristic (Algorithm 4).
-    ///
-    /// Instead of simply picking the M nearest candidates, this heuristic
-    /// ensures directional diversity: a candidate is only selected if it is
-    /// closer to the query than to any already-selected neighbor. This prevents
-    /// all edges from pointing in the same direction.
-    fn select_neighbors_heuristic(
-        &self,
-        _query: &[f32],
-        candidates: &[Candidate],
-        max_neighbors: usize,
-    ) -> Vec<Candidate> {
-        let mut selected: Vec<Candidate> = Vec::with_capacity(max_neighbors);
-
-        for candidate in candidates {
-            if selected.len() >= max_neighbors {
+    fn select_neighbors_heuristic(&self, candidates: &[Candidate], m_max: usize, _query: &[f32]) -> Vec<u32> {
+        let mut selected = Vec::with_capacity(m_max);
+        let mut pruned = Vec::new();
+        
+        for c in candidates {
+            if selected.len() >= m_max {
                 break;
             }
-
-            let dist_to_query = candidate.distance;
-
-            // Check if this candidate is closer to query than to any selected neighbor
-            let mut is_diverse = true;
-            for existing in &selected {
-                let dist_to_existing = cosine_distance(
-                    &self.nodes[candidate.node_idx as usize].vector,
-                    &self.nodes[existing.node_idx as usize].vector,
-                );
-                if dist_to_existing < dist_to_query {
-                    is_diverse = false;
+            
+            let c_vec = self.get_vector(c.id).unwrap();
+            let mut is_good = true;
+            for &s_id in &selected {
+                let s_vec = self.get_vector(s_id).unwrap();
+                let dist_c_s = cosine_distance_normalized(c_vec, s_vec);
+                if dist_c_s < c.dist {
+                    is_good = false;
                     break;
                 }
             }
-
-            if is_diverse {
-                selected.push(candidate.clone());
+            
+            if is_good {
+                selected.push(c.id);
+            } else {
+                pruned.push(c.id);
             }
         }
-
-        // If diversity heuristic didn't fill all slots, add nearest remaining
-        if selected.len() < max_neighbors {
-            for candidate in candidates {
-                if selected.len() >= max_neighbors {
-                    break;
-                }
-                if !selected.iter().any(|s| s.node_idx == candidate.node_idx) {
-                    selected.push(candidate.clone());
-                }
+        
+        let mut iter = pruned.into_iter();
+        while selected.len() < m_max {
+            if let Some(p) = iter.next() {
+                selected.push(p);
+            } else {
+                break;
             }
         }
-
+        
         selected
     }
 
-    /// Prune a node's neighbor list to max_edges using the diversity heuristic.
-    fn prune_neighbors(&mut self, node_idx: usize, layer: usize, max_edges: usize) {
-        let node_vec = self.nodes[node_idx].vector.clone();
-        let neighbor_indices: Vec<u32> = self.nodes[node_idx].neighbors[layer].clone();
-
-        // Build candidates from current neighbors
-        let mut candidates: Vec<Candidate> = neighbor_indices
-            .iter()
-            .map(|&n_idx| {
-                let dist = cosine_distance(&node_vec, &self.nodes[n_idx as usize].vector);
-                Candidate { distance: dist, node_idx: n_idx }
-            })
-            .collect();
-        candidates.sort_by(|a, b| a.distance.partial_cmp(&b.distance).unwrap_or(CmpOrdering::Equal));
-
-        let selected = self.select_neighbors_heuristic(&node_vec, &candidates, max_edges);
-        self.nodes[node_idx].neighbors[layer] = selected.iter().map(|c| c.node_idx).collect();
-    }
-
-    /// Generate a random layer for a new node using geometric distribution.
-    /// P(layer = l) = (1 - p) * p^l where p = e^(-1/mL)
-    fn random_layer(&self) -> usize {
-        use rand::Rng;
-        let uniform: f64 = rand::thread_rng().gen_range(0.0001..1.0);
-        let layer = (-uniform.ln() * self.config.ml).floor() as usize;
-        layer
-    }
-
-    /// Get the vector for a node by its index.
-    pub fn get_vector(&self, node_idx: u32) -> Option<&[f32]> {
-        self.nodes.get(node_idx as usize).map(|n| n.vector.as_slice())
-    }
-
-    /// Get the external ID for a node by its index.
-    pub fn get_external_id(&self, node_idx: u32) -> Option<u64> {
-        self.nodes.get(node_idx as usize).map(|n| n.external_id)
-    }
-
-    /// Get the max layer for a node.
-    pub fn node_max_layer(&self, node_idx: u32) -> usize {
-        self.nodes.get(node_idx as usize).map_or(0, |n| n.max_layer)
-    }
-
-    /// Get the neighbors of a node at a specific layer.
-    pub fn get_neighbors(&self, node_idx: u32, layer: usize) -> &[u32] {
-        self.nodes
-            .get(node_idx as usize)
-            .and_then(|n| n.neighbors.get(layer))
-            .map_or(&[], |v| v.as_slice())
-    }
-
-    /// Get the config.
-    pub fn config(&self) -> &HnswConfig {
-        &self.config
-    }
-
-    /// Get the entry point node index.
-    pub fn entry_point(&self) -> Option<u32> {
-        self.entry_point
-    }
-
-    /// Get the current max layer.
-    pub fn max_layer(&self) -> usize {
-        self.max_layer
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use rand::rngs::SmallRng;
-    use rand::{Rng, SeedableRng};
-
-    fn random_vector(rng: &mut SmallRng, dim: usize) -> Vec<f32> {
-        (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect()
-    }
-
-    #[test]
-    fn insert_single_vector() {
-        let config = HnswConfig::new(4);
-        let mut graph = HnswGraph::new(config);
-        graph.insert(1, vec![1.0, 0.0, 0.0, 0.0]);
-        assert_eq!(graph.len(), 1);
-        assert!(graph.entry_point().is_some());
-    }
-
-    #[test]
-    fn insert_and_search_exact() {
-        let config = HnswConfig::new(4).with_m(4).with_ef_construction(50);
-        let mut graph = HnswGraph::new(config);
-
-        // Insert 3 known vectors
-        graph.insert(1, vec![1.0, 0.0, 0.0, 0.0]);
-        graph.insert(2, vec![0.0, 1.0, 0.0, 0.0]);
-        graph.insert(3, vec![0.9, 0.1, 0.0, 0.0]); // closest to [1,0,0,0]
-
-        // Search for nearest to [1,0,0,0]
-        let results = graph.search(&[1.0, 0.0, 0.0, 0.0], 2, 10);
-        assert_eq!(results.len(), 2);
-        // First result should be vector 1 (exact match)
-        assert_eq!(results[0].0, 1);
-        assert!(results[0].1 < 0.01);
-        // Second should be vector 3 (closest)
-        assert_eq!(results[1].0, 3);
-    }
-
-    #[test]
-    fn search_empty_graph() {
-        let config = HnswConfig::new(4);
-        let graph = HnswGraph::new(config);
-        let results = graph.search(&[1.0, 0.0, 0.0, 0.0], 5, 10);
-        assert!(results.is_empty());
-    }
-
-    #[test]
-    fn insert_100_vectors_and_search() {
-        let config = HnswConfig::new(32).with_m(8).with_ef_construction(100);
-        let mut graph = HnswGraph::new(config);
-        let mut rng = SmallRng::seed_from_u64(42);
-
-        let mut vectors: Vec<Vec<f32>> = Vec::new();
-        for i in 0..100 {
-            let v = random_vector(&mut rng, 32);
-            vectors.push(v.clone());
-            graph.insert(i as u64, v);
+    fn set_neighbors(&self, id: u32, layer: usize, neighbors: &[u32]) {
+        let guards = self.node_locks.read();
+        let _lock = guards[id as usize].write();
+        
+        if layer == 0 {
+            let count_ptr = unsafe { self.neighbors0_counts.as_mut_ptr().add(id as usize) };
+            let slice = unsafe { self.neighbors0.get_slice_mut(id as usize * self.config.m0, self.config.m0) };
+            for (i, &n) in neighbors.iter().enumerate() {
+                slice[i] = n;
+            }
+            unsafe { *count_ptr = neighbors.len() as u16; }
+        } else {
+            let upper = unsafe { &mut *self.neighbors_upper.as_mut_ptr().add(id as usize) };
+            upper[layer - 1] = neighbors.to_vec();
         }
-
-        assert_eq!(graph.len(), 100);
-
-        // Search for nearest to the first vector
-        let results = graph.search(&vectors[0], 5, 50);
-        assert_eq!(results.len(), 5);
-        // First result should be the vector itself
-        assert_eq!(results[0].0, 0);
-        assert!(results[0].1 < 0.01);
     }
 
-    #[test]
-    fn recall_at_10_on_1000_vectors() {
-        // This tests the quality of the HNSW index.
-        // We insert 1000 random 128-dim vectors and check that
-        // HNSW search finds at least 95% of the true 10 nearest neighbors.
-        let dim = 128;
-        let n = 1000;
-        let k = 10;
-        let ef_search = 100;
-
-        let config = HnswConfig::new(dim).with_m(16).with_ef_construction(200);
-        let mut graph = HnswGraph::new(config);
-        let mut rng = SmallRng::seed_from_u64(123);
-
-        let mut vectors: Vec<Vec<f32>> = Vec::new();
-        for i in 0..n {
-            let v = random_vector(&mut rng, dim);
-            vectors.push(v.clone());
-            graph.insert(i as u64, v);
-        }
-
-        // Pick 50 random queries and measure recall
-        let num_queries = 50;
-        let mut total_recall = 0.0;
-
-        for _ in 0..num_queries {
-            let query = random_vector(&mut rng, dim);
-
-            // Brute-force ground truth
-            let mut distances: Vec<(u64, f32)> = vectors
-                .iter()
-                .enumerate()
-                .map(|(i, v)| (i as u64, cosine_distance(&query, v)))
-                .collect();
-            distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            let ground_truth: HashSet<u64> = distances.iter().take(k).map(|d| d.0).collect();
-
-            // HNSW search
-            let results = graph.search(&query, k, ef_search);
-            let found: HashSet<u64> = results.iter().map(|r| r.0).collect();
-
-            let recall = ground_truth.intersection(&found).count() as f64 / k as f64;
-            total_recall += recall;
-        }
-
-        let avg_recall = total_recall / num_queries as f64;
-        assert!(
-            avg_recall >= 0.95,
-            "recall@{} should be >= 0.95, got {:.3} (over {} queries)",
-            k, avg_recall, num_queries
-        );
-    }
-
-    #[test]
-    fn layer_distribution_is_geometric() {
-        let config = HnswConfig::new(4);
-        let graph = HnswGraph::new(config);
-
-        let mut layer_counts = [0u32; 10];
-        for _ in 0..10000 {
-            let layer = graph.random_layer();
-            if layer < 10 {
-                layer_counts[layer] += 1;
+    fn add_edge_bidirectional(&self, target_node: u32, new_nb: u32, layer: usize) {
+        let m_max = self.config.max_edges(layer);
+        
+        let guards = self.node_locks.read();
+        let _lock = guards[target_node as usize].write();
+        
+        let mut neighbors = if layer == 0 {
+            let count = unsafe { *self.neighbors0_counts.as_mut_ptr().add(target_node as usize) };
+            let slice = unsafe { self.neighbors0.get_slice_mut(target_node as usize * self.config.m0, count as usize) };
+            slice.to_vec()
+        } else {
+            let upper = unsafe { &*self.neighbors_upper.as_mut_ptr().add(target_node as usize) };
+            upper[layer - 1].clone()
+        };
+        
+        if !neighbors.contains(&new_nb) {
+            neighbors.push(new_nb);
+            
+            if neighbors.len() > m_max {
+                let target_vec = self.get_vector(target_node).unwrap();
+                let mut candidates: Vec<Candidate> = neighbors.into_iter().map(|n| {
+                    let d = cosine_distance_normalized(target_vec, self.get_vector(n).unwrap());
+                    Candidate { id: n, dist: d }
+                }).collect();
+                candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+                
+                neighbors = if layer == 0 {
+                    self.select_neighbors_heuristic(&candidates, m_max, target_vec)
+                } else {
+                    candidates.into_iter().take(m_max).map(|c| c.id).collect()
+                };
+            }
+            
+            if layer == 0 {
+                let count_ptr = unsafe { self.neighbors0_counts.as_mut_ptr().add(target_node as usize) };
+                let slice = unsafe { self.neighbors0.get_slice_mut(target_node as usize * self.config.m0, self.config.m0) };
+                for (i, &n) in neighbors.iter().enumerate() {
+                    slice[i] = n;
+                }
+                unsafe { *count_ptr = neighbors.len() as u16; }
+            } else {
+                let upper = unsafe { &mut *self.neighbors_upper.as_mut_ptr().add(target_node as usize) };
+                upper[layer - 1] = neighbors;
             }
         }
-
-        // Layer 0 should have ~93.8% of nodes (for M=16)
-        let layer0_pct = layer_counts[0] as f64 / 10000.0;
-        assert!(
-            layer0_pct > 0.90 && layer0_pct < 0.97,
-            "layer 0 should have ~93.8%, got {:.1}%",
-            layer0_pct * 100.0
-        );
-
-        // Layer 1 should have ~5-7%
-        let layer1_pct = layer_counts[1] as f64 / 10000.0;
-        assert!(
-            layer1_pct > 0.03 && layer1_pct < 0.10,
-            "layer 1 should have ~6%, got {:.1}%",
-            layer1_pct * 100.0
-        );
     }
 
-    #[test]
-    fn diversity_heuristic_produces_spread_neighbors() {
-        // Insert vectors in a cluster + one outlier.
-        // The diversity heuristic should select the outlier even though
-        // it's farther, because it provides directional diversity.
-        let config = HnswConfig::new(2).with_m(3).with_ef_construction(50);
-        let mut graph = HnswGraph::new(config);
-
-        // Cluster of similar vectors
-        graph.insert(0, vec![1.0, 0.0]);
-        graph.insert(1, vec![0.99, 0.01]);
-        graph.insert(2, vec![0.98, 0.02]);
-        graph.insert(3, vec![0.97, 0.03]);
-        // Outlier in a different direction
-        graph.insert(4, vec![0.0, 1.0]);
-
-        // The entry point's neighbors should include the outlier
-        // for directional diversity, not just the 3 nearest cluster members
-        assert_eq!(graph.len(), 5);
-    }
-
-    #[test]
-    fn recall_at_10_on_10000_vectors() {
-        // Test recall at 10K scale to catch scaling bugs
-        let dim = 64; // smaller dim for faster test
-        let n = 10_000;
-        let k = 10;
-        let ef_search = 100;
-        let num_queries = 20;
-
-        let config = HnswConfig::new(dim).with_m(16).with_ef_construction(200);
-        let mut graph = HnswGraph::new(config);
-        let mut rng = SmallRng::seed_from_u64(123);
-
-        let mut vectors: Vec<Vec<f32>> = Vec::new();
-        for i in 0..n {
-            let v = random_vector(&mut rng, dim);
-            vectors.push(v.clone());
-            graph.insert(i as u64, v);
+    fn insert_internal(&self, id: u32) {
+        let mut visited = self.get_visited_list();
+        let query = self.get_vector(id).unwrap();
+        let node_layer = self.node_max_layers.get()[id as usize];
+        
+        let mut curr_ep = *self.entry_point.read();
+        let max_layer = self.max_layer.load(AtomicOrdering::Acquire);
+        
+        if curr_ep.is_none() {
+            let mut write_ep = self.entry_point.write();
+            if write_ep.is_none() {
+                *write_ep = Some(id);
+                self.max_layer.store(node_layer, AtomicOrdering::Release);
+                self.put_visited_list(visited);
+                return;
+            }
+            curr_ep = *write_ep;
         }
-
-        let mut total_recall = 0.0;
-        for _ in 0..num_queries {
-            let query = random_vector(&mut rng, dim);
-            let mut distances: Vec<(u64, f32)> = vectors.iter().enumerate()
-                .map(|(i, v)| (i as u64, cosine_distance(&query, v)))
+        
+        let mut curr_node = curr_ep.unwrap();
+        let mut curr_dist = cosine_distance_normalized(query, self.get_vector(curr_node).unwrap());
+        
+        for layer in (node_layer + 1 ..= max_layer).rev() {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                let neighbors = self.get_neighbors(curr_node, layer);
+                for &nb in &neighbors {
+                    let d = cosine_distance_normalized(query, self.get_vector(nb).unwrap());
+                    if d < curr_dist {
+                        curr_dist = d;
+                        curr_node = nb;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        
+        let search_start_layer = max_layer.min(node_layer);
+        let mut ep_nodes = vec![Candidate { id: curr_node, dist: curr_dist }];
+        
+        for layer in (0 ..= search_start_layer).rev() {
+            visited.next_gen(); // CLEAR VISITED LIST BETWEEN LAYERS
+            
+            let mut candidates = BinaryHeap::new();
+            let mut results = BinaryHeap::new();
+            
+            for &ep in &ep_nodes {
+                candidates.push(ep);
+                results.push(MaxCandidate { id: ep.id, dist: ep.dist });
+                visited.mark_visited(ep.id);
+            }
+            
+            while let Some(c) = candidates.pop() {
+                let farthest = results.peek().unwrap().dist;
+                if results.len() >= self.config.ef_construction && c.dist > farthest {
+                    break;
+                }
+                
+                let neighbors = self.get_neighbors(c.id, layer);
+                for &nb in &neighbors {
+                    if !visited.mark_visited(nb) {
+                        let d = cosine_distance_normalized(query, self.get_vector(nb).unwrap());
+                        let farthest = results.peek().unwrap().dist;
+                        if results.len() < self.config.ef_construction || d < farthest {
+                            candidates.push(Candidate { id: nb, dist: d });
+                            results.push(MaxCandidate { id: nb, dist: d });
+                            if results.len() > self.config.ef_construction {
+                                results.pop();
+                            }
+                        }
+                    }
+                }
+            }
+            
+            let mut best_candidates: Vec<Candidate> = results.into_iter()
+                .map(|mc| Candidate { id: mc.id, dist: mc.dist })
                 .collect();
-            distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-            let ground_truth: HashSet<u64> = distances.iter().take(k).map(|d| d.0).collect();
-
-            let results = graph.search(&query, k, ef_search);
-            let found: HashSet<u64> = results.iter().map(|r| r.0).collect();
-            total_recall += ground_truth.intersection(&found).count() as f64 / k as f64;
+            best_candidates.sort_by(|a, b| a.dist.partial_cmp(&b.dist).unwrap());
+            
+            let m_max = self.config.max_edges(layer);
+            let selected_neighbors = if layer == 0 {
+                self.select_neighbors_heuristic(&best_candidates, m_max, query)
+            } else {
+                best_candidates.iter().take(m_max).map(|c| c.id).collect()
+            };
+            
+            self.set_neighbors(id, layer, &selected_neighbors);
+            
+            for &nb in &selected_neighbors {
+                self.add_edge_bidirectional(nb, id, layer);
+            }
+            
+            ep_nodes = best_candidates;
         }
+        
+        if node_layer > max_layer {
+            let mut write_ep = self.entry_point.write();
+            if node_layer > self.max_layer.load(AtomicOrdering::Acquire) {
+                *write_ep = Some(id);
+                self.max_layer.store(node_layer, AtomicOrdering::Release);
+            }
+        }
+        
+        self.put_visited_list(visited);
+    }
 
-        let avg_recall = total_recall / num_queries as f64;
-        eprintln!("10K recall@{}: {:.4}", k, avg_recall);
-        assert!(
-            avg_recall >= 0.90,
-            "recall@{} at 10K should be >= 0.90, got {:.4}",
-            k, avg_recall
-        );
+    pub fn insert(&mut self, external_id: u64, vector: Vec<f32>) {
+        let start_id = self.len.load(AtomicOrdering::SeqCst);
+        let end_id = start_id + 1;
+        
+        self.vectors.resize(end_id * self.config.dim, 0.0);
+        self.external_ids.resize(end_id, 0);
+        self.node_max_layers.resize(end_id, 0);
+        self.neighbors0.resize(end_id * self.config.m0, 0);
+        self.neighbors0_counts.resize(end_id, 0);
+        self.neighbors_upper.resize(end_id, Vec::new());
+        self.node_locks.get_mut().resize_with(end_id, || RwLock::new(()));
+        
+        let v_slice = unsafe { self.vectors.get_slice_mut(start_id * self.config.dim, self.config.dim) };
+        v_slice.copy_from_slice(&vector);
+        normalize(v_slice);
+        
+        self.external_ids.as_mut_slice()[start_id] = external_id;
+        
+        let ml = 1.0 / (self.config.m as f64).ln();
+        let mut rng = SmallRng::seed_from_u64(start_id as u64 + 0x12345);
+        let uniform: f64 = rng.gen_range(0.0001..1.0);
+        let l = (-uniform.ln() * ml).floor() as usize;
+        self.node_max_layers.as_mut_slice()[start_id] = l;
+        
+        if l > 0 {
+            self.neighbors_upper.as_mut_slice()[start_id] = vec![Vec::new(); l];
+        }
+        
+        self.insert_internal(start_id as u32);
+        self.len.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+
+    pub fn insert_parallel(&mut self, entries: &[(u64, Vec<f32>)]) {
+        if entries.is_empty() { return; }
+        
+        let start_id = self.len.load(AtomicOrdering::SeqCst);
+        let end_id = start_id + entries.len();
+        
+        self.vectors.resize(end_id * self.config.dim, 0.0);
+        self.external_ids.resize(end_id, 0);
+        self.node_max_layers.resize(end_id, 0);
+        self.neighbors0.resize(end_id * self.config.m0, 0);
+        self.neighbors0_counts.resize(end_id, 0);
+        self.neighbors_upper.resize(end_id, Vec::new());
+        self.node_locks.get_mut().resize_with(end_id, || RwLock::new(()));
+        
+        let vectors_slice = self.vectors.as_mut_slice();
+        let external_ids_slice = self.external_ids.as_mut_slice();
+        let node_max_layers_slice = self.node_max_layers.as_mut_slice();
+        let neighbors_upper_slice = self.neighbors_upper.as_mut_slice();
+        
+        let ml = 1.0 / (self.config.m as f64).ln();
+        let dim = self.config.dim;
+        
+        vectors_slice[start_id * dim .. end_id * dim].par_chunks_mut(dim)
+            .zip(&mut external_ids_slice[start_id .. end_id])
+            .zip(&mut node_max_layers_slice[start_id .. end_id])
+            .zip(&mut neighbors_upper_slice[start_id .. end_id])
+            .enumerate()
+            .for_each(|(i, (((v_slice, ext_id), max_layer), upper))| {
+                let id = start_id + i;
+                let (e, vec) = &entries[i];
+                
+                *ext_id = *e;
+                v_slice.copy_from_slice(vec);
+                normalize(v_slice);
+                
+                let mut rng = SmallRng::seed_from_u64(id as u64 + 0x12345);
+                let uniform: f64 = rng.gen_range(0.0001..1.0);
+                let l = (-uniform.ln() * ml).floor() as usize;
+                *max_layer = l;
+                
+                if l > 0 {
+                    *upper = vec![Vec::new(); l];
+                }
+            });
+            
+        let ids: Vec<u32> = (start_id as u32 .. end_id as u32).collect();
+        let seed_count = 1000.min(ids.len());
+        
+        for &id in &ids[..seed_count] {
+            self.insert_internal(id);
+            self.len.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+        
+        if seed_count < ids.len() {
+            ids[seed_count..].par_iter().for_each(|&id| {
+                self.insert_internal(id);
+            });
+            self.len.fetch_add(ids.len() - seed_count, AtomicOrdering::SeqCst);
+        }
+    }
+
+    pub fn search(&self, query: &[f32], k: usize, ef_search: usize) -> Vec<(u64, f32)> {
+        let ep = match *self.entry_point.read() {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        
+        let mut q_vec = query.to_vec();
+        normalize(&mut q_vec);
+        
+        let mut curr_ep = ep;
+        let mut curr_dist = cosine_distance_normalized(&q_vec, self.get_vector(curr_ep).unwrap());
+        
+        let max_layer = self.max_layer.load(AtomicOrdering::Acquire);
+        
+        for layer in (1 ..= max_layer).rev() {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                let neighbors = self.get_neighbors(curr_ep, layer);
+                for &nb in &neighbors {
+                    let d = cosine_distance_normalized(&q_vec, self.get_vector(nb).unwrap());
+                    if d < curr_dist {
+                        curr_dist = d;
+                        curr_ep = nb;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        
+        let mut visited = self.get_visited_list();
+        let ef = ef_search.max(k);
+        let results = self.search_layer(&q_vec, curr_ep, curr_dist, ef, 0, &mut visited);
+        self.put_visited_list(visited);
+        
+        let mut final_results: Vec<(u64, f32)> = results.into_iter()
+            .map(|c| (self.external_ids.get()[c.id as usize], c.dist))
+            .collect();
+            
+        final_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        final_results.truncate(k);
+        final_results
     }
 }

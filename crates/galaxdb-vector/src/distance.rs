@@ -20,6 +20,66 @@ pub fn cosine_distance(a: &[f32], b: &[f32]) -> f32 {
     1.0 - sim
 }
 
+/// Fast cosine distance for PRE-NORMALIZED vectors (||a|| = ||b|| = 1).
+/// Returns 1.0 - dot(a, b). This is 3× faster than full cosine_distance
+/// because it skips the norm computations.
+///
+/// IMPORTANT: Only correct if both vectors are unit-length. Use `normalize()`
+/// before inserting into the HNSW graph.
+#[inline]
+pub fn cosine_distance_normalized(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+    1.0 - dot_product_fast(a, b)
+}
+
+/// Fast dot product with SIMD acceleration.
+#[inline]
+pub fn dot_product_fast(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len());
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma") {
+            return unsafe { dot_product_avx2(a, b) };
+        }
+    }
+
+    // Scalar fallback
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+}
+
+/// AVX2 + FMA accelerated dot product.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+#[inline]
+unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {
+    unsafe {
+        use std::arch::x86_64::*;
+
+        let n = a.len();
+        let chunks = n / 8;
+        let remainder = n % 8;
+
+        let mut acc = _mm256_setzero_ps();
+        let a_ptr = a.as_ptr();
+        let b_ptr = b.as_ptr();
+
+        for i in 0..chunks {
+            let offset = i * 8;
+            let va = _mm256_loadu_ps(a_ptr.add(offset));
+            let vb = _mm256_loadu_ps(b_ptr.add(offset));
+            acc = _mm256_fmadd_ps(va, vb, acc);
+        }
+
+        let mut sum = hsum_avx2(acc);
+        let start = chunks * 8;
+        for i in start..start + remainder {
+            sum += a[i] * b[i];
+        }
+        sum
+    }
+}
+
 /// Compute cosine similarity between two f32 vectors.
 /// Returns dot(a,b) / (||a|| × ||b||). Range: [-1.0, 1.0].
 #[inline]

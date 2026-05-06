@@ -364,7 +364,6 @@ mod tests {
 
     #[test]
     fn brute_force_filtered_returns_correct_results() {
-        let dim = 4;
         let query = vec![1.0, 0.0, 0.0, 0.0];
         let filtered = vec![
             (1, vec![0.9, 0.1, 0.0, 0.0]),  // similar

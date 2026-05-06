@@ -203,7 +203,7 @@ fn setup_parent_monitor_linux(parent_pid: u32, running: Arc<AtomicBool>) {
 
     // PR_SET_PDEATHSIG = 1, SIGTERM = 15
     // This tells the kernel to send SIGTERM to this process when the parent exits.
-    extern "C" {
+    unsafe extern "C" {
         fn prctl(option: c_int, arg2: c_int) -> c_int;
     }
 

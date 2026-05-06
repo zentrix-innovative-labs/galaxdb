@@ -3,9 +3,13 @@
 //! The executor is the bridge between the SQL layer and the storage engine.
 //! It translates query plans into storage operations (memtable writes, ART
 //! lookups, PAX block reads, etc.).
+//!
+//! For SEMANTIC_MATCH queries, the executor delegates to a `VectorSearchBackend`
+//! trait which abstracts the HNSW + delta buffer + sidecar pipeline.
 
 use galaxdb_common::{GalaxError, GalaxResult};
 
+use crate::ast::SemanticMatchExpr;
 use crate::planner::*;
 
 /// A single row returned by a query.
@@ -28,6 +32,61 @@ pub enum ExecuteResult {
     Ok(String),
     /// Error with message.
     Error(String),
+}
+
+/// Result from a vector search operation.
+#[derive(Debug, Clone)]
+pub struct VectorSearchResult {
+    pub row_id: u64,
+    pub similarity: f32,
+}
+
+/// Trait for the vector search backend (HNSW + delta buffer + sidecar).
+///
+/// The executor calls this to perform SEMANTIC_MATCH queries. The implementation
+/// handles: query text → embedding (via sidecar), HNSW search, delta buffer
+/// union, re-ranking, and threshold filtering.
+pub trait VectorSearchBackend {
+    /// Execute a semantic search: embed the query text, search HNSW + delta buffer,
+    /// re-rank, apply threshold, return top-k results.
+    ///
+    /// Returns Err if the embedding sidecar is unavailable.
+    fn semantic_search(
+        &self,
+        table: &str,
+        query_text: &str,
+        threshold: f64,
+        k: usize,
+        strategy: SearchStrategy,
+    ) -> Result<Vec<VectorSearchResult>, String>;
+
+    /// Execute a brute-force filtered search over a pre-filtered candidate set.
+    fn brute_force_filtered(
+        &self,
+        table: &str,
+        query_text: &str,
+        threshold: f64,
+        k: usize,
+        filter: &FilterExpr,
+    ) -> Result<Vec<VectorSearchResult>, String>;
+}
+
+/// A no-op vector backend that returns "sidecar unavailable" errors.
+/// Used when no vector search is configured.
+pub struct NoOpVectorBackend;
+
+impl VectorSearchBackend for NoOpVectorBackend {
+    fn semantic_search(
+        &self, _table: &str, _query_text: &str, _threshold: f64, _k: usize, _strategy: SearchStrategy,
+    ) -> Result<Vec<VectorSearchResult>, String> {
+        Err("semantic search temporarily unavailable — embedding sidecar is down".to_string())
+    }
+
+    fn brute_force_filtered(
+        &self, _table: &str, _query_text: &str, _threshold: f64, _k: usize, _filter: &FilterExpr,
+    ) -> Result<Vec<VectorSearchResult>, String> {
+        Err("semantic search temporarily unavailable — embedding sidecar is down".to_string())
+    }
 }
 
 /// Catalog entry for a table.
@@ -88,10 +147,9 @@ impl Catalog {
 
 /// Execute a query plan against the catalog.
 ///
-/// This is a simplified executor that handles DDL and validates DML.
-/// Full storage engine integration (memtable writes, ART lookups, etc.)
-/// will be wired in when the engine facade is built.
-pub fn execute(plan: &QueryPlan, catalog: &mut Catalog) -> ExecuteResult {
+/// The `vector_backend` provides SEMANTIC_MATCH execution (HNSW + delta buffer + sidecar).
+/// Pass `&NoOpVectorBackend` if vector search is not configured.
+pub fn execute(plan: &QueryPlan, catalog: &mut Catalog, vector_backend: &dyn VectorSearchBackend) -> ExecuteResult {
     match plan {
         QueryPlan::CreateTable(stmt) => execute_create_table(stmt, catalog),
         QueryPlan::DropTable { name, if_exists } => {
@@ -142,15 +200,28 @@ pub fn execute(plan: &QueryPlan, catalog: &mut Catalog) -> ExecuteResult {
             }
             ExecuteResult::Ok(format!("BULK INSERT INTO {}", table))
         }
-        QueryPlan::SemanticSearch { table, .. } | QueryPlan::HybridSearch { table, .. } => {
+        QueryPlan::SemanticSearch {
+            table,
+            query_text,
+            threshold,
+            strategy,
+            ..
+        } => {
             if !catalog.table_exists(table) {
                 return ExecuteResult::Error(format!("table not found: {}", table));
             }
-            // Semantic search requires the embedding sidecar (Month 3)
-            ExecuteResult::Rows {
-                columns: vec!["id".to_string(), "score".to_string()],
-                rows: vec![],
+            execute_semantic_search(table, query_text, *threshold, *strategy, vector_backend)
+        }
+        QueryPlan::HybridSearch {
+            table,
+            filter,
+            semantic,
+            strategy,
+        } => {
+            if !catalog.table_exists(table) {
+                return ExecuteResult::Error(format!("table not found: {}", table));
             }
+            execute_hybrid_search(table, semantic, filter, *strategy, vector_backend)
         }
         QueryPlan::PointLookup { table, .. } => {
             if !catalog.table_exists(table) {
@@ -161,6 +232,81 @@ pub fn execute(plan: &QueryPlan, catalog: &mut Catalog) -> ExecuteResult {
                 rows: vec![],
             }
         }
+    }
+}
+
+fn execute_semantic_search(
+    table: &str,
+    query_text: &str,
+    threshold: f64,
+    strategy: SearchStrategy,
+    vector_backend: &dyn VectorSearchBackend,
+) -> ExecuteResult {
+    match vector_backend.semantic_search(table, query_text, threshold, 10, strategy) {
+        Ok(results) => {
+            let rows: Vec<Row> = results
+                .iter()
+                .map(|r| Row {
+                    columns: vec![
+                        ("id".to_string(), Value::Integer(r.row_id as i64)),
+                        ("score".to_string(), Value::Float(r.similarity as f64)),
+                    ],
+                })
+                .collect();
+            ExecuteResult::Rows {
+                columns: vec!["id".to_string(), "score".to_string()],
+                rows,
+            }
+        }
+        Err(msg) => ExecuteResult::Error(msg),
+    }
+}
+
+fn execute_hybrid_search(
+    table: &str,
+    semantic: &SemanticMatchExpr,
+    filter: &FilterExpr,
+    strategy: SearchStrategy,
+    vector_backend: &dyn VectorSearchBackend,
+) -> ExecuteResult {
+    let result = match strategy {
+        SearchStrategy::BruteForceFiltered => {
+            vector_backend.brute_force_filtered(
+                table,
+                &semantic.query,
+                semantic.threshold,
+                10,
+                filter,
+            )
+        }
+        SearchStrategy::HnswWithPostFilter => {
+            vector_backend.semantic_search(
+                table,
+                &semantic.query,
+                semantic.threshold,
+                10,
+                strategy,
+            )
+        }
+    };
+
+    match result {
+        Ok(results) => {
+            let rows: Vec<Row> = results
+                .iter()
+                .map(|r| Row {
+                    columns: vec![
+                        ("id".to_string(), Value::Integer(r.row_id as i64)),
+                        ("score".to_string(), Value::Float(r.similarity as f64)),
+                    ],
+                })
+                .collect();
+            ExecuteResult::Rows {
+                columns: vec!["id".to_string(), "score".to_string()],
+                rows,
+            }
+        }
+        Err(msg) => ExecuteResult::Error(msg),
     }
 }
 
