@@ -252,24 +252,24 @@
 
 ## Month 4: Versioning, Training, Hardening & Observability
 
-- [ ] 32. Implement Merkle DAG versioning — galaxdb-versioning (Req 23)
-  - [ ] 32.1 Implement `MerkleDag` struct: BTreeMap of commit_timestamp → MerkleRoot, with root_hash computed as XXH3-128 over child block hashes
-  - [ ] 32.2 Implement version root creation on each commit: collect PAX block checksums, compute Merkle tree
-  - [ ] 32.3 Implement `AT VERSION timestamp` query: filter PAX blocks where commit_timestamp <= target
-  - [ ] 32.4 Implement `AT VERSION tag_name` query: resolve tag to MerkleRoot, return exact block set
-  - [ ] 32.5 Implement semantic guardrail: AT VERSION + SEMANTIC_MATCH without consistency mode → reject with error message
-  - [ ] 32.6 Implement CONSISTENCY 'SEMANTIC_FRESH': search current HNSW against historical rows, include warning in result metadata
-  - [ ] 32.7 Implement CONSISTENCY 'SEMANTIC_SNAPSHOT' rejection: return error "v2 feature"
-  - [ ] 32.8 Write tests: version root computation, AT VERSION query correctness, semantic guardrail rejection, SEMANTIC_FRESH warning
+- [x] 32. Implement Merkle DAG versioning — galaxdb-versioning (Req 23)
+  - [x] 32.1 Implement `MerkleDag` struct: BTreeMap of commit_timestamp → MerkleRoot, with root_hash computed as XXH3-128 over child block hashes
+  - [x] 32.2 Implement version root creation on each commit: collect PAX block checksums, compute Merkle tree
+  - [x] 32.3 Implement `AT VERSION timestamp` query: filter PAX blocks where commit_timestamp <= target
+  - [x] 32.4 Implement `AT VERSION tag_name` query: resolve tag to MerkleRoot, return exact block set
+  - [x] 32.5 Implement semantic guardrail: AT VERSION + SEMANTIC_MATCH without consistency mode → reject with error message
+  - [x] 32.6 Implement CONSISTENCY 'SEMANTIC_FRESH': search current HNSW against historical rows, include warning in result metadata
+  - [x] 32.7 Implement CONSISTENCY 'SEMANTIC_SNAPSHOT' rejection: return error "v2 feature"
+  - [x] 32.8 Write tests: version root computation, AT VERSION query correctness, semantic guardrail rejection, SEMANTIC_FRESH warning
 
-- [ ] 33. Implement version tags — galaxdb-versioning (Req 24)
-  - [ ] 33.1 Implement `CREATE VERSION TAG 'name'`: capture current MerkleRoot, mark referenced blocks as GC-exempt (pinned)
-  - [ ] 33.2 Implement `FOR TRAINING` tag: store TrainingTagMetadata (precision, seed, deterministic_order=true with primary key sort)
-  - [ ] 33.3 Implement `WITH TRAINING PRECISION 'sq8'|'rabitq'|'float32'` storage in tag metadata
-  - [ ] 33.4 Implement `TRAINING SEED n` storage in tag metadata
-  - [ ] 33.5 Integrate with compactor: pinned blocks are never GC'd regardless of MVCC age
-  - [ ] 33.6 Implement `_galaxdb_versions` system table for tag catalog
-  - [ ] 33.7 Write tests: tag creation, GC exemption, FOR TRAINING metadata, compactor respects pins
+- [x] 33. Implement version tags — galaxdb-versioning (Req 24)
+  - [x] 33.1 Implement `CREATE VERSION TAG 'name'`: capture current MerkleRoot, mark referenced blocks as GC-exempt (pinned)
+  - [x] 33.2 Implement `FOR TRAINING` tag: store TrainingTagMetadata (precision, seed, deterministic_order=true with primary key sort)
+  - [x] 33.3 Implement `WITH TRAINING PRECISION 'sq8'|'rabitq'|'float32'` storage in tag metadata
+  - [x] 33.4 Implement `TRAINING SEED n` storage in tag metadata
+  - [x] 33.5 Integrate with compactor: pinned blocks are never GC'd regardless of MVCC age
+  - [x] 33.6 Implement `_galaxdb_versions` system table for tag catalog
+  - [x] 33.7 Write tests: tag creation, GC exemption, FOR TRAINING metadata, compactor respects pins
 
 - [ ] 34. Implement Lance training export — galaxdb-versioning (Req 25)
   - [ ] 34.1 Add `lance` crate dependency, implement `LanceExporter` struct

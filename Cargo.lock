@@ -1122,6 +1122,10 @@ name = "galaxdb-versioning"
 version = "0.1.0"
 dependencies = [
  "galaxdb-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "xxhash-rust",
 ]
 
 [[package]]
