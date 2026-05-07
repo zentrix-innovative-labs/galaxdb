@@ -10,6 +10,8 @@ description = "Embedded library API for GalaxDB (Python FFI via PyO3)"
 galaxdb-common.workspace = true
 galaxdb-sql = { path = "../galaxdb-sql" }
 galaxdb-storage = { path = "../galaxdb-storage" }
+galaxdb-vector = { path = "../galaxdb-vector" }
+galaxdb-sidecar = { path = "../galaxdb-sidecar" }
 galaxdb-io = { path = "../galaxdb-io" }
 sqlparser.workspace = true
 tokio.workspace = true

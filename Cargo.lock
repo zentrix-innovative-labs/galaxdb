@@ -523,8 +523,10 @@ version = "0.1.0"
 dependencies = [
  "galaxdb-common",
  "galaxdb-io",
+ "galaxdb-sidecar",
  "galaxdb-sql",
  "galaxdb-storage",
+ "galaxdb-vector",
  "sqlparser",
  "tempfile",
  "tokio",

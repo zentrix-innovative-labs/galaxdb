@@ -46,6 +46,11 @@ pub fn parse(sql: &str) -> GalaxResult<Vec<AuroraStatement>> {
     }
 
     // Try standard sqlparser, then post-process for extensions
+    // If CREATE TABLE contains EMBEDDING, pre-process to strip it before sqlparser
+    if upper.starts_with("CREATE TABLE") && upper.contains("EMBEDDING") {
+        return Ok(vec![parse_create_table_with_embedding(trimmed)?]);
+    }
+
     let dialect = PostgreSqlDialect {};
     let statements = Parser::parse_sql(&dialect, trimmed).map_err(|e| {
         let pos = extract_error_position(&e);
@@ -380,6 +385,138 @@ fn split_respecting_quotes(s: &str) -> Vec<&str> {
         parts.push(&s[start..]);
     }
     parts
+}
+
+/// Parse CREATE TABLE with EMBEDDING MODEL annotations.
+/// Custom parser that handles: CREATE TABLE name (col TYPE EMBEDDING MODEL 'name' DIM n, ...)
+fn parse_create_table_with_embedding(sql: &str) -> GalaxResult<AuroraStatement> {
+    let upper = sql.to_uppercase();
+    let if_not_exists = upper.contains("IF NOT EXISTS");
+
+    // Extract table name
+    let after_table = if if_not_exists {
+        let pos = upper.find("IF NOT EXISTS").unwrap() + "IF NOT EXISTS".len();
+        sql[pos..].trim()
+    } else {
+        let pos = upper.find("TABLE").unwrap() + "TABLE".len();
+        sql[pos..].trim()
+    };
+
+    let paren_pos = after_table.find('(')
+        .ok_or_else(|| GalaxError::SqlParse { position: 0, message: "expected '(' in CREATE TABLE".into() })?;
+    let table_name = after_table[..paren_pos].trim().to_string();
+
+    // Extract column definitions between ( and )
+    let cols_str = &after_table[paren_pos + 1..];
+    let close_paren = cols_str.rfind(')')
+        .ok_or_else(|| GalaxError::SqlParse { position: 0, message: "expected ')' in CREATE TABLE".into() })?;
+    let cols_str = &cols_str[..close_paren];
+
+    // Split by comma (respecting parentheses for types like DECIMAL(10,2))
+    let col_defs = split_column_defs(cols_str);
+
+    let mut columns = Vec::new();
+    for col_def in &col_defs {
+        let trimmed = col_def.trim();
+        if trimmed.is_empty() { continue; }
+
+        let col_upper = trimmed.to_uppercase();
+
+        // Parse: name TYPE [PRIMARY KEY] [NOT NULL] [EMBEDDING MODEL 'name' DIM n]
+        let parts: Vec<&str> = trimmed.splitn(2, char::is_whitespace).collect();
+        if parts.len() < 2 {
+            columns.push(ColumnDef {
+                name: parts[0].to_string(),
+                data_type: "TEXT".to_string(),
+                nullable: true,
+                primary_key: false,
+                embedding: None,
+            });
+            continue;
+        }
+
+        let col_name = parts[0].to_string();
+        let rest = parts[1].trim();
+
+        // Extract data type (first word or until EMBEDDING/PRIMARY/NOT)
+        let type_end = rest.to_uppercase()
+            .find("EMBEDDING")
+            .or_else(|| rest.to_uppercase().find("PRIMARY"))
+            .or_else(|| rest.to_uppercase().find("NOT NULL"))
+            .unwrap_or(rest.len());
+        let data_type = rest[..type_end].trim().to_string();
+
+        let primary_key = col_upper.contains("PRIMARY KEY");
+        let nullable = !col_upper.contains("NOT NULL");
+
+        // Parse EMBEDDING MODEL 'name' DIM n
+        let embedding = if col_upper.contains("EMBEDDING") {
+            let emb_pos = col_upper.find("EMBEDDING MODEL").unwrap_or(col_upper.find("EMBEDDING").unwrap());
+            let emb_str = &trimmed[emb_pos..];
+
+            // Extract model name (between quotes)
+            let model_name = if let Some(q1) = emb_str.find('\'') {
+                let after_q1 = &emb_str[q1 + 1..];
+                if let Some(q2) = after_q1.find('\'') {
+                    after_q1[..q2].to_string()
+                } else {
+                    "default".to_string()
+                }
+            } else {
+                "default".to_string()
+            };
+
+            // Extract DIM n
+            let dimensions = if let Some(dim_pos) = emb_str.to_uppercase().find("DIM") {
+                let after_dim = emb_str[dim_pos + 3..].trim();
+                after_dim.split_whitespace().next()
+                    .and_then(|s| s.parse::<u32>().ok())
+            } else {
+                None
+            };
+
+            Some(EmbeddingDef { model_name, dimensions })
+        } else {
+            None
+        };
+
+        columns.push(ColumnDef {
+            name: col_name,
+            data_type,
+            nullable,
+            primary_key,
+            embedding,
+        });
+    }
+
+    Ok(AuroraStatement::CreateTable(CreateTableStmt {
+        table_name,
+        columns,
+        if_not_exists,
+    }))
+}
+
+/// Split column definitions by comma, respecting parentheses.
+fn split_column_defs(s: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0;
+
+    for ch in s.chars() {
+        match ch {
+            '(' => { depth += 1; current.push(ch); }
+            ')' => { depth -= 1; current.push(ch); }
+            ',' if depth == 0 => {
+                result.push(current.clone());
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        result.push(current);
+    }
+    result
 }
 
 /// Extract error position from sqlparser error.
