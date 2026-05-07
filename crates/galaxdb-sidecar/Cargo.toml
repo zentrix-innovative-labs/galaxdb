@@ -20,14 +20,14 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+hf-hub = "0.4"
+tokenizers = "0.21"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-# ONNX Runtime — commented out until model files are available.
-# The sidecar binary requires ort for actual inference.
-# For now, the protocol and client code work without it.
-# ort = "2"
 
 [dev-dependencies]
 tempfile.workspace = true
