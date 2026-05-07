@@ -21,6 +21,7 @@ use galaxdb_vector::{
 };
 use galaxdb_sidecar::manager::{SidecarManager, SidecarConfig};
 use galaxdb_sidecar::protocol::EmbedRequest;
+use galaxdb_versioning::{MerkleDag, TagCatalog, TrainingTagMetadata};
 
 /// Per-table vector index (HNSW + delta buffer).
 struct TableVectorIndex {
@@ -47,6 +48,12 @@ pub struct Database {
     vector_indexes: HashMap<String, TableVectorIndex>,
     /// Sidecar manager for embedding generation
     sidecar: Option<SidecarManager>,
+    /// Merkle DAG for version history
+    merkle_dag: MerkleDag,
+    /// Version tag catalog
+    tag_catalog: TagCatalog,
+    /// Monotonic commit timestamp counter
+    commit_ts: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +85,9 @@ impl Database {
             schemas: HashMap::new(),
             vector_indexes: HashMap::new(),
             sidecar: None,
+            merkle_dag: MerkleDag::new(),
+            tag_catalog: TagCatalog::new(),
+            commit_ts: 0,
         })
     }
 
@@ -150,7 +160,7 @@ impl Database {
         }
     }
 
-    fn exec_extension(&self, stmt: &AuroraStatement) -> GalaxResult<QueryResult> {
+    fn exec_extension(&mut self, stmt: &AuroraStatement) -> GalaxResult<QueryResult> {
         match stmt {
             AuroraStatement::Analyze { table } => {
                 if !self.catalog.table_exists(table) { return Err(GalaxError::TableNotFound(table.clone())); }
@@ -162,7 +172,44 @@ impl Database {
                 let msg = table.as_ref().map_or("SHOW EMBEDDING HEALTH".to_string(), |t| format!("SHOW EMBEDDING HEALTH FOR {}", t));
                 Ok(QueryResult::Rows(vec![QueryRow { values: vec![("status".to_string(), msg)] }]))
             }
-            AuroraStatement::CreateVersionTag(tag) => Ok(QueryResult::Ok(format!("CREATE VERSION TAG '{}'", tag.name))),
+            AuroraStatement::CreateVersionTag(tag_stmt) => {
+                // Capture current version state
+                let current_root = self.merkle_dag.latest_root();
+                let current_ts = self.commit_ts;
+                let blocks = self.merkle_dag.blocks_at_version(current_ts);
+
+                let training_opts = if tag_stmt.for_training {
+                    let opts = tag_stmt.training_opts.as_ref();
+                    let precision = opts.and_then(|o| o.precision.as_ref()).map(|p| {
+                        match p {
+                            galaxdb_sql::ast::TrainingPrecision::Sq8 => "sq8".to_string(),
+                            galaxdb_sql::ast::TrainingPrecision::Rabitq => "rabitq".to_string(),
+                            galaxdb_sql::ast::TrainingPrecision::Float32 => "float32".to_string(),
+                        }
+                    }).unwrap_or_else(|| "float32".to_string());
+
+                    Some(TrainingTagMetadata {
+                        precision,
+                        seed: opts.and_then(|o| o.seed),
+                        deterministic_order: true,
+                    })
+                } else {
+                    None
+                };
+
+                match self.tag_catalog.create_tag(
+                    tag_stmt.name.clone(),
+                    current_ts,
+                    current_root,
+                    current_ts,
+                    blocks,
+                    tag_stmt.for_training,
+                    training_opts,
+                ) {
+                    Ok(_) => Ok(QueryResult::Ok(format!("CREATE VERSION TAG '{}'", tag_stmt.name))),
+                    Err(e) => Err(GalaxError::Internal(e)),
+                }
+            }
             AuroraStatement::BulkInsert(bi) => {
                 if !self.catalog.table_exists(&bi.table) { return Err(GalaxError::TableNotFound(bi.table.clone())); }
                 Ok(QueryResult::Ok(format!("BULK INSERT INTO {}", bi.table)))
@@ -578,6 +625,44 @@ mod tests {
         assert!(matches!(db.execute("ANALYZE t").unwrap(), QueryResult::Ok(_)));
         assert!(matches!(db.execute("SHOW EMBEDDING HEALTH").unwrap(), QueryResult::Rows(_)));
         assert!(matches!(db.execute("CREATE VERSION TAG 'v1'").unwrap(), QueryResult::Ok(_)));
+    }
+
+    #[test]
+    fn version_tag_creation_and_pinning() {
+        let mut db = test_db();
+        db.execute("CREATE TABLE docs (id INT, content TEXT)").unwrap();
+        db.execute("INSERT INTO docs (id, content) VALUES (1, 'hello')").unwrap();
+        db.execute("INSERT INTO docs (id, content) VALUES (2, 'world')").unwrap();
+
+        // Create a version tag
+        let result = db.execute("CREATE VERSION TAG 'v1.0'").unwrap();
+        assert!(matches!(result, QueryResult::Ok(_)));
+
+        // Tag should exist in catalog
+        assert!(db.tag_catalog.get_tag("v1.0").is_some());
+        let tag = db.tag_catalog.get_tag("v1.0").unwrap();
+        assert_eq!(tag.name, "v1.0");
+        assert!(!tag.for_training);
+
+        // Duplicate tag should fail
+        assert!(db.execute("CREATE VERSION TAG 'v1.0'").is_err());
+    }
+
+    #[test]
+    fn version_tag_for_training() {
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT)").unwrap();
+
+        // Create training tag with precision
+        let result = db.execute("CREATE VERSION TAG 'train-v1' FOR TRAINING WITH TRAINING PRECISION 'sq8' TRAINING SEED 42").unwrap();
+        assert!(matches!(result, QueryResult::Ok(_)));
+
+        let tag = db.tag_catalog.get_tag("train-v1").unwrap();
+        assert!(tag.for_training);
+        let opts = tag.training_opts.as_ref().unwrap();
+        assert_eq!(opts.precision, "sq8");
+        assert_eq!(opts.seed, Some(42));
+        assert!(opts.deterministic_order);
     }
 
     /// End-to-end SEMANTIC_MATCH test:

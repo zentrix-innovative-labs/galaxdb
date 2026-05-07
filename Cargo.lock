@@ -1004,6 +1004,7 @@ dependencies = [
  "galaxdb-sql",
  "galaxdb-storage",
  "galaxdb-vector",
+ "galaxdb-versioning",
  "sqlparser",
  "tempfile",
  "tokio",

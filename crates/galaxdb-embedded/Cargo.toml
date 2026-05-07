@@ -12,6 +12,7 @@ galaxdb-sql = { path = "../galaxdb-sql" }
 galaxdb-storage = { path = "../galaxdb-storage" }
 galaxdb-vector = { path = "../galaxdb-vector" }
 galaxdb-sidecar = { path = "../galaxdb-sidecar" }
+galaxdb-versioning = { path = "../galaxdb-versioning" }
 galaxdb-io = { path = "../galaxdb-io" }
 sqlparser.workspace = true
 tokio.workspace = true

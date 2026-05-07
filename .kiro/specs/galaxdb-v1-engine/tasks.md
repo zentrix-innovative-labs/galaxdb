@@ -262,7 +262,7 @@
   - [x] 32.7 Implement CONSISTENCY 'SEMANTIC_SNAPSHOT' rejection: return error "v2 feature"
   - [x] 32.8 Write tests: version root computation, AT VERSION query correctness, semantic guardrail rejection, SEMANTIC_FRESH warning
 
-- [x] 33. Implement version tags — galaxdb-versioning (Req 24)
+- [-] 33. Implement version tags — galaxdb-versioning (Req 24)
   - [x] 33.1 Implement `CREATE VERSION TAG 'name'`: capture current MerkleRoot, mark referenced blocks as GC-exempt (pinned)
   - [x] 33.2 Implement `FOR TRAINING` tag: store TrainingTagMetadata (precision, seed, deterministic_order=true with primary key sort)
   - [x] 33.3 Implement `WITH TRAINING PRECISION 'sq8'|'rabitq'|'float32'` storage in tag metadata
@@ -271,7 +271,7 @@
   - [x] 33.6 Implement `_galaxdb_versions` system table for tag catalog
   - [x] 33.7 Write tests: tag creation, GC exemption, FOR TRAINING metadata, compactor respects pins
 
-- [ ] 34. Implement Lance training export — galaxdb-versioning (Req 25)
+- [-] 34. Implement Lance training export — galaxdb-versioning (Req 25)
   - [ ] 34.1 Add `lance` crate dependency, implement `LanceExporter` struct
   - [ ] 34.2 Implement export pipeline: read blocks for tagged version → sort by primary key → convert to Arrow batches → write Lance dataset
   - [ ] 34.3 Implement training precision conversion: float32 passthrough, sq8 quantization, rabitq quantization during export
