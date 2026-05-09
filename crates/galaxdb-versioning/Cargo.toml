@@ -8,9 +8,20 @@ description = "Merkle DAG, Version Tags, Lance Exporter, MinHash Dedup"
 
 [dependencies]
 galaxdb-common.workspace = true
+# Sq8Quantizer / RabitqQuantizer for training-precision conversion during
+# Lance export (task 34.3). galaxdb-vector has no dependency on this crate,
+# so there is no cycle.
+galaxdb-vector.workspace = true
 xxhash-rust.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Lance 4.0.1 internally depends on arrow 57.0 — the user-facing
+# arrow dep MUST match Lance's internal version, otherwise Arrow
+# types from the user crate are incompatible with Lance's trait
+# bounds (RecordBatchReader, Schema, etc.).
+lance = "4.0"
+arrow = "57"
+tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

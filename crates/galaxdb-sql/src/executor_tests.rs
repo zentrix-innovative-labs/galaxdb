@@ -525,3 +525,308 @@ fn execute_hybrid_search_hnsw_strategy() {
         other => panic!("expected Rows, got {:?}", other),
     }
 }
+
+// ── Task 35.2: MinHash write-path integration ──────────────────────
+
+use std::sync::Arc;
+
+/// Build a catalog with a `docs(id INT PK, body TEXT)` table for MinHash
+/// integration tests.
+fn make_catalog_with_docs_body() -> Catalog {
+    let mut catalog = Catalog::new();
+    let entry = TableEntry {
+        name: "docs".to_string(),
+        columns: vec![
+            CatalogColumn {
+                name: "id".to_string(),
+                data_type: "INT".to_string(),
+                nullable: false,
+                primary_key: true,
+                is_embedding_source: false,
+            },
+            CatalogColumn {
+                name: "body".to_string(),
+                data_type: "TEXT".to_string(),
+                nullable: true,
+                primary_key: false,
+                is_embedding_source: false,
+            },
+        ],
+        has_embedding: false,
+    };
+    catalog.create_table("docs".to_string(), entry).unwrap();
+    catalog
+}
+
+#[test]
+fn insert_computes_minhash_for_text_column() {
+    let mut catalog = make_catalog_with_docs_body();
+    let sink = Arc::new(InMemorySystemColumnSink::new());
+    let policy = MinHashPolicy::new(42, sink.clone());
+
+    let plan = plan_insert(
+        "docs".to_string(),
+        vec!["id".to_string(), "body".to_string()],
+        vec![Value::Integer(1), Value::Text("hello world".to_string())],
+    );
+
+    let result = execute_with_policies(&plan, &mut catalog, &NoOpVectorBackend, Some(&policy));
+    assert_eq!(result, ExecuteResult::RowCount(1));
+
+    let entries = sink.entries();
+    assert_eq!(entries.len(), 1, "expected exactly one MinHash write");
+    assert_eq!(entries[0].table, "docs");
+    assert_eq!(entries[0].user_column, "body");
+    assert_eq!(entries[0].signature_column, "_minhash_signature__body");
+
+    // The signature must match an independent computation from the same seed.
+    let expected = galaxdb_versioning::MinHashDedup::new(42)
+        .signature("hello world")
+        .to_bytes();
+    assert_eq!(entries[0].signature, expected);
+}
+
+#[test]
+fn insert_skips_non_text_columns() {
+    let mut catalog = Catalog::new();
+    let entry = TableEntry {
+        name: "nums".to_string(),
+        columns: vec![
+            CatalogColumn {
+                name: "id".to_string(),
+                data_type: "INT".to_string(),
+                nullable: false,
+                primary_key: true,
+                is_embedding_source: false,
+            },
+            CatalogColumn {
+                name: "qty".to_string(),
+                data_type: "INT".to_string(),
+                nullable: false,
+                primary_key: false,
+                is_embedding_source: false,
+            },
+        ],
+        has_embedding: false,
+    };
+    catalog.create_table("nums".to_string(), entry).unwrap();
+
+    let sink = Arc::new(InMemorySystemColumnSink::new());
+    let policy = MinHashPolicy::new(42, sink.clone());
+
+    let plan = plan_insert(
+        "nums".to_string(),
+        vec!["id".to_string(), "qty".to_string()],
+        vec![Value::Integer(1), Value::Integer(99)],
+    );
+
+    let result = execute_with_policies(&plan, &mut catalog, &NoOpVectorBackend, Some(&policy));
+    assert_eq!(result, ExecuteResult::RowCount(1));
+    assert_eq!(sink.len(), 0, "non-TEXT table should not produce MinHash writes");
+}
+
+#[test]
+fn insert_skips_null_text_values() {
+    let mut catalog = make_catalog_with_docs_body();
+    let sink = Arc::new(InMemorySystemColumnSink::new());
+    let policy = MinHashPolicy::new(42, sink.clone());
+
+    let plan = plan_insert(
+        "docs".to_string(),
+        vec!["id".to_string(), "body".to_string()],
+        vec![Value::Integer(1), Value::Null],
+    );
+
+    let result = execute_with_policies(&plan, &mut catalog, &NoOpVectorBackend, Some(&policy));
+    assert_eq!(result, ExecuteResult::RowCount(1));
+    assert_eq!(sink.len(), 0, "NULL text value should not yield a MinHash signature");
+}
+
+#[test]
+fn insert_handles_multiple_text_columns() {
+    let mut catalog = Catalog::new();
+    let entry = TableEntry {
+        name: "docs".to_string(),
+        columns: vec![
+            CatalogColumn {
+                name: "id".to_string(),
+                data_type: "INT".to_string(),
+                nullable: false,
+                primary_key: true,
+                is_embedding_source: false,
+            },
+            CatalogColumn {
+                name: "title".to_string(),
+                data_type: "TEXT".to_string(),
+                nullable: false,
+                primary_key: false,
+                is_embedding_source: false,
+            },
+            CatalogColumn {
+                name: "body".to_string(),
+                data_type: "TEXT".to_string(),
+                nullable: false,
+                primary_key: false,
+                is_embedding_source: false,
+            },
+        ],
+        has_embedding: false,
+    };
+    catalog.create_table("docs".to_string(), entry).unwrap();
+
+    let sink = Arc::new(InMemorySystemColumnSink::new());
+    let policy = MinHashPolicy::new(42, sink.clone());
+
+    let plan = plan_insert(
+        "docs".to_string(),
+        vec!["id".to_string(), "title".to_string(), "body".to_string()],
+        vec![
+            Value::Integer(1),
+            Value::Text("Rust is great".to_string()),
+            Value::Text("Completely different content about biology".to_string()),
+        ],
+    );
+
+    let result = execute_with_policies(&plan, &mut catalog, &NoOpVectorBackend, Some(&policy));
+    assert_eq!(result, ExecuteResult::RowCount(1));
+
+    let entries = sink.entries();
+    assert_eq!(entries.len(), 2, "expected one MinHash write per TEXT column");
+
+    let by_column: std::collections::HashMap<_, _> =
+        entries.iter().map(|e| (e.user_column.clone(), e)).collect();
+    assert!(by_column.contains_key("title"));
+    assert!(by_column.contains_key("body"));
+    assert_eq!(
+        by_column["title"].signature_column,
+        "_minhash_signature__title"
+    );
+    assert_eq!(
+        by_column["body"].signature_column,
+        "_minhash_signature__body"
+    );
+
+    // Distinct texts → distinct signatures.
+    assert_ne!(
+        by_column["title"].signature, by_column["body"].signature,
+        "unrelated texts should produce distinct signatures"
+    );
+}
+
+#[test]
+fn insert_determinism() {
+    let sink_a = Arc::new(InMemorySystemColumnSink::new());
+    let sink_b = Arc::new(InMemorySystemColumnSink::new());
+    let policy_a = MinHashPolicy::new(42, sink_a.clone());
+    let policy_b = MinHashPolicy::new(42, sink_b.clone());
+
+    let mut catalog_a = make_catalog_with_docs_body();
+    let mut catalog_b = make_catalog_with_docs_body();
+
+    let make_plan = || {
+        plan_insert(
+            "docs".to_string(),
+            vec!["id".to_string(), "body".to_string()],
+            vec![
+                Value::Integer(7),
+                Value::Text("deterministic minhash run".to_string()),
+            ],
+        )
+    };
+
+    let _ = execute_with_policies(&make_plan(), &mut catalog_a, &NoOpVectorBackend, Some(&policy_a));
+    let _ = execute_with_policies(&make_plan(), &mut catalog_b, &NoOpVectorBackend, Some(&policy_b));
+
+    let a = sink_a.entries();
+    let b = sink_b.entries();
+    assert_eq!(a.len(), 1);
+    assert_eq!(b.len(), 1);
+    assert_eq!(
+        a[0].signature, b[0].signature,
+        "same seed + same text must yield byte-identical signatures"
+    );
+}
+
+#[test]
+fn insert_uses_column_names_when_provided() {
+    let mut catalog = make_catalog_with_docs_body();
+    let sink = Arc::new(InMemorySystemColumnSink::new());
+    let policy = MinHashPolicy::new(42, sink.clone());
+
+    // Explicit column list in reverse order.
+    let plan = plan_insert(
+        "docs".to_string(),
+        vec!["body".to_string(), "id".to_string()],
+        vec![Value::Text("hello".to_string()), Value::Integer(1)],
+    );
+
+    let result = execute_with_policies(&plan, &mut catalog, &NoOpVectorBackend, Some(&policy));
+    assert_eq!(result, ExecuteResult::RowCount(1));
+
+    let entries = sink.entries();
+    assert_eq!(entries.len(), 1, "exactly one TEXT column → one signature");
+    assert_eq!(entries[0].user_column, "body");
+    assert_eq!(entries[0].signature_column, "_minhash_signature__body");
+
+    // Signature is of "hello", not Integer(1).
+    let expected = galaxdb_versioning::MinHashDedup::new(42)
+        .signature("hello")
+        .to_bytes();
+    assert_eq!(entries[0].signature, expected);
+}
+
+#[test]
+fn is_text_column_handles_varchar_and_char_sizes() {
+    assert!(is_text_column("TEXT"));
+    assert!(is_text_column("VARCHAR"));
+    assert!(is_text_column("VARCHAR(100)"));
+    assert!(is_text_column("CHAR"));
+    assert!(is_text_column("CHAR(10)"));
+    assert!(is_text_column("STRING"));
+    assert!(is_text_column("text")); // case-insensitive
+    assert!(is_text_column("varchar(255)"));
+
+    assert!(!is_text_column("INT"));
+    assert!(!is_text_column("INTEGER"));
+    assert!(!is_text_column("FLOAT"));
+    assert!(!is_text_column("BOOL"));
+    assert!(!is_text_column("BLOB"));
+}
+
+#[test]
+fn execute_without_policy_does_not_call_sink() {
+    let mut catalog = make_catalog_with_docs_body();
+    // The sink is created but never handed to `execute`.
+    let sink = Arc::new(InMemorySystemColumnSink::new());
+
+    let plan = plan_insert(
+        "docs".to_string(),
+        vec!["id".to_string(), "body".to_string()],
+        vec![Value::Integer(1), Value::Text("hello".to_string())],
+    );
+
+    // Legacy `execute` path.
+    let result = execute(&plan, &mut catalog, &NoOpVectorBackend);
+    assert_eq!(result, ExecuteResult::RowCount(1));
+    assert_eq!(sink.len(), 0, "legacy execute must not invoke any sink");
+}
+
+#[test]
+fn execute_with_policy_but_missing_table_does_not_panic() {
+    let mut catalog = Catalog::new(); // no tables registered
+    let sink = Arc::new(InMemorySystemColumnSink::new());
+    let policy = MinHashPolicy::new(42, sink.clone());
+
+    let plan = plan_insert(
+        "ghost".to_string(),
+        vec!["id".to_string()],
+        vec![Value::Integer(1)],
+    );
+
+    let result = execute_with_policies(&plan, &mut catalog, &NoOpVectorBackend, Some(&policy));
+    match result {
+        ExecuteResult::Error(msg) => assert!(msg.contains("table not found")),
+        other => panic!("expected Error for missing table, got {:?}", other),
+    }
+    assert_eq!(sink.len(), 0, "missing table must not produce sink writes");
+}

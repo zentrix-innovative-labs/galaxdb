@@ -8,6 +8,7 @@
 //! trait which abstracts the HNSW + delta buffer + sidecar pipeline.
 
 use galaxdb_common::{GalaxError, GalaxResult};
+use galaxdb_versioning::{MinHashDedup, SIGNATURE_BYTES};
 
 use crate::ast::SemanticMatchExpr;
 use crate::planner::*;
@@ -150,6 +151,19 @@ impl Catalog {
 /// The `vector_backend` provides SEMANTIC_MATCH execution (HNSW + delta buffer + sidecar).
 /// Pass `&NoOpVectorBackend` if vector search is not configured.
 pub fn execute(plan: &QueryPlan, catalog: &mut Catalog, vector_backend: &dyn VectorSearchBackend) -> ExecuteResult {
+    execute_with_policies(plan, catalog, vector_backend, None)
+}
+
+/// Execute a query plan with optional side-channel policies such as MinHash
+/// near-duplicate signature computation on INSERT (task 35.2).
+///
+/// Callers that have no policy to apply should use [`execute`] instead.
+pub fn execute_with_policies(
+    plan: &QueryPlan,
+    catalog: &mut Catalog,
+    vector_backend: &dyn VectorSearchBackend,
+    minhash_policy: Option<&MinHashPolicy>,
+) -> ExecuteResult {
     match plan {
         QueryPlan::CreateTable(stmt) => execute_create_table(stmt, catalog),
         QueryPlan::DropTable { name, if_exists } => {
@@ -159,7 +173,7 @@ pub fn execute(plan: &QueryPlan, catalog: &mut Catalog, vector_backend: &dyn Vec
             table,
             columns,
             values,
-        } => execute_insert(table, columns, values, catalog),
+        } => execute_insert(table, columns, values, catalog, minhash_policy),
         QueryPlan::Update {
             table,
             assignments,
@@ -353,6 +367,7 @@ fn execute_insert(
     columns: &[String],
     values: &[Value],
     catalog: &Catalog,
+    minhash_policy: Option<&MinHashPolicy>,
 ) -> ExecuteResult {
     if !catalog.table_exists(table) {
         return ExecuteResult::Error(format!("table not found: {}", table));
@@ -365,6 +380,15 @@ fn execute_insert(
             columns.len(),
             values.len()
         ));
+    }
+
+    // Task 35.2: compute MinHash signatures for TEXT columns and hand them
+    // to the sink. When the caller didn't install a policy (legacy `execute`)
+    // this path is skipped entirely.
+    if let Some(policy) = minhash_policy {
+        // Safe to unwrap: table_exists was checked above.
+        let table_entry = catalog.get_table(table).unwrap();
+        policy.compute_and_sink(table, table_entry, columns, values);
     }
 
     // In the full implementation, this would write to memtable + WAL + ART
@@ -424,5 +448,184 @@ fn execute_select(
     ExecuteResult::Rows {
         columns: vec![],
         rows: vec![],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Task 35.2 — MinHash write-path integration
+// ---------------------------------------------------------------------------
+
+/// Does `data_type` name a text-valued SQL type that should be MinHashed?
+///
+/// Matches `TEXT`, `VARCHAR`, `STRING`, and `CHAR` case-insensitively.
+/// Parameterised forms like `VARCHAR(100)` or `CHAR(10)` are accepted — the
+/// size parameter is ignored because it doesn't affect MinHash applicability.
+pub fn is_text_column(data_type: &str) -> bool {
+    // Strip any "(n)" suffix — we only care about the base type name.
+    let base = match data_type.find('(') {
+        Some(paren) => &data_type[..paren],
+        None => data_type,
+    };
+    matches!(
+        base.trim().to_ascii_uppercase().as_str(),
+        "TEXT" | "VARCHAR" | "STRING" | "CHAR"
+    )
+}
+
+/// One system-column write produced alongside a user row during INSERT.
+///
+/// Task 35.2 emits these for MinHash signatures on TEXT columns. Later tasks
+/// (35.4 background grouping, 35.5 `WHERE NOT DUPLICATE`) read them back via
+/// the storage engine. Storage integration wires these into PAX system
+/// columns.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SystemColumnWrite {
+    /// Table the row belongs to.
+    pub table: String,
+    /// Which user-visible TEXT column the signature was computed from.
+    pub user_column: String,
+    /// System column name, e.g. `_minhash_signature__body`.
+    pub signature_column: String,
+    /// The 512-byte MinHash signature.
+    pub signature: [u8; SIGNATURE_BYTES],
+}
+
+/// Receives system-column writes produced during INSERT execution.
+///
+/// Task 35.2 wires MinHash signatures through this trait. The concrete
+/// storage integration (later tasks / `galaxdb-embedded`) implements it by
+/// appending the signatures as PAX system columns. Tests use
+/// [`InMemorySystemColumnSink`], a Vec-backed reference impl.
+pub trait SystemColumnSink: Send + Sync {
+    /// Record a single system-column write.
+    fn write(&self, row: SystemColumnWrite);
+}
+
+/// In-memory reference implementation of [`SystemColumnSink`], used by tests
+/// and by callers that want to buffer system-column writes without a full
+/// storage backend.
+#[derive(Debug, Default)]
+pub struct InMemorySystemColumnSink {
+    entries: std::sync::Mutex<Vec<SystemColumnWrite>>,
+}
+
+impl InMemorySystemColumnSink {
+    /// Construct an empty sink.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot the entries recorded so far.
+    pub fn entries(&self) -> Vec<SystemColumnWrite> {
+        self.entries.lock().unwrap().clone()
+    }
+
+    /// Number of entries recorded so far.
+    pub fn len(&self) -> usize {
+        self.entries.lock().unwrap().len()
+    }
+
+    /// Whether no entries have been recorded.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl SystemColumnSink for InMemorySystemColumnSink {
+    fn write(&self, row: SystemColumnWrite) {
+        self.entries.lock().unwrap().push(row);
+    }
+}
+
+/// Write-path MinHash policy: computes a 512-byte MinHash signature for every
+/// TEXT column on INSERT and forwards the result to a [`SystemColumnSink`].
+///
+/// Task 35.2 wires this into [`execute_with_policies`]. Non-TEXT columns and
+/// `NULL` text values are skipped silently — they are not MinHash candidates.
+pub struct MinHashPolicy {
+    dedup: std::sync::Arc<MinHashDedup>,
+    sink: std::sync::Arc<dyn SystemColumnSink>,
+}
+
+impl MinHashPolicy {
+    /// Construct a new policy with a deterministic seed and a sink.
+    ///
+    /// Two policies built with the same seed produce byte-identical
+    /// signatures for the same input text — see [`MinHashDedup::new`].
+    pub fn new(seed: u64, sink: std::sync::Arc<dyn SystemColumnSink>) -> Self {
+        Self {
+            dedup: std::sync::Arc::new(MinHashDedup::new(seed)),
+            sink,
+        }
+    }
+
+    /// Compute MinHash signatures for every TEXT column in a row and forward
+    /// them to the sink.
+    ///
+    /// * If `columns` is empty, `values` are assumed to be in table-definition
+    ///   order — this matches `INSERT INTO t VALUES (...)` without a column
+    ///   list.
+    /// * If `columns` is non-empty, it is the user-provided column name
+    ///   mapping and overrides the positional assumption.
+    /// * Columns whose catalog `data_type` is not a TEXT type (per
+    ///   [`is_text_column`]) are skipped.
+    /// * Non-text `Value` variants (e.g. `Value::Null` for a nullable TEXT
+    ///   column) are skipped.
+    pub fn compute_and_sink(
+        &self,
+        table: &str,
+        table_entry: &TableEntry,
+        columns: &[String],
+        values: &[Value],
+    ) {
+        // Build the (user_column_name, value) pairs.
+        let pairs: Vec<(&str, &Value)> = if columns.is_empty() {
+            // Positional: zip table-definition order against values. If the
+            // caller supplied fewer values than columns (an error caught
+            // elsewhere) we still emit for the prefix that does match — the
+            // policy itself is best-effort.
+            table_entry
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .zip(values.iter())
+                .collect()
+        } else {
+            columns
+                .iter()
+                .map(|c| c.as_str())
+                .zip(values.iter())
+                .collect()
+        };
+
+        for (user_column, value) in pairs {
+            // Locate the catalog column for this name. Unknown columns are
+            // skipped silently — they'll be reported by the validator path.
+            let Some(col_meta) = table_entry
+                .columns
+                .iter()
+                .find(|c| c.name == user_column)
+            else {
+                continue;
+            };
+
+            if !is_text_column(&col_meta.data_type) {
+                continue;
+            }
+
+            let text = match value {
+                Value::Text(s) => s,
+                _ => continue, // NULL / non-text → nothing to hash
+            };
+
+            let signature = self.dedup.signature(text).to_bytes();
+
+            self.sink.write(SystemColumnWrite {
+                table: table.to_string(),
+                user_column: user_column.to_string(),
+                signature_column: format!("_minhash_signature__{user_column}"),
+                signature,
+            });
+        }
     }
 }
