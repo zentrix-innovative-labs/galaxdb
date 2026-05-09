@@ -27,6 +27,9 @@ use galaxdb_versioning::{MerkleDag, TagCatalog, TrainingTagMetadata};
 struct TableVectorIndex {
     hnsw: HnswGraph,
     delta: DeltaBuffer,
+    /// Embedding dimension — read by the online-tests feature to assert
+    /// the sidecar's model matches the declared `DIM` in CREATE TABLE.
+    #[allow(dead_code)]
     dim: usize,
     /// Column name that has the embedding
     embedding_column: String,
@@ -91,31 +94,53 @@ impl Database {
         })
     }
 
-    /// Open with a sidecar for embedding generation.
-    /// The sidecar binary must be built and available at the given path.
-    pub fn open_with_sidecar(path: &str, sidecar_binary: &str, mock_dim: Option<usize>) -> GalaxResult<Self> {
+    /// Open a `Database` with an embedding sidecar attached.
+    ///
+    /// * `path` — storage engine data directory.
+    /// * `sidecar_binary` — path to the already-built `galaxdb-sidecar`
+    ///   binary.
+    /// * `model_id` — HuggingFace model id to load (e.g.
+    ///   `sentence-transformers/all-MiniLM-L6-v2`). The sidecar downloads
+    ///   the model from HF Hub on first run and caches it locally.
+    ///
+    /// If the sidecar fails to load the model it exits with a non-zero
+    /// status; `SidecarManager` observes the dead child via its
+    /// heartbeat/restart loop and surfaces the failure as a typed
+    /// `GalaxError::Internal`. There is no mock fallback — every
+    /// embedding this database returns is computed by the real model.
+    pub fn open_with_sidecar(
+        path: &str,
+        sidecar_binary: &str,
+        model_id: &str,
+    ) -> GalaxResult<Self> {
         let mut db = Self::open(path)?;
 
         let socket_path = db.path.join("sidecar.sock");
         let sidecar_config = SidecarConfig {
             binary_path: PathBuf::from(sidecar_binary),
             socket_path,
-            model_path: None,
-            mock_dim,
+            model_id: model_id.to_string(),
             data_dir: db.path.clone(),
         };
 
         let mgr = SidecarManager::new(sidecar_config);
         mgr.start()?;
 
-        // Wait for socket to appear
+        // Wait for the sidecar socket to appear. The first run includes
+        // the HF Hub download (~90 MB for the default model) so we
+        // allow up to 120 s. Subsequent runs hit the HF cache and come
+        // up in seconds.
         let socket = db.path.join("sidecar.sock");
         let start = std::time::Instant::now();
-        while !socket.exists() && start.elapsed() < std::time::Duration::from_secs(5) {
+        while !socket.exists() && start.elapsed() < std::time::Duration::from_secs(120) {
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
         if !socket.exists() {
-            return Err(GalaxError::Internal("sidecar failed to start within 5s".into()));
+            return Err(GalaxError::Internal(
+                "sidecar failed to start within 120s — check network access to HuggingFace \
+                 Hub and disk space for the HF cache"
+                    .into(),
+            ));
         }
 
         db.sidecar = Some(mgr);
@@ -666,21 +691,31 @@ mod tests {
     }
 
     /// End-to-end SEMANTIC_MATCH test:
-    /// CREATE TABLE with embedding → INSERT text → sidecar embeds → SEMANTIC_MATCH finds it.
+    /// CREATE TABLE with embedding → INSERT text → sidecar embeds →
+    /// SEMANTIC_MATCH finds semantically-similar rows.
     ///
-    /// Requires the sidecar binary to be built. Run with:
-    /// cargo test -p galaxdb-embedded -- semantic_match_end_to_end --ignored
+    /// Requires network access to HuggingFace Hub (downloads ~90 MB
+    /// model on first run). Gated behind the `online-tests` feature:
+    ///
+    /// ```text
+    /// cargo test -p galaxdb-embedded --features online-tests
+    /// ```
+    #[cfg(feature = "online-tests")]
     #[test]
-    #[ignore] // requires sidecar binary — run explicitly
     fn semantic_match_end_to_end() {
-        // Find the sidecar binary
-        let sidecar_binary = std::env::current_exe().unwrap()
-            .parent().unwrap()
-            .parent().unwrap()
+        const MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+        const MODEL_DIM: usize = 384;
+
+        // Find the sidecar binary.
+        let sidecar_binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
             .join("galaxdb-sidecar");
 
         if !sidecar_binary.exists() {
-            // Try to build it
             let status = std::process::Command::new("cargo")
                 .args(["build", "-p", "galaxdb-sidecar"])
                 .status()
@@ -690,53 +725,80 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("semantic_db");
-        std::mem::forget(dir); // keep temp dir alive
+        std::mem::forget(dir); // keep temp dir alive for the test duration
 
-        // Open database with sidecar (mock mode, dim=64)
+        // Open database with sidecar using the real model.
         let mut db = Database::open_with_sidecar(
             db_path.to_str().unwrap(),
             sidecar_binary.to_str().unwrap(),
-            Some(64),
-        ).unwrap();
+            MODEL_ID,
+        )
+        .unwrap();
 
-        // Create table with embedding column
-        db.execute(
-            "CREATE TABLE docs (id INT PRIMARY KEY, content TEXT EMBEDDING MODEL 'mock' DIM 64)"
-        ).unwrap();
+        // Create a table with an embedding column bound to the real model.
+        db.execute(&format!(
+            "CREATE TABLE docs (id INT PRIMARY KEY, \
+             content TEXT EMBEDDING MODEL '{MODEL_ID}' DIM {MODEL_DIM})"
+        ))
+        .unwrap();
 
         assert!(db.vector_indexes.contains_key("docs"));
 
-        // Insert text rows — sidecar will embed them
-        db.execute("INSERT INTO docs (id, content) VALUES (1, 'machine learning is great')").unwrap();
-        db.execute("INSERT INTO docs (id, content) VALUES (2, 'rust programming language')").unwrap();
-        db.execute("INSERT INTO docs (id, content) VALUES (3, 'machine learning algorithms')").unwrap();
+        // Insert text rows — sidecar embeds them through the real model.
+        db.execute(
+            "INSERT INTO docs (id, content) VALUES \
+             (1, 'machine learning is great')",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO docs (id, content) VALUES \
+             (2, 'rust programming language')",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO docs (id, content) VALUES \
+             (3, 'machine learning algorithms')",
+        )
+        .unwrap();
 
-        // Verify embeddings were generated
+        // Verify real embeddings were generated via the sidecar.
         let idx = db.vector_indexes.get("docs").unwrap();
-        assert_eq!(idx.delta.vector_count(), 3, "should have 3 embeddings in delta buffer");
+        assert_eq!(
+            idx.delta.vector_count(),
+            3,
+            "three INSERTs must produce three sidecar-computed embeddings"
+        );
+        assert_eq!(idx.dim, MODEL_DIM);
 
-        // Run SEMANTIC_MATCH — should find similar documents
-        let result = db.execute(
-            "SELECT * FROM docs WHERE SEMANTIC_MATCH(content, 'machine learning', 0.0)"
-        ).unwrap();
+        // Run SEMANTIC_MATCH — expect real semantic ranking, not
+        // hash-based similarity.
+        let result = db
+            .execute(
+                "SELECT * FROM docs WHERE SEMANTIC_MATCH(content, 'machine learning', 0.0)",
+            )
+            .unwrap();
 
         match result {
             QueryResult::Rows(rows) => {
                 assert!(!rows.is_empty(), "SEMANTIC_MATCH should return results");
-                eprintln!("SEMANTIC_MATCH returned {} results:", rows.len());
+                // Every row must declare both pk and similarity columns.
                 for row in &rows {
-                    eprintln!("  {:?}", row.values);
+                    assert!(
+                        row.values.iter().any(|(k, _)| k == "row_id"),
+                        "missing row_id column"
+                    );
+                    assert!(
+                        row.values.iter().any(|(k, _)| k == "similarity"),
+                        "missing similarity column"
+                    );
                 }
-                // The mock sidecar generates deterministic embeddings from text hash.
-                // "machine learning is great" and "machine learning algorithms" should
-                // be more similar to "machine learning" than "rust programming language".
             }
             other => panic!("expected Rows, got {:?}", other),
         }
 
-        // Verify sidecar is still healthy
-        assert!(db.sidecar.as_ref().unwrap().is_healthy());
-
-        eprintln!("✓ End-to-end SEMANTIC_MATCH test passed!");
+        assert!(
+            db.sidecar.as_ref().unwrap().is_healthy(),
+            "sidecar must still be healthy after a successful query"
+        );
     }
 }

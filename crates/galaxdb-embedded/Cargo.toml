@@ -6,6 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 description = "Embedded library API for GalaxDB (Python FFI via PyO3)"
 
+[features]
+# Enable tests that spawn the real sidecar binary and download a
+# sentence-transformer model from HuggingFace Hub.
+online-tests = []
+
 [dependencies]
 galaxdb-common.workspace = true
 galaxdb-sql = { path = "../galaxdb-sql" }

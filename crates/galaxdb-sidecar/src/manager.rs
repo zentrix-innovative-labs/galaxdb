@@ -22,6 +22,12 @@ use galaxdb_common::{GalaxError, GalaxResult};
 
 use crate::protocol::*;
 
+/// Default sentence-transformer model used by the sidecar if no explicit
+/// model id is provided. The model is pulled from HuggingFace Hub on first
+/// run. Chosen for size/quality balance: ~90 MB, 384-d embeddings, strong
+/// general-purpose recall.
+pub const DEFAULT_MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+
 /// Sidecar connection state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidecarState {
@@ -36,16 +42,21 @@ pub enum SidecarState {
 }
 
 /// Configuration for the sidecar manager.
+///
+/// Every sidecar launched by this manager loads a real sentence-transformer
+/// model from HuggingFace Hub. There is no mock mode — if the model fails
+/// to load the sidecar exits with status 1 and the engine observes the
+/// dead child and enters degraded mode (see Req 19).
 #[derive(Debug, Clone)]
 pub struct SidecarConfig {
     /// Path to the sidecar binary.
     pub binary_path: PathBuf,
     /// Unix socket path for communication.
     pub socket_path: PathBuf,
-    /// Model path (ONNX file) or None for mock mode.
-    pub model_path: Option<PathBuf>,
-    /// Mock embedding dimensions (for testing without a model).
-    pub mock_dim: Option<usize>,
+    /// HuggingFace model ID to load, e.g. `sentence-transformers/all-MiniLM-L6-v2`.
+    /// The sidecar downloads the model from HF Hub on first run and caches it
+    /// locally thereafter.
+    pub model_id: String,
     /// Data directory (for backlog table).
     pub data_dir: PathBuf,
 }
@@ -102,13 +113,7 @@ impl SidecarManager {
         let mut cmd = Command::new(&self.config.binary_path);
         cmd.arg("--socket").arg(&self.config.socket_path);
         cmd.arg("--parent-pid").arg(std::process::id().to_string());
-
-        if let Some(dim) = self.config.mock_dim {
-            cmd.arg("--mock-dim").arg(dim.to_string());
-        }
-        if let Some(ref model) = self.config.model_path {
-            cmd.arg("--model").arg(model);
-        }
+        cmd.arg("--model").arg(&self.config.model_id);
 
         let child = cmd.spawn().map_err(|e| {
             GalaxError::Internal(format!("failed to spawn sidecar: {}", e))
@@ -334,20 +339,42 @@ impl Drop for SidecarManager {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "online-tests"))]
 mod tests {
+    //! Integration tests that require network access to HuggingFace Hub.
+    //!
+    //! Run with:
+    //!
+    //! ```text
+    //! cargo test -p galaxdb-sidecar --features online-tests
+    //! ```
+    //!
+    //! Every test in this module launches a real sidecar binary that
+    //! downloads and loads `DEFAULT_MODEL_ID` (~90 MB) on first run. If
+    //! the network or HF Hub is unavailable the sidecar exits with
+    //! status 1 and the test fails with a typed error — there is no
+    //! mock fallback. To run on CI without HF access, use a local
+    //! HF-compatible mirror (e.g. `HF_ENDPOINT=https://hf-mirror.com`).
+
     use super::*;
     use std::path::Path;
     use std::time::Instant;
 
+    /// Dimension of the default model's embeddings. Pinned so accidental
+    /// model upgrades are caught by the test suite.
+    const DEFAULT_MODEL_DIM: usize = 384;
+
     fn test_config(socket_path: &Path) -> SidecarConfig {
-        // Find the sidecar binary in the target directory
-        let binary = std::env::current_exe().unwrap()
-            .parent().unwrap() // deps/
-            .parent().unwrap() // debug/ or release/
+        // Find the sidecar binary in the target directory.
+        let binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap() // deps/
+            .parent()
+            .unwrap() // debug/ or release/
             .join("galaxdb-sidecar");
 
-        // Build it if it doesn't exist
+        // Build it if it doesn't exist.
         if !binary.exists() {
             let status = std::process::Command::new("cargo")
                 .args(["build", "-p", "galaxdb-sidecar"])
@@ -359,13 +386,15 @@ mod tests {
         SidecarConfig {
             binary_path: binary,
             socket_path: socket_path.to_path_buf(),
-            model_path: None,
-            mock_dim: Some(64),
+            model_id: DEFAULT_MODEL_ID.to_string(),
             data_dir: socket_path.parent().unwrap().to_path_buf(),
         }
     }
 
     /// Wait for the sidecar socket to appear.
+    ///
+    /// Allows up to the supplied timeout — the first run includes the
+    /// HF Hub download (~90 MB) so callers pass a generous timeout.
     fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < timeout {
@@ -378,6 +407,10 @@ mod tests {
         false
     }
 
+    /// 120-second timeout covers the initial model download on a cold
+    /// HF cache. Subsequent runs hit the cache and finish in seconds.
+    const SOCKET_READY_TIMEOUT: Duration = Duration::from_secs(120);
+
     #[test]
     fn manager_starts_and_stops() {
         let dir = tempfile::tempdir().unwrap();
@@ -388,7 +421,10 @@ mod tests {
         assert_eq!(mgr.state(), SidecarState::Stopped);
 
         mgr.start().unwrap();
-        assert!(wait_for_socket(&socket, Duration::from_secs(5)), "socket should appear");
+        assert!(
+            wait_for_socket(&socket, SOCKET_READY_TIMEOUT),
+            "socket should appear after model load"
+        );
         assert_eq!(mgr.state(), SidecarState::Healthy);
         assert!(mgr.is_process_alive());
 
@@ -404,17 +440,26 @@ mod tests {
         let mgr = SidecarManager::new(config);
 
         mgr.start().unwrap();
-        assert!(wait_for_socket(&socket, Duration::from_secs(5)));
+        assert!(wait_for_socket(&socket, SOCKET_READY_TIMEOUT));
 
-        let response = mgr.embed(EmbedRequest {
-            row_id: 1,
-            text: "hello world".to_string(),
-            column: "emb".to_string(),
-        }).unwrap();
+        let response = mgr
+            .embed(EmbedRequest {
+                row_id: 1,
+                text: "hello world".to_string(),
+                column: "emb".to_string(),
+            })
+            .unwrap();
 
         assert_eq!(response.row_id, 1);
-        assert_eq!(response.embedding.len(), 64);
-        assert!(!response.model_version.is_empty());
+        assert_eq!(response.embedding.len(), DEFAULT_MODEL_DIM);
+        assert_eq!(response.model_version, DEFAULT_MODEL_ID);
+        // Real sentence-transformers output is L2-normalized.
+        let norm: f32 = response.embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!(
+            (norm - 1.0).abs() < 0.01,
+            "expected unit-norm embedding, got norm={}",
+            norm
+        );
 
         mgr.stop();
     }
@@ -426,10 +471,10 @@ mod tests {
         let config = test_config(&socket);
         let mgr = SidecarManager::new(config);
 
-        // Don't start the sidecar — it should be in Stopped state
+        // Don't start the sidecar — it should be in Stopped state.
         assert!(mgr.is_degraded());
 
-        // Embed should fail and add to backlog
+        // Embed should fail and add to backlog.
         let result = mgr.embed(EmbedRequest {
             row_id: 1,
             text: "test".to_string(),
@@ -447,19 +492,19 @@ mod tests {
         let mgr = SidecarManager::new(config);
 
         mgr.start().unwrap();
-        assert!(wait_for_socket(&socket, Duration::from_secs(5)));
+        assert!(wait_for_socket(&socket, SOCKET_READY_TIMEOUT));
         assert!(mgr.is_healthy());
 
-        // Miss 2 heartbeats — still healthy
+        // Miss 2 heartbeats — still healthy.
         mgr.record_missed_heartbeat();
         mgr.record_missed_heartbeat();
         assert!(mgr.is_healthy());
 
-        // Miss 3rd — degraded
+        // Miss 3rd — degraded.
         mgr.record_missed_heartbeat();
         assert_eq!(mgr.state(), SidecarState::Degraded);
 
-        // Successful heartbeat — back to healthy
+        // Successful heartbeat — back to healthy.
         mgr.record_heartbeat();
         assert!(mgr.is_healthy());
 
@@ -473,26 +518,38 @@ mod tests {
         let config = test_config(&socket);
         let mgr = SidecarManager::new(config);
 
-        // Add requests to backlog while sidecar is down
+        // Add requests to backlog while sidecar is down.
         mgr.add_to_backlog(EmbedRequest {
-            row_id: 1, text: "a".to_string(), column: "emb".to_string(),
+            row_id: 1,
+            text: "a".to_string(),
+            column: "emb".to_string(),
         });
         mgr.add_to_backlog(EmbedRequest {
-            row_id: 2, text: "b".to_string(), column: "emb".to_string(),
+            row_id: 2,
+            text: "b".to_string(),
+            column: "emb".to_string(),
         });
         assert_eq!(mgr.backlog_size(), 2);
 
-        // Start sidecar and wait for it to be ready
+        // Start sidecar and wait for it to be ready.
         mgr.start().unwrap();
-        assert!(wait_for_socket(&socket, Duration::from_secs(5)), "socket should appear");
+        assert!(
+            wait_for_socket(&socket, SOCKET_READY_TIMEOUT),
+            "socket should appear"
+        );
 
-        // Verify sidecar is actually accepting connections before draining
+        // Verify the sidecar is actually accepting connections.
         let test_result = mgr.send_embed_request(&EmbedRequest {
-            row_id: 99, text: "test".to_string(), column: "emb".to_string(),
+            row_id: 99,
+            text: "test".to_string(),
+            column: "emb".to_string(),
         });
-        assert!(test_result.is_ok(), "sidecar should be accepting connections");
+        assert!(
+            test_result.is_ok(),
+            "sidecar should be accepting connections after model load"
+        );
 
-        // Drain backlog
+        // Drain backlog.
         let processed = mgr.drain_backlog();
         assert_eq!(processed, 2);
         assert_eq!(mgr.backlog_size(), 0);

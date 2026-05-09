@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Embedding Sidecar binary (ort crate, Unix socket, backlog)"
+description = "Embedding Sidecar binary (Candle, Unix socket, backlog)"
+
+[features]
+# Enable tests that launch the real sidecar binary and download a
+# sentence-transformer model from HuggingFace Hub (~90 MB on first run).
+# Off by default so `cargo test -p galaxdb-sidecar` stays hermetic.
+online-tests = []
 
 [lib]
 name = "galaxdb_sidecar"
