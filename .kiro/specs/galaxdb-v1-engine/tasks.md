@@ -360,4 +360,4 @@ boxes mirror the phase status there.
 - [x] Phase E — `_disk_full` Prometheus metric live
 - [x] Phase F — Reconcile tasks.md with real code (this entry)
 - [ ] Phase G — Real AWS benchmarking against SIFT1M
-- [ ] Phase H — CI gates (grep-for-mocks, cargo-deny for vendor SDKs)
+- [x] Phase H — CI gates (grep-for-mocks, cargo-deny for vendor SDKs)

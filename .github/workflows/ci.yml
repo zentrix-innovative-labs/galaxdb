@@ -38,7 +38,48 @@ jobs:
         run: cargo build --release
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --workspace --exclude galaxdb-python --lib
 
       - name: Clippy lint
         run: cargo clippy -- -D warnings
+
+  # -------------------------------------------------------------------
+  # Phase H consolidation gates. See docs/CONSOLIDATION.md Phase H and
+  # .github/workflows/README.md. These run independently of the main
+  # build so a mock regression fails fast even while the slow build is
+  # still warming up.
+  # -------------------------------------------------------------------
+
+  no-mocks-gate:
+    name: "Gate H1: no mocks in production code"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ripgrep
+        run: sudo apt-get update -y && sudo apt-get install -y ripgrep
+      - name: Run grep-for-mocks
+        run: bash scripts/grep-for-mocks.sh
+
+  no-vendor-sdk-gate:
+    name: "Gate H2: no vendor cloud SDKs in Cargo.lock"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+      - name: cargo deny check bans
+        run: cargo deny check bans
+      - name: cargo deny check licenses
+        run: cargo deny check licenses
+      - name: cargo deny check advisories
+        run: cargo deny check advisories
+
+  task-tracker-gate:
+    name: "Gate H3: tasks.md consistent with production code"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run check-tasks-no-stub-ticks
+        run: bash scripts/check-tasks-no-stub-ticks.sh

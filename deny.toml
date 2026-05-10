@@ -1,0 +1,85 @@
+# Phase H gate H2: cargo-deny configuration.
+#
+# Primary purpose: keep vendor SDKs out of the dependency graph. GalaxDB
+# supports AWS / GCP / Azure / Vault key management exclusively through
+# `ExternalCommandKeyProvider` + `HashicorpVaultKeyProvider` (pure Rust,
+# HTTP). No cloud-provider SDK is ever permitted — that preserves the
+# no-vendor-lock-in rule from .kiro/steering/engineering-principles.md §5.
+#
+# Run locally with:
+#   cargo install cargo-deny  # once
+#   cargo deny check bans
+#   cargo deny check licenses
+#   cargo deny check advisories
+#
+# CI runs all three under the same name via .github/workflows/ci.yml.
+
+[graph]
+all-features = false
+no-default-features = false
+
+[bans]
+multiple-versions = "allow"
+wildcards = "warn"
+highlight = "all"
+
+# The core rule: no cloud-vendor SDK in any build profile, any feature,
+# any target.
+deny = [
+    # AWS SDK family
+    { name = "aws-sdk-kms" },
+    { name = "aws-sdk-s3" },
+    { name = "aws-sdk-dynamodb" },
+    { name = "aws-sdk-secretsmanager" },
+    { name = "aws-sdk-sts" },
+    { name = "aws-config" },
+    # Google Cloud SDK family
+    { name = "google-cloud-kms" },
+    { name = "google-cloud-storage" },
+    { name = "google-cloud-auth" },
+    { name = "gcloud-sdk" },
+    # Azure SDK family
+    { name = "azure_core" },
+    { name = "azure_identity" },
+    { name = "azure_storage" },
+    { name = "azure_security_keyvault" },
+]
+
+# Never warn on `rand`, `ring`, etc. being present in multiple versions —
+# common transitively and harmless. This is just about vendor SDKs.
+skip = []
+skip-tree = []
+
+[licenses]
+# We accept OSI-approved licenses commonly used in the Rust ecosystem.
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-DFS-2016",
+    "Unicode-3.0",
+    "Zlib",
+    "MPL-2.0",
+    "CC0-1.0",
+    "0BSD",
+    # aes-gcm / rsa style
+    "OpenSSL",
+]
+confidence-threshold = 0.8
+# If a new dependency carries an unrecognized license, CI fails and a
+# human has to review. This is deliberate.
+
+[advisories]
+# Fail on any unmaintained crate or open security advisory.
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# ignore = []  # Add specific RUSTSEC IDs here if a known advisory has a
+#              # documented mitigation in this workspace.
+
+[sources]
+unknown-registry = "warn"
+unknown-git = "warn"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

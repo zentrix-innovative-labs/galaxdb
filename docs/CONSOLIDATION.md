@@ -200,12 +200,12 @@ Phase B is architectural. The plan is broken into reviewable sub-steps so we can
 
 ### Phase H — CI gates to prevent regression.
 
-- [ ] H1: Add a CI step that runs `scripts/grep-for-mocks.sh` which fails the build if `mock` appears in any non-test source file.
-- [ ] H2: Add `cargo deny check` to CI with `deny.toml` that blocks any new `aws-sdk-*`, `google-cloud-*`, `azure_*` dependency at the Cargo.lock level.
-- [ ] H3: Add a CI step that fails if `tasks.md` has ticked boxes on tasks that match known stub patterns (the grep above + executor stub comments).
-- [ ] H4: Document the CI gates in `.github/workflows/README.md`.
+- [x] H1: `scripts/grep-for-mocks.sh` wired into CI as the `no-mocks-gate` job. Fails on `\bmock` in any production Rust file under `crates/`, `benchmarks/`, `galaxdb-python/`. Allowed only inside `tests/`, `*_tests.rs`, `tests.rs`, `benches/`, or in comments that explicitly document the absence of a mock.
+- [x] H2: `deny.toml` + `cargo deny check {bans,licenses,advisories}` wired as the `no-vendor-sdk-gate` job. Denies `aws-sdk-*`, `google-cloud-*`, `gcloud-sdk`, `azure_*` by name at the Cargo.lock level. Any PR that pulls one in transitively fails CI.
+- [x] H3: `scripts/check-tasks-no-stub-ticks.sh` wired as the `task-tracker-gate` job. Fails if `tasks.md` ticks 18.7 / 37 / 32.3 / 32.4 / 32.6 / 10.5 / 33.5 while the corresponding stub marker is still in the code / tracker (`NotYetAvailable { task: "..." }`, Phase B6/B7 deferral in `CONSOLIDATION.md`). Also tripwires `In the full implementation`, `For now we rely`, `NoOpVectorBackend`, and `AwsKmsKeyProvider` outside doc comments.
+- [x] H4: `.github/workflows/README.md` documents all four CI jobs (build + three gates), what each allows, and how to run them locally.
 
-**Verification**: A PR that adds `fn mock_foo()` in a non-test file fails CI.
+**Verification**: A PR that adds `fn mock_foo()` in a non-test file fails the `no-mocks-gate` job. A PR that adds `aws-sdk-kms` to any `Cargo.toml` fails the `no-vendor-sdk-gate` job. Running `bash scripts/grep-for-mocks.sh` and `bash scripts/check-tasks-no-stub-ticks.sh` on HEAD both exit 0.
 
 ## Running log
 
@@ -402,3 +402,23 @@ Phase G is the real AWS-benchmarking phase. This entry records the infrastructur
 - Pasting the resulting ef-sweep rows into `docs/BENCHMARKS.md` and ticking G2 / G3 / G4.
 
 **Next action**: User executes `GALAXDB_SSH_KEY=~/.ssh/galaxdb-test.pem scripts/aws-integration-run.sh` on the workstation with their own AWS profile. First run will error in step 5 with the observed SIFT1M SHA256; user verifies it, pins it via `GALAXDB_SIFT1M_SHA256=<hex>`, and re-runs. Second run produces `sift_bench.json`; user attaches it to the consolidation tracker.
+
+### 2026-05-10 — Phase H complete
+
+CI gates are live. Regressions that would reintroduce stubs, mocks, vendor SDKs, or prematurely-ticked tasks now fail the build before they can land on `main`.
+
+Files touched in Phase H:
+- `scripts/grep-for-mocks.sh` — new. Walks `crates/` + `benchmarks/` + `galaxdb-python/`, skips allow-listed test paths (`tests/`, `*_tests.rs`, `tests.rs`, `benches/`, `integration_test.rs`), case-insensitively greps for `\bmock`, then filters out comment-level negations (`no mock`, `not a mock`, `never a mock`, `there is deliberately no`, etc.). Any hit is a production-code mock reference and fails the job.
+- `scripts/check-tasks-no-stub-ticks.sh` — new. Cross-checks `tasks.md` tick state against the `GalaxError::NotYetAvailable` markers in `crates/galaxdb-sql/src/executor.rs` and the deferred-phase markers in `docs/CONSOLIDATION.md`. Also tripwires four historical stub strings directly: `In the full implementation` (Phase B), `For now we rely` (Phase E), `NoOpVectorBackend` (Phase B8), and `AwsKmsKeyProvider` outside doc comments (Phase C).
+- `deny.toml` — new. `[bans]` section denies cloud-vendor SDKs by name: `aws-sdk-kms`, `aws-sdk-s3`, `aws-sdk-dynamodb`, `aws-sdk-secretsmanager`, `aws-sdk-sts`, `aws-config`, `google-cloud-kms`, `google-cloud-storage`, `google-cloud-auth`, `gcloud-sdk`, `azure_core`, `azure_identity`, `azure_storage`, `azure_security_keyvault`. `[licenses]` allows OSI-approved licenses only. `[advisories]` fails on any open RustSec advisory.
+- `.github/workflows/ci.yml` — rewritten. Four parallel jobs: `build-and-test` (cargo build/test/clippy, unchanged except narrowed to `--workspace --exclude galaxdb-python --lib` per the Phase B baseline), `no-mocks-gate` (H1), `no-vendor-sdk-gate` (H2 — runs `cargo deny check bans`, `… licenses`, `… advisories`), `task-tracker-gate` (H3).
+- `.github/workflows/README.md` — new. Documents each job, what it allows, what it denies, and how to run the same gates locally.
+
+Verification (actually run on macOS, 2026-05-10):
+- `bash scripts/grep-for-mocks.sh` → `OK: no forbidden mock references in production code.` Exit 0.
+- `bash scripts/check-tasks-no-stub-ticks.sh` → `OK: tasks.md and CONSOLIDATION.md are consistent with production code.` Exit 0.
+- First run of H1 caught two real negation comments (`crates/galaxdb-versioning/src/export.rs:1262` "not a mock", `crates/galaxdb-sidecar/src/main.rs:58` "never a mock"). Allowlist tightened to accept those patterns. Re-run passed. The first-run false-positive confirmed the gate actually walks production code — not a no-op.
+
+Consolidation sprint summary: Phases A, B, C, D (folded), E, F, G-infrastructure, H all green on `feat/v1-engine-tasks-1-5`. Remaining work is user-initiated:
+- **G2 + G3-pin + G4-run**: run `scripts/aws-integration-run.sh` on `i-0b2dec9226f62db65`, pin the observed SIFT1M SHA256, re-run, attach `bench-results/<ts>/sift_bench.json` to this tracker's next running-log entry.
+- Then: tick G2/G3/G4 boxes, close the sprint.
