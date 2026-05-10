@@ -171,9 +171,9 @@ Phase B is architectural. The plan is broken into reviewable sub-steps so we can
 
 ### Phase E — `_disk_full` metric live.
 
-- [ ] E1: Add a `prometheus::IntGauge` (0 or 1) to `galaxdb-storage::disk_full::DiskFullHandler`. Set to 1 on trip, 0 on recovery.
-- [ ] E2: Gauge is registered with the default Prometheus registry exported by `galaxdb-observe` when that crate is present; fallback to a crate-local static registry otherwise.
-- [ ] E3: Test: flip disk-full on, assert gauge reads 1; recover, assert gauge reads 0.
+- [x] E1: Add a `prometheus::IntGauge` (0 or 1) to `galaxdb-storage::disk_full::DiskFullHandler`. Set to 1 on trip, 0 on recovery.
+- [x] E2: Gauge is registered with the default Prometheus registry exported by `galaxdb-observe` when that crate is present; fallback to a crate-local static registry otherwise.
+- [x] E3: Test: flip disk-full on, assert gauge reads 1; recover, assert gauge reads 0.
 
 **Verification**: `! git grep -n "For now we rely" -- 'crates/**/*.rs'` returns zero. 
 
@@ -292,3 +292,23 @@ Verification (all commands actually run on macOS, 2026-05-10):
   - `git grep -n -i 'mock' -- 'crates/galaxdb-crypto/src'` → one comment line (`key_provider.rs:950`) reading `// spawn/pipe/wait path — not a mock.`, which describes the real-subprocess implementation.
 
 **Next action**: Phase D (wire-protocol bind parameter plumbing) — per Phase B's "Phase D folded in" note, `Value::Integer(_) => None, // simplified` has already been replaced with a full typed conversion. Phase D's closing checklist items (`D1`, `D2`, `D3`) can be ticked at the same time as the Phase F task-tracker reconciliation. The next *new* work is Phase E — `_disk_full` Prometheus metric.
+
+### 2026-05-10 — Phase E complete
+
+The `galaxdb_disk_full` Prometheus gauge is live. `DiskFullHandler` now owns a process-wide `prometheus::IntGauge` registered exactly once against the default registry exposed by `galaxdb-observe`. The gauge reads `1` while the engine is in disk-full recovery mode and `0` while normal operation resumes after `recover`. No tracing-only signal anywhere — the stub comment "For now we rely on the tracing log line" has been removed outright.
+
+Files touched in Phase E:
+- `crates/galaxdb-observe/Cargo.toml` — added `prometheus = { workspace = true }`.
+- `crates/galaxdb-observe/src/lib.rs` — exposes the process-wide Prometheus `Registry` via `pub fn default_registry() -> &'static Registry`, lazy-initialised with `std::sync::OnceLock`. Two unit tests: stable-across-calls and accepts-registration.
+- `crates/galaxdb-storage/Cargo.toml` — added `galaxdb-observe` path dep and `prometheus = { workspace = true }`.
+- `crates/galaxdb-storage/src/disk_full/mod.rs` — full rewrite. `DiskFullHandler` gains a `gauge: IntGauge` field; new free function `get_or_register_disk_full_gauge` uses a `OnceLock<IntGauge>` to register the `galaxdb_disk_full` metric with the observe registry exactly once. `handle_disk_full` sets the gauge to 1; `recover` sets it to 0. New `disk_full_gauge()` accessor returns the current gauge value. The "For now we rely on the tracing log line" comment is gone.
+- `crates/galaxdb-storage/src/disk_full/tests.rs` — three new tests: `disk_full_gauge_sets_to_one_when_tripped`, `disk_full_gauge_sets_to_zero_after_recovery`, `disk_full_gauge_is_registered_with_default_registry`. Tests that touch the singleton gauge serialise on a test-only `Mutex<()>` to eliminate inter-test races and verify the value via both the handler accessor and `default_registry().gather()` so E2 registration is asserted, not assumed.
+
+Verification (actually run on macOS, 2026-05-10):
+- `cargo check --workspace --all-targets` → Exit 0 (only pre-existing `galaxdb-python` pyo3 warnings).
+- `cargo test -p galaxdb-storage --lib disk_full` → 17 tests pass, 0 failures (14 existing plus 3 new Phase E tests).
+- `cargo test --workspace --exclude galaxdb-python --lib` → **675 tests pass across 11 crates, 0 failures** (Phase C baseline was 670; the 5-test delta is 2 new `galaxdb-observe` tests + 3 new `galaxdb-storage` Phase E tests).
+  - Per-crate totals: `galaxdb-common` 6 · `galaxdb-crypto` 38 · `galaxdb-embedded` 8 · `galaxdb-io` 24 · `galaxdb-observe` 2 · `galaxdb-sidecar` 15 · `galaxdb-sql` 111 · `galaxdb-storage` 324 · `galaxdb-vector` 48 · `galaxdb-versioning` 73 · `galaxdb-wire` 26.
+- `git grep -n "For now we rely" -- 'crates/**/*.rs'` → zero matches (exit 1, nothing to print).
+
+**Next action**: Phase F — reconcile `tasks.md` (untick 18.3–18.7, 32.3, 32.4, 32.6, 33, 33.5; add the consolidation-sprint preamble). Phase F baseline test count: **675**.

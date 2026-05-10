@@ -8,3 +8,4 @@ description = "HTTP /health + /metrics, Prometheus, OTel tracing, JSON logging"
 
 [dependencies]
 galaxdb-common.workspace = true
+prometheus.workspace = true
