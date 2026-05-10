@@ -1,0 +1,5 @@
+CREATE TABLE products
+psql:bench-results/aws-20260510/wire_demo.sql:9: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+psql:bench-results/aws-20260510/wire_demo.sql:9: error: connection to server was lost

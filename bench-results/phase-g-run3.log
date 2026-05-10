@@ -1,0 +1,55 @@
+[preflight] commit:   8567691d4f7859742c1e6cb54ba8c429ae36d297
+[preflight] instance: i-0b2dec9226f62db65 (c6id.4xlarge) in us-east-1
+[preflight] user:     ubuntu
+[preflight] remote:   /mnt/nvme/galaxdb
+[preflight] results:  bench-results/20260510T131442Z
+[1/8] starting i-0b2dec9226f62db65
+[2/8] resolving public IP
+[3/8] waiting for SSH
+  sshd ready after 1 attempt(s)
+[4/8] mounting NVMe and syncing workspace
+meta-data=/dev/nvme1n1           isize=512    agcount=4, agsize=57983399 blks
+         =                       sectsz=512   attr=2, projid32bit=1
+         =                       crc=1        finobt=1, sparse=1, rmapbt=1
+         =                       reflink=1    bigtime=1 inobtcount=1 nrext64=0
+data     =                       bsize=4096   blocks=231933593, imaxpct=25
+         =                       sunit=0      swidth=0 blks
+naming   =version 2              bsize=4096   ascii-ci=0, ftype=1
+log      =internal log           bsize=4096   blocks=113248, version=2
+         =                       sectsz=512   sunit=0 blks, lazy-count=1
+realtime =none                   extsz=4096   blocks=0, rtextents=0
+Discarding blocks...Done.
+Hit:1 http://us-east-1.ec2.archive.ubuntu.com/ubuntu noble InRelease
+Hit:2 http://us-east-1.ec2.archive.ubuntu.com/ubuntu noble-updates InRelease
+Hit:3 http://us-east-1.ec2.archive.ubuntu.com/ubuntu noble-backports InRelease
+Hit:4 http://security.ubuntu.com/ubuntu noble-security InRelease
+Reading package lists...
+
+Running kernel seems to be up-to-date.
+
+No services need to be restarted.
+
+No containers need to be restarted.
+
+No user sessions are running outdated binaries.
+
+No VM guests are running outdated hypervisor (qemu) binaries on this host.
+info: downloading installer
+warn: It looks like you have an existing rustup settings file at:
+warn: /home/ubuntu/.rustup/settings.toml
+warn: Rustup will install the default toolchain as specified in the settings file,
+warn: instead of the one inferred from the default host triple.
+info: profile set to minimal
+info: default host triple is x86_64-unknown-linux-gnu
+warn: Updating existing toolchain, profile choice will be ignored
+info: syncing channel updates for stable-x86_64-unknown-linux-gnu
+info: default toolchain set to stable-x86_64-unknown-linux-gnu
+Connection timed out during banner exchange
+rsync: connection unexpectedly closed (0 bytes received so far) [sender]
+rsync error: unexplained error (code 255) at /AppleInternal/Library/BuildRoots/46298ee5-4a1c-11ef-a181-1aec23608739/Library/Caches/com.apple.xbs/Sources/rsync/rsync/io.c(453) [sender=2.6.9]
+
+[teardown] stopping i-0b2dec9226f62db65 in us-east-1 (script exit=255)
+[teardown] WARNING: aws ec2 stop-instances returned an error
+[teardown] Please manually confirm the instance is stopped:
+[teardown]   aws ec2 describe-instances --instance-ids i-0b2dec9226f62db65 --region us-east-1
+[teardown] instance final state: unknown

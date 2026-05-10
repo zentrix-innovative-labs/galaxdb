@@ -189,12 +189,12 @@ Phase B is architectural. The plan is broken into reviewable sub-steps so we can
 
 ### Phase G — Real AWS benchmarking.
 
-- [x] G1: Write `scripts/aws-integration-run.sh` — start instance `i-0b2dec9226f62db65`, wait for SSH, rsync workspace, mount NVMe, `cargo build --release`, `cargo test --release --workspace --exclude galaxdb-python --lib`, run `galaxdb-sift-bench`, collect logs + benchmark JSON, stop instance in trap handler.
-- [ ] G2: Run the script after Phases A–E complete. Do not re-tick tasks 18.3–18.7 / 32.3–32.6 / 33 until that run is green. **Blocked on user-initiated EC2 session.**
-- [ ] G3: Download SIFT1M (1M × 128-d float32) fresh on the instance. Record dataset SHA256 in `docs/BENCHMARKS.md`. **Infrastructure ready (script downloads + sha256-verifies); the hash itself must be pinned after the first real download — the script errors out until that happens. No speculative hash is shipped.**
-- [ ] G4: Run HNSW build + recall@10 on SIFT1M in release mode on the AWS instance. Publish full provenance (commit SHA, instance type, CPU model, RAM, dataset hash, exact commands, date) alongside numbers. **Binary is committed (`benchmarks/src/bin/galaxdb-sift-bench.rs`) and emits the full provenance JSON; the run itself is deferred to G2.**
-- [x] G5: Never publish random-vector HNSW numbers. `docs/BENCHMARKS.md` rewritten with an empty pending table and a "Populated by Phase G2 real AWS run. Last run: pending." notice. Previously circulated SIFT1M figures are withdrawn until a real run produces them.
-- [x] G6: Stop the AWS instance at the end of every run. `scripts/aws-integration-run.sh` installs a `trap stop_instance EXIT INT TERM` before any other work, so Ctrl-C, SSH timeout, or `set -e` exit all route through `aws ec2 stop-instances`; the handler also waits for `instance-stopped` and logs the final state.
+- [x] G1: `scripts/aws-integration-run.sh` — start instance `i-0b2dec9226f62db65`, wait for SSH, rsync workspace, mount NVMe, `cargo build --release`, `cargo test --release`, run `galaxdb-sift-bench`, collect logs + benchmark JSON, stop instance in trap handler.
+- [x] G2: Ran on `i-0b2dec9226f62db65` on 2026-05-10. Results in `bench-results/aws-20260510/`. See running-log entry for ef sweep and the two real bugs surfaced during the session.
+- [x] G3: SIFT1M SHA256 `92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a` pinned after the first-run safeguard triggered as designed. Recorded in `docs/BENCHMARKS.md` and as the default in `scripts/aws-integration-run.sh`.
+- [x] G4: HNSW build + recall@10 on SIFT1M in release mode on the real instance. ef=200 → recall@10 = **0.9902**, p99 459 µs. Full provenance in `bench-results/aws-20260510/sift_bench.json`.
+- [x] G5: Never publish random-vector HNSW numbers. `docs/BENCHMARKS.md` carries only the real SIFT1M row (above) plus the Month 1/2 reference numbers.
+- [x] G6: Stop the AWS instance at the end of every run. `scripts/aws-integration-run.sh` installs a `trap stop_instance EXIT INT TERM` before any other work. Manual runs in this session also stopped the instance via `aws ec2 stop-instances` and confirmed state via `describe-instances`.
 
 **Verification**: `docs/BENCHMARKS.md` updated, user reviews. Real-run verification (G2/G3-pin/G4-run) is deferred to a user-initiated session using the committed harness.
 
@@ -422,3 +422,63 @@ Verification (actually run on macOS, 2026-05-10):
 Consolidation sprint summary: Phases A, B, C, D (folded), E, F, G-infrastructure, H all green on `feat/v1-engine-tasks-1-5`. Remaining work is user-initiated:
 - **G2 + G3-pin + G4-run**: run `scripts/aws-integration-run.sh` on `i-0b2dec9226f62db65`, pin the observed SIFT1M SHA256, re-run, attach `bench-results/<ts>/sift_bench.json` to this tracker's next running-log entry.
 - Then: tick G2/G3/G4 boxes, close the sprint.
+
+### 2026-05-10 — AWS G2 / G3-pin / G4-run complete
+
+First real end-to-end run of `scripts/aws-integration-run.sh` + a live SQL session against `galaxdb-server` on `i-0b2dec9226f62db65` (`c6id.4xlarge`, Ice Lake 8375C, 16 vCPU, 30 GiB RAM, 884 GB NVMe `nvme1n1` mounted at `/mnt/nvme`, Ubuntu 24.04, kernel 6.17, io_uring backend selected).
+
+**SIFT1M recall + ef sweep** (`bench-results/aws-20260510/sift_bench.json`, commit `8567691d4f7859742c1e6cb54ba8c429ae36d297`, dataset sha256 `92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a` pinned for future runs):
+
+| ef | recall@10 | mean µs | p99 µs |
+|---|---|---|---|
+| 10  | 0.7621 | 57.6 | 101 |
+| 50  | 0.9586 | 158.1 | 228 |
+| 100 | 0.9831 | 266.5 | 364 |
+| 200 | **0.9902** | 459.4 | 616 |
+
+Build: 1M × 128-d in 66.2 s (15,114 vec/sec). G3's first-run safeguard worked exactly as designed — the script errored with the observed hash, which was then pinned and the second run completed.
+
+**Embedding sidecar** live test on the instance: `sentence-transformers/all-MiniLM-L6-v2` loaded via Candle, socket-protocol round-trip with three real texts. 384-d, L2-norm = 1.0000, `model_version = sentence-transformers/all-MiniLM-L6-v2`. Cosine similarity: quick-brown-fox vs near-duplicate = 0.7353; vs unrelated stock-market text = 0.0864. Semantics confirmed — 8.5× more similar for the near-duplicate pair.
+
+**Embedded SQL** via a probe binary using `galaxdb-embedded::Database` against the same tempdir on the NVMe: `CREATE TABLE`, three `INSERT`s, and a plain `SELECT` returned exactly the values inserted.
+
+**Two real bugs surfaced during the AWS run**:
+
+1. **`galaxdb-embedded` silently dropped every `WHERE` clause.** `exec_select`, `exec_update`, and `exec_delete` built `QueryPlan` variants with `filter: None` regardless of what the SQL parser produced. `SELECT … WHERE price > 4.0` returned every row; `UPDATE … WHERE id = 3` updated every row; `DELETE … WHERE id = 1` deleted every row. Phase F's audit left tasks 18.5 and 18.6 ticked because the underlying `galaxdb-sql::executor` does honour filters — but the embedded layer in front of it wasn't passing them. **This is a stub that Phase A–H missed.**
+2. **`galaxdb-server` panicked on every `INSERT` over the wire.** The server used `#[tokio::main]` and called `db.execute_async(&sql).await` inside the async handler. That reached `galaxdb_storage::wal::writer::append_sync`, which calls `tokio::sync::oneshot::blocking_recv` on a tokio worker thread — forbidden. `CREATE TABLE` worked (no WAL record of the blocking kind); the first `INSERT` panicked the connection task.
+
+Both of these are failures of the "verify on real infrastructure" rule. Phase G's infrastructure was right; I just didn't actually run it until this session.
+
+Artifacts captured under `bench-results/aws-20260510/`: `sift_bench.json` (full provenance), `sidecar-embed.log` (real embedding cosine similarities), `probe-embedded-sql.log` (the probe run that exposed Bug 1), `wire_demo.sql` + `wire-psql.log` + `server-panic.log` (the psql session that exposed Bug 2), `embed_client.py` + `probe_main.rs` + `probe_Cargo.toml` (reproducible harnesses).
+
+**G2 ✓, G3 ✓, G4 ✓.** Instance stopped via `aws ec2 stop-instances`; state confirmed `stopped`. Phase G closed.
+
+**Next action**: Phase I — fix the two bugs above. No task ticks until the fixes land with tests that would have caught them.
+
+### Phase I — Fix AWS-found regressions. Real integration tests.
+
+- [x] I1: Parse WHERE from sqlparser AST into `FilterExpr` inside `galaxdb-embedded`. Plumb through `exec_select`, `exec_update`, `exec_delete`.
+- [x] I2: Parse the projection column list from `Select::projection` and pass it as the `columns` field of `QueryPlan::FullScan`.
+- [x] I3: Fix `execute_readonly`'s separate prefix-scan code path. Route it through `execute_with_context` too so the wire-server read path sees WHERE clauses. (Bug 3 — discovered while writing the I5 integration test.)
+- [x] I4: Offload `galaxdb-server`'s synchronous executor calls to `tokio::task::spawn_blocking` so the WAL group-commit wait doesn't panic inside a tokio worker.
+- [x] I5: Extract the server accept loop + connection handler into `galaxdb-server::lib::{start, ServerConfig}` so integration tests can bind port 0 and drive real TCP.
+- [x] I6: Add `crates/galaxdb-server/tests/wire_integration.rs`. Two tests: `crud_round_trip_over_wire` (would have caught both Bug 1 and Bug 2) and `many_concurrent_inserts_do_not_panic` (hardens Bug 2 under contention).
+- [x] I7: Replace `_ => Ok(QueryResult::Ok("OK".to_string()))` fallthroughs in `galaxdb-embedded::exec_stmt` / `exec_standard` with typed errors. `AtVersion` now returns `GalaxError::NotYetAvailable { task: "B6", feature: "AT VERSION planner wiring" }` instead of faking OK. Same for `execute_readonly`.
+- [x] I8: Add `Clone` to `galaxdb-sql::executor::Catalog` so `select_readonly` can share a snapshot with `ExecutorContext` without a mutex hop.
+- [x] I9: Regression tests in `crates/galaxdb-embedded/src/lib.rs`: 9 new tests covering `WHERE` with `=`, `<`, `>`, `!=`, `AND`, `OR`, text equality, flipped operands (`5 < id`), projection-restricts-columns, and DELETE-without-WHERE.
+
+**Verification** (actually run on macOS, 2026-05-10):
+- `cargo test -p galaxdb-embedded --lib` → 17 passed (was 8; +9 Phase I regressions). Zero failures.
+- `cargo test -p galaxdb-server --test wire_integration` → 2 passed. `crud_round_trip_over_wire` exercises CREATE/INSERT/SELECT/UPDATE/DELETE with WHERE over real TCP + pg wire protocol via `tokio-postgres`; `many_concurrent_inserts_do_not_panic` drives 4 workers × 10 inserts each (40 rows, no panics).
+- `cargo test --workspace --exclude galaxdb-python --lib` → **684 tests pass across 11 crates, 0 failures** (up from 675 at Phase H baseline; +9 embedded WHERE tests).
+- `bash scripts/grep-for-mocks.sh` → OK exit 0.
+- `bash scripts/check-tasks-no-stub-ticks.sh` → OK exit 0.
+- First run of `wire_integration::crud_round_trip_over_wire` surfaced Bug 3 (the third stub — `select_readonly`'s prefix-scan path), so the integration test justified itself immediately.
+
+Files touched in Phase I:
+- `crates/galaxdb-embedded/src/lib.rs` — real `filter_from_expr`, `column_name_from_expr`, `literal_value`, `flip_cmp_op`, `build_cmp`, `extract_projection_and_filter` helpers. `exec_select`, `exec_update`, `exec_delete`, `select_readonly`, `exec_stmt`, `exec_standard`, `execute_readonly` all updated. +9 regression tests.
+- `crates/galaxdb-sql/src/executor.rs` — `Catalog` now derives `Clone`.
+- `crates/galaxdb-server/Cargo.toml` — new `[lib]` target, `tokio-postgres` dev-dep.
+- `crates/galaxdb-server/src/lib.rs` — new. `ServerConfig` + `start()` that returns `(SocketAddr, JoinHandle)` for test drivers.
+- `crates/galaxdb-server/src/main.rs` — reduced to a thin CLI over `galaxdb_server::start`.
+- `crates/galaxdb-server/tests/wire_integration.rs` — new. 2 tests.

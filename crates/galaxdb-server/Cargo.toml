@@ -4,7 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Standalone server binary, connection management"
+description = "GalaxDB standalone server (PostgreSQL wire protocol)"
+
+[lib]
+name = "galaxdb_server"
+path = "src/lib.rs"
 
 [[bin]]
 name = "galaxdb-server"
@@ -12,13 +16,12 @@ path = "src/main.rs"
 
 [dependencies]
 galaxdb-common.workspace = true
-galaxdb-sql = { path = "../galaxdb-sql" }
-galaxdb-storage = { path = "../galaxdb-storage" }
-galaxdb-io = { path = "../galaxdb-io" }
-galaxdb-wire = { path = "../galaxdb-wire" }
-galaxdb-embedded = { path = "../galaxdb-embedded" }
-sqlparser.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-tempfile.workspace = true
+galaxdb-embedded.workspace = true
+galaxdb-wire.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tempfile = { workspace = true }
+
+[dev-dependencies]
+tokio-postgres = "0.7"

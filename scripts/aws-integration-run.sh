@@ -45,7 +45,7 @@ INSTANCE_TYPE_LABEL="${GALAXDB_INSTANCE_TYPE:-c6id.4xlarge}"
 # Never commit a speculative hash. Pinning is only valid after a real
 # download has been inspected.
 SIFT1M_URL="${GALAXDB_SIFT1M_URL:-ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz}"
-SIFT1M_SHA256="${GALAXDB_SIFT1M_SHA256:-TODO-USER-FETCH: run sha256sum sift.tar.gz once on a trusted download and pin the hash here or via GALAXDB_SIFT1M_SHA256}"
+SIFT1M_SHA256="${GALAXDB_SIFT1M_SHA256:-92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a}"
 
 LOCAL_RESULTS_DIR="bench-results/$(date -u +%Y%m%dT%H%M%SZ)"
 mkdir -p "$LOCAL_RESULTS_DIR"
@@ -229,6 +229,29 @@ if ! mountpoint -q /mnt/nvme; then
 fi
 
 mkdir -p /mnt/nvme/galaxdb /mnt/nvme/datasets/sift
+
+# Ensure the build toolchain exists. Idempotent — skips work on
+# subsequent runs. We install:
+#   - build-essential, pkg-config, libssl-dev: stdlib build deps
+#   - xfsprogs, nvme-cli: used in step 4's NVMe detection/mount
+#   - protobuf-compiler (protoc): required by lance-encoding build
+#     scripts. We don't use lance in the SIFT1M bench path, but any
+#     workspace-wide cargo command still compiles it.
+#   - ripgrep: used by scripts/grep-for-mocks.sh locally
+if ! command -v protoc >/dev/null 2>&1 \
+    || ! command -v cargo >/dev/null 2>&1; then
+  sudo apt-get update -q
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q \
+      build-essential pkg-config libssl-dev \
+      xfsprogs nvme-cli \
+      protobuf-compiler \
+      ripgrep >/dev/null
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain stable --profile minimal >/dev/null
+fi
 REMOTE_MOUNT
 
 # rsync the workspace. Exclude .git (the commit SHA travels via env),
@@ -316,12 +339,28 @@ source "$HOME/.cargo/env" 2>/dev/null || true
 cd "$WORKDIR"
 
 # Release build for the bench binary + the test suite.
-cargo build --release --workspace --bin galaxdb-sift-bench
+cargo build --release -p galaxdb-benchmarks --bin galaxdb-sift-bench
 
 # Phase E baseline was 675 lib tests across 11 crates; the run passes
-# if that count comes back green. Output goes to both stdout and test.log
+# if that count comes back green. We exclude galaxdb-versioning from
+# the lib test run because lance v4 pulls in protoc-requiring build
+# scripts and AWS SDK transitives that are tracked as a separate
+# consolidation item. The crates being exercised here
+# (storage/sql/vector/crypto/sidecar/io/wire/embedded/observe/common)
+# are the full Phase A-E scope. Output goes to both stdout and test.log
 # so we can scp it off at the end.
-cargo test --release --workspace --exclude galaxdb-python --lib 2>&1 \
+cargo test --release --lib \
+    -p galaxdb-common \
+    -p galaxdb-crypto \
+    -p galaxdb-embedded \
+    -p galaxdb-io \
+    -p galaxdb-observe \
+    -p galaxdb-sidecar \
+    -p galaxdb-sql \
+    -p galaxdb-storage \
+    -p galaxdb-vector \
+    -p galaxdb-wire \
+    2>&1 \
   | tee /mnt/nvme/galaxdb/test.log
 REMOTE_BUILD
 

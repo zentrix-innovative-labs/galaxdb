@@ -131,7 +131,7 @@ pub struct CatalogColumn {
 }
 
 /// In-memory catalog tracking table metadata.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Catalog {
     tables: HashMap<String, TableEntry>,
 }

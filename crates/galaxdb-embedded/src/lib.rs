@@ -221,7 +221,11 @@ impl Database {
                     if let sqlparser::ast::Statement::Query(q) = s.as_ref() {
                         last = self.select_readonly(q)?;
                     } else {
-                        last = QueryResult::Ok("OK".to_string());
+                        return Err(GalaxError::Internal(
+                            "execute_readonly only supports SELECT and SHOW; \
+                             use execute() for write-capable statements"
+                                .into(),
+                        ));
                     }
                 }
                 AuroraStatement::ShowEmbeddingHealth { table } => {
@@ -247,27 +251,36 @@ impl Database {
     }
 
     fn select_readonly(&self, q: &sqlparser::ast::Query) -> GalaxResult<QueryResult> {
+        // Route through the canonical executor so WHERE clauses and
+        // projections are honoured. Before Phase I this did a raw
+        // prefix scan over `engine.scan_all()` and dropped the filter,
+        // which silently returned every row for any `SELECT ... WHERE`
+        // the wire server received.
+        //
+        // `execute_with_context` takes `&mut ExecutorContext`, but this
+        // method is `&self` (multiple concurrent readers). We build a
+        // throwaway context that clones the catalog; the executor
+        // never mutates the catalog on read paths, so the clone we
+        // take here is discarded at the end.
+        let (columns, filter) = extract_projection_and_filter(q);
         let table = extract_table(q);
         if table != "unknown" && !self.catalog.table_exists(&table) {
             return Err(GalaxError::TableNotFound(table));
         }
-        let prefix = format!("{}:", table);
-        let rows: Vec<QueryRow> = self
-            .engine
-            .scan_all()
-            .into_iter()
-            .filter(|(k, _)| String::from_utf8_lossy(k).starts_with(&prefix))
-            .map(|(_, v)| {
-                let decoded = row_codec::decode_row(&v);
-                QueryRow {
-                    values: decoded
-                        .into_iter()
-                        .map(|(k, v)| (k, row_codec::value_display(&v)))
-                        .collect(),
-                }
-            })
-            .collect();
-        Ok(QueryResult::Rows(rows))
+        let plan = QueryPlan::FullScan {
+            table,
+            filter,
+            columns,
+        };
+
+        let mut ctx = ExecutorContext::new(self.engine.clone());
+        ctx.catalog = self.catalog.clone();
+        ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
+            sidecar: self.sidecar.clone(),
+            indexes: self.vector_indexes.clone(),
+        }));
+        let res = execute_with_context(&plan, &mut ctx)?;
+        Ok(query_result_from(res))
     }
 
     // -----------------------------------------------------------------
@@ -303,7 +316,10 @@ impl Database {
             AuroraStatement::BulkInsert(bi) => self.dispatch(QueryPlan::BulkInsert {
                 table: bi.table.clone(),
             }),
-            _ => Ok(QueryResult::Ok("OK".to_string())),
+            AuroraStatement::AtVersion(_) => Err(GalaxError::NotYetAvailable {
+                task: "B6",
+                feature: "AT VERSION planner wiring (consolidation Phase B6 deferred)",
+            }),
         }
     }
 
@@ -324,10 +340,18 @@ impl Database {
             sqlparser::ast::Statement::Update {
                 table,
                 assignments,
+                selection,
                 ..
-            } => self.exec_update(&table.relation.to_string(), assignments),
+            } => self.exec_update(
+                &table.relation.to_string(),
+                assignments,
+                selection.as_ref(),
+            ),
             sqlparser::ast::Statement::Delete(del) => self.exec_delete(del),
-            _ => Ok(QueryResult::Ok("OK".to_string())),
+            other => Err(GalaxError::Internal(format!(
+                "unsupported SQL statement: {:?}",
+                std::mem::discriminant(other)
+            ))),
         }
     }
 
@@ -500,10 +524,11 @@ impl Database {
 
     fn exec_select(&mut self, q: &sqlparser::ast::Query) -> GalaxResult<QueryResult> {
         let table = extract_table(q);
+        let (columns, filter) = extract_projection_and_filter(q);
         let plan = QueryPlan::FullScan {
             table: table.clone(),
-            filter: None,
-            columns: vec![],
+            filter,
+            columns,
         };
         let mut ctx = self.context();
         let res = execute_with_context(&plan, &mut ctx)?;
@@ -515,15 +540,17 @@ impl Database {
         &mut self,
         table: &str,
         assignments: &[sqlparser::ast::Assignment],
+        selection: Option<&sqlparser::ast::Expr>,
     ) -> GalaxResult<QueryResult> {
         let aligned: Vec<(String, Value)> = assignments
             .iter()
             .map(|a| (a.target.to_string(), value_from_expr(&a.value)))
             .collect();
+        let filter = selection.and_then(filter_from_expr);
         let plan = QueryPlan::Update {
             table: table.to_string(),
             assignments: aligned,
-            filter: None,
+            filter,
         };
         self.dispatch(plan)
     }
@@ -539,10 +566,8 @@ impl Database {
         if table.is_empty() {
             return Ok(QueryResult::RowCount(0));
         }
-        let plan = QueryPlan::Delete {
-            table,
-            filter: None,
-        };
+        let filter = del.selection.as_ref().and_then(filter_from_expr);
+        let plan = QueryPlan::Delete { table, filter };
         self.dispatch(plan)
     }
 
@@ -755,6 +780,180 @@ fn extract_table(q: &sqlparser::ast::Query) -> String {
         }
     }
     "unknown".to_string()
+}
+
+/// Extract the projection column list and the WHERE filter from a
+/// `SELECT` query. `SELECT *` / unsupported projection items yield
+/// an empty column list (which the executor interprets as "all
+/// columns"). Missing WHERE returns `None`.
+///
+/// Supported projection items:
+/// - `*` → empty list (all columns)
+/// - `col_name` / `table.col_name` → column name
+///
+/// Anything else (aggregates, expressions, aliases) returns the
+/// empty projection so the full row comes back — that's correct
+/// behaviour for v1, the executor caller can drop columns it
+/// doesn't want. A dedicated aggregation path is task 18.8 scope.
+fn extract_projection_and_filter(
+    q: &sqlparser::ast::Query,
+) -> (Vec<String>, Option<FilterExpr>) {
+    let sqlparser::ast::SetExpr::Select(s) = q.body.as_ref() else {
+        return (vec![], None);
+    };
+
+    let mut columns = Vec::new();
+    let mut projection_is_star = false;
+    for item in &s.projection {
+        match item {
+            sqlparser::ast::SelectItem::Wildcard(_)
+            | sqlparser::ast::SelectItem::QualifiedWildcard(..) => {
+                projection_is_star = true;
+                break;
+            }
+            sqlparser::ast::SelectItem::UnnamedExpr(expr)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                if let Some(name) = column_name_from_expr(expr) {
+                    columns.push(name);
+                } else {
+                    // Unsupported expression — fall back to full row.
+                    projection_is_star = true;
+                    break;
+                }
+            }
+        }
+    }
+    let columns = if projection_is_star { Vec::new() } else { columns };
+
+    let filter = s.selection.as_ref().and_then(filter_from_expr);
+
+    (columns, filter)
+}
+
+/// If `expr` is a bare column reference, return its name.
+fn column_name_from_expr(expr: &sqlparser::ast::Expr) -> Option<String> {
+    match expr {
+        sqlparser::ast::Expr::Identifier(id) => Some(id.value.clone()),
+        sqlparser::ast::Expr::CompoundIdentifier(parts) => {
+            // table.col → "col"
+            parts.last().map(|p| p.value.clone())
+        }
+        _ => None,
+    }
+}
+
+/// Convert a WHERE clause from the `sqlparser` AST into a `FilterExpr`
+/// the executor can evaluate. Supported shapes:
+///
+/// - `col = literal`, `col != literal`, `col <> literal`
+/// - `col < literal`, `col > literal`, `col <= literal`, `col >= literal`
+/// - `expr AND expr`, `expr OR expr`
+///
+/// The left side must be a column reference and the right side a
+/// literal value. Anything else returns `None` (treated by the planner
+/// as "no filter", which is strictly less restrictive than the query
+/// asks for — callers should prefer a parse error for that case, but
+/// at the embedded layer today we only forward supported filters).
+fn filter_from_expr(expr: &sqlparser::ast::Expr) -> Option<FilterExpr> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    match expr {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => Some(FilterExpr::And(
+                Box::new(filter_from_expr(left)?),
+                Box::new(filter_from_expr(right)?),
+            )),
+            BinaryOperator::Or => Some(FilterExpr::Or(
+                Box::new(filter_from_expr(left)?),
+                Box::new(filter_from_expr(right)?),
+            )),
+            BinaryOperator::Eq
+            | BinaryOperator::NotEq
+            | BinaryOperator::Lt
+            | BinaryOperator::Gt
+            | BinaryOperator::LtEq
+            | BinaryOperator::GtEq => {
+                // Try col OP literal. If that fails, try literal OP col
+                // and flip.
+                if let (Some(col), Some(val)) =
+                    (column_name_from_expr(left), literal_value(right))
+                {
+                    return Some(build_cmp(op, col, val));
+                }
+                if let (Some(val), Some(col)) =
+                    (literal_value(left), column_name_from_expr(right))
+                {
+                    let flipped = flip_cmp_op(op);
+                    return Some(build_cmp(&flipped, col, val));
+                }
+                None
+            }
+            _ => None,
+        },
+        Expr::Nested(inner) => filter_from_expr(inner),
+        _ => None,
+    }
+}
+
+/// Build a `FilterExpr` for a comparison op with `col OP val` ordering.
+fn build_cmp(
+    op: &sqlparser::ast::BinaryOperator,
+    column: String,
+    value: Value,
+) -> FilterExpr {
+    use sqlparser::ast::BinaryOperator::*;
+    match op {
+        Eq => FilterExpr::Eq { column, value },
+        NotEq => FilterExpr::Ne { column, value },
+        Lt => FilterExpr::Lt { column, value },
+        Gt => FilterExpr::Gt { column, value },
+        LtEq => FilterExpr::Le { column, value },
+        GtEq => FilterExpr::Ge { column, value },
+        _ => FilterExpr::Eq { column, value },
+    }
+}
+
+/// Mirror a comparison operator when the column ends up on the right
+/// side of the expression (`5 < id` becomes `id > 5`).
+fn flip_cmp_op(op: &sqlparser::ast::BinaryOperator) -> sqlparser::ast::BinaryOperator {
+    use sqlparser::ast::BinaryOperator::*;
+    match op {
+        Lt => Gt,
+        Gt => Lt,
+        LtEq => GtEq,
+        GtEq => LtEq,
+        other => other.clone(),
+    }
+}
+
+/// If `expr` is a literal, return the corresponding [`Value`]. Mirrors
+/// [`value_from_expr`] but returns `None` on non-literals so we can
+/// distinguish a successful conversion from a fallback string.
+fn literal_value(expr: &sqlparser::ast::Expr) -> Option<Value> {
+    use sqlparser::ast::{Expr, Value as SqlValue};
+    match expr {
+        Expr::Value(v) => match v {
+            SqlValue::Number(n, _) => n
+                .parse::<i64>()
+                .map(Value::Integer)
+                .or_else(|_| n.parse::<f64>().map(Value::Float))
+                .ok(),
+            SqlValue::SingleQuotedString(s) | SqlValue::DoubleQuotedString(s) => {
+                Some(Value::Text(s.clone()))
+            }
+            SqlValue::Boolean(b) => Some(Value::Bool(*b)),
+            SqlValue::Null => Some(Value::Null),
+            _ => None,
+        },
+        Expr::UnaryOp {
+            op: sqlparser::ast::UnaryOperator::Minus,
+            expr,
+        } => match literal_value(expr) {
+            Some(Value::Integer(n)) => Some(Value::Integer(-n)),
+            Some(Value::Float(f)) => Some(Value::Float(-f)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// Find the column name and its index in `column_names` (the explicit
@@ -997,5 +1196,187 @@ mod tests {
             db.sidecar.as_ref().unwrap().is_healthy(),
             "sidecar must still be healthy after a successful query"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Phase I regressions — WHERE / projection plumbing
+    //
+    // Before Phase I, `exec_select`, `exec_update`, and `exec_delete`
+    // hard-coded `filter: None`, silently ignoring the WHERE clause.
+    // These tests drive real SQL through `Database::execute` and assert
+    // that the filter reaches the executor. A regression would show up
+    // as wrong row counts, which is exactly what AWS integration
+    // testing caught.
+    // -----------------------------------------------------------------
+
+    fn seeded_db() -> Database {
+        let mut db = test_db();
+        db.execute("CREATE TABLE p (id INT PRIMARY KEY, name TEXT, price FLOAT)")
+            .unwrap();
+        db.execute("INSERT INTO p (id, name, price) VALUES (1, 'espresso', 3.50)")
+            .unwrap();
+        db.execute("INSERT INTO p (id, name, price) VALUES (2, 'latte', 4.25)")
+            .unwrap();
+        db.execute("INSERT INTO p (id, name, price) VALUES (3, 'mocha', 4.75)")
+            .unwrap();
+        db
+    }
+
+    fn rows_of(r: QueryResult) -> Vec<QueryRow> {
+        match r {
+            QueryResult::Rows(rows) => rows,
+            other => panic!("expected Rows, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn select_where_price_filters_rows() {
+        let mut db = seeded_db();
+        let rows = rows_of(
+            db.execute("SELECT id, name, price FROM p WHERE price > 4.0")
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 2, "should return latte + mocha only");
+        for r in &rows {
+            let price_str = r
+                .values
+                .iter()
+                .find(|(k, _)| k == "price")
+                .map(|(_, v)| v.clone())
+                .unwrap();
+            let price: f64 = price_str.parse().unwrap();
+            assert!(price > 4.0, "row slipped past WHERE: price={price}");
+        }
+    }
+
+    #[test]
+    fn select_where_id_equals_returns_single_row() {
+        let mut db = seeded_db();
+        let rows = rows_of(
+            db.execute("SELECT id, name FROM p WHERE id = 2").unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        let name = &rows[0]
+            .values
+            .iter()
+            .find(|(k, _)| k == "name")
+            .unwrap()
+            .1;
+        assert_eq!(name, "latte");
+    }
+
+    #[test]
+    fn select_projection_restricts_columns() {
+        let mut db = seeded_db();
+        let rows = rows_of(db.execute("SELECT name FROM p").unwrap());
+        assert_eq!(rows.len(), 3);
+        for r in &rows {
+            assert_eq!(
+                r.values.len(),
+                1,
+                "projection should limit output to one column, got {:?}",
+                r.values
+            );
+            assert_eq!(r.values[0].0, "name");
+        }
+    }
+
+    #[test]
+    fn update_where_affects_only_matching_rows() {
+        let mut db = seeded_db();
+        match db
+            .execute("UPDATE p SET price = 9.99 WHERE id = 3")
+            .unwrap()
+        {
+            QueryResult::RowCount(n) => assert_eq!(n, 1, "UPDATE with id=3 must affect 1 row"),
+            other => panic!("expected RowCount, got {:?}", other),
+        }
+
+        // Others unchanged.
+        let latte = rows_of(
+            db.execute("SELECT price FROM p WHERE id = 2").unwrap(),
+        );
+        assert_eq!(latte.len(), 1);
+        assert_eq!(latte[0].values[0].1, "4.25");
+
+        // Target updated.
+        let mocha = rows_of(
+            db.execute("SELECT price FROM p WHERE id = 3").unwrap(),
+        );
+        assert_eq!(mocha.len(), 1);
+        assert_eq!(mocha[0].values[0].1, "9.99");
+    }
+
+    #[test]
+    fn delete_where_affects_only_matching_rows() {
+        let mut db = seeded_db();
+        match db.execute("DELETE FROM p WHERE id = 1").unwrap() {
+            QueryResult::RowCount(n) => assert_eq!(n, 1, "DELETE with id=1 must remove 1 row"),
+            other => panic!("expected RowCount, got {:?}", other),
+        }
+        let rows = rows_of(db.execute("SELECT id FROM p").unwrap());
+        assert_eq!(rows.len(), 2, "two rows should remain after deleting id=1");
+
+        // Deleting a non-existent row is a no-op.
+        match db.execute("DELETE FROM p WHERE id = 99").unwrap() {
+            QueryResult::RowCount(n) => assert_eq!(n, 0),
+            other => panic!("expected RowCount, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn delete_without_where_clears_table() {
+        let mut db = seeded_db();
+        match db.execute("DELETE FROM p").unwrap() {
+            QueryResult::RowCount(n) => {
+                assert_eq!(n, 3, "DELETE without WHERE must remove all rows")
+            }
+            other => panic!("expected RowCount, got {:?}", other),
+        }
+        let rows = rows_of(db.execute("SELECT * FROM p").unwrap());
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn where_and_or_combine() {
+        let mut db = seeded_db();
+        let rows = rows_of(
+            db.execute(
+                "SELECT id FROM p WHERE price > 4.0 AND price < 4.5",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.len(), 1, "only latte matches 4.0 < p < 4.5");
+        assert_eq!(rows[0].values[0].1, "2");
+
+        let rows = rows_of(
+            db.execute(
+                "SELECT id FROM p WHERE id = 1 OR id = 3",
+            )
+            .unwrap(),
+        );
+        assert_eq!(rows.len(), 2);
+    }
+
+    #[test]
+    fn where_text_equality() {
+        let mut db = seeded_db();
+        let rows = rows_of(
+            db.execute("SELECT id FROM p WHERE name = 'latte'")
+                .unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0].1, "2");
+    }
+
+    #[test]
+    fn where_column_on_right_side_is_flipped() {
+        // `5 < id` should behave like `id > 5`.
+        let mut db = seeded_db();
+        let rows = rows_of(
+            db.execute("SELECT id FROM p WHERE 2 < id").unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0].1, "3");
     }
 }

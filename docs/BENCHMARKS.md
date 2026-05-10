@@ -36,16 +36,20 @@ The Month 1/2 non-vector benchmarks (OLTP, OLAP, mixed, cold-cache, crypto) each
 
 ### Vector search — SIFT1M on AWS `c6id.4xlarge`
 
-Populated by Phase G2 of the consolidation sprint (see `docs/CONSOLIDATION.md`). **Last run: pending.** The Phase G infrastructure (orchestration script, SIFT1M benchmark binary, SHA256 verification, stop-on-exit trap) is committed; the user-initiated AWS run will populate the table below.
+Run date: 2026-05-10. Instance `i-0b2dec9226f62db65`, Ice Lake Xeon Platinum 8375C @ 2.90 GHz (16 vCPU, 30 GiB RAM, 884 GB NVMe), Ubuntu 24.04, kernel 6.17, io_uring selected. Dataset SHA256 `92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a`. Commit `8567691d4f7859742c1e6cb54ba8c429ae36d297`. Full JSON provenance in `bench-results/aws-20260510/sift_bench.json`.
 
-| commit_sha | instance | cpu | ram_gb | dataset sha256 | build_time_ms | ef | recall@10 | mean_latency_µs | p99_latency_µs |
-|---|---|---|---|---|---|---|---|---|---|
-| _pending_ | c6id.4xlarge | _pending_ | _pending_ | _pending_ | _pending_ | 10 | _pending_ | _pending_ | _pending_ |
-| _pending_ | c6id.4xlarge | _pending_ | _pending_ | _pending_ | _pending_ | 50 | _pending_ | _pending_ | _pending_ |
-| _pending_ | c6id.4xlarge | _pending_ | _pending_ | _pending_ | _pending_ | 100 | _pending_ | _pending_ | _pending_ |
-| _pending_ | c6id.4xlarge | _pending_ | _pending_ | _pending_ | _pending_ | 200 | _pending_ | _pending_ | _pending_ |
+Build: 1,000,000 × 128-d float32 vectors, M=16, ef_construction=200 → 66.2 s (15,114 vec/sec).
 
-No numbers are published here until `scripts/aws-integration-run.sh` completes a full run and the emitted `sift_bench.json` is attached to the CONSOLIDATION tracker. Any previously circulated SIFT1M numbers that were not produced by this harness have been struck — see the Phase G entry in `docs/CONSOLIDATION.md`.
+| ef  | recall@10 | mean latency (µs) | p99 latency (µs) |
+|-----|-----------|-------------------|------------------|
+| 10  | 0.7621    | 57.6              | 101              |
+| 50  | 0.9586    | 158.1             | 228              |
+| 100 | 0.9831    | 266.5             | 364              |
+| 200 | **0.9902** | 459.4            | 616              |
+
+Meets the v1 target of recall@10 ≥ 0.95 at ef=200 with p99 ≤ 15 ms. All 10,000 SIFT1M queries evaluated per ef point; ground truth is the dataset's pre-computed top-100 list, intersected with the returned top-10 for the ratio.
+
+Re-run with: `GALAXDB_SSH_KEY=~/.ssh/galaxdb-bench-key.pem GALAXDB_SIFT1M_SHA256=92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a scripts/aws-integration-run.sh`.
 
 ---
 
