@@ -230,7 +230,8 @@ Every PAX block and WAL record encrypted before hitting storage.
 - **Pluggable key management:** `KeyProvider` trait — no vendor lock-in
   - `LocalKeyProvider` — 32-byte key file (dev/self-hosted)
   - `EnvKeyProvider` — hex key from `GALAXDB_MASTER_KEY` env var (containers)
-  - `AwsKmsKeyProvider` — behind `aws-kms` feature flag (production)
+  - `ExternalCommandKeyProvider` — delegate to an operator-supplied shell command for any KMS (AWS CLI, gcloud, az, vault CLI, custom HSM wrappers). No SDK lock-in.
+  - `HashicorpVaultKeyProvider` — HashiCorp Vault Transit engine over rustls, behind the `vault` Cargo feature.
 - **Counter-based 96-bit nonces:** 4-byte random prefix + 8-byte atomic counter
 - **AES-NI accelerated:** 680 MB/s encrypt, 709 MB/s decrypt on Intel
 - **Overhead:** ~3-8% CPU (AES-NI), negligible on modern hardware

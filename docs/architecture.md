@@ -205,7 +205,8 @@ PostgreSQL v3 simple query protocol:
 Pluggable via `KeyProvider` trait:
 - `LocalKeyProvider` — key from file (development)
 - `EnvKeyProvider` — key from environment variable
-- `AwsKmsKeyProvider` — AWS KMS (production)
+- `ExternalCommandKeyProvider` — delegate to any KMS CLI (AWS, GCP, Azure, Vault, custom)
+- `HashicorpVaultKeyProvider` — Vault Transit engine (feature = "vault")
 
 ---
 

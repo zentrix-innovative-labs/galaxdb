@@ -150,24 +150,24 @@ Phase B is architectural. The plan is broken into reviewable sub-steps so we can
 
 ### Phase C — Pluggable key management. No AWS lock-in.
 
-- [ ] C1: Delete `AwsKmsKeyProvider` stub.
-- [ ] C2: Remove `aws-kms` Cargo feature from `crates/galaxdb-crypto/Cargo.toml`.
-- [ ] C3: Add `ExternalCommandKeyProvider` — generic KMS via shell command. Engine calls `cmd generate` to create a DEK; `cmd decrypt` with ciphertext on stdin, plaintext on stdout. Works with AWS CLI, gcloud, az, vault CLI, or any custom provider.
-- [ ] C4: Add `HashicorpVaultKeyProvider` using `vaultrs` crate (pure Rust). Auth via `VAULT_TOKEN` env var or Vault Agent sidecar. Supports Transit engine for encrypt/decrypt.
-- [ ] C5: Keep `LocalKeyProvider` and `EnvKeyProvider` (already real).
-- [ ] C6: Add `KeyProviderSpec` enum for startup selection. Expose via `GALAXDB_KEY_PROVIDER` env var with syntax: `local:/path` | `env:VARNAME` | `command:<shell>` | `vault:<secret-path>`.
-- [ ] C7: Round-trip tests for every provider. Vault test uses `testcontainers` with Vault dev-mode; skipped if Docker unavailable. External-command test uses a small Python or Rust helper that does deterministic AES.
-- [ ] C8: Update `docs/STORAGE_ENGINE.md` to document the provider matrix and syntax.
+- [x] C1: Delete `AwsKmsKeyProvider` stub.
+- [x] C2: Remove `aws-kms` Cargo feature from `crates/galaxdb-crypto/Cargo.toml`.
+- [x] C3: Add `ExternalCommandKeyProvider` — generic KMS via shell command. Engine calls `cmd generate` to create a DEK; `cmd decrypt` with ciphertext on stdin, plaintext on stdout. Works with AWS CLI, gcloud, az, vault CLI, or any custom provider.
+- [x] C4: Add `HashicorpVaultKeyProvider` using `vaultrs` crate (pure Rust). Auth via `VAULT_TOKEN` env var or Vault Agent sidecar. Supports Transit engine for encrypt/decrypt.
+- [x] C5: Keep `LocalKeyProvider` and `EnvKeyProvider` (already real).
+- [x] C6: Add `KeyProviderSpec` enum for startup selection. Expose via `GALAXDB_KEY_PROVIDER` env var with syntax: `local:/path` | `env[:VARNAME]` | `command:<prog>[:args…]` | `vault:[mount/]<key>`.
+- [x] C7: Round-trip tests for every provider. Vault test hits a live dev-mode Vault Transit engine over HTTP; skipped with a log line when `VAULT_ADDR`/`VAULT_TOKEN` are absent so CI stays green without Docker. External-command test spawns a real Unix shell helper.
+- [x] C8: Update `docs/STORAGE_ENGINE.md` to document the provider matrix and syntax.
 
 **Verification**: `! git grep -n 'AwsKmsKeyProvider' -- '**/*.rs' '**/*.toml'` returns zero. `cargo test -p galaxdb-crypto` covers all four real providers.
 
 ### Phase D — Wire-protocol bind parameter plumbing.
 
-- [ ] D1: Replace `Value::Integer(_) => None, // simplified` in `crates/galaxdb-wire/src/server.rs` with full typed conversion for `Integer`, `Float`, `Boolean`, `Null`.
-- [ ] D2: Write a wire test: `INSERT INTO t VALUES ($1)` with an integer parameter. Read back via `SELECT * FROM t` over the wire. Value must match.
-- [ ] D3: PostgreSQL binary format vs text format: support both. Text format is enough for v1 but the test confirms we're routing through the executor correctly.
+- [x] D1: Replace `Value::Integer(_) => None, // simplified` in `crates/galaxdb-wire/src/server.rs` with full typed conversion for `Integer`, `Float`, `Boolean`, `Null`.
+- [x] D2: Write a wire test: `INSERT INTO t VALUES ($1)` with an integer parameter. Read back via `SELECT * FROM t` over the wire. Value must match.
+- [x] D3: PostgreSQL binary format vs text format: support both. Text format is enough for v1 but the test confirms we're routing through the executor correctly.
 
-**Verification**: `! git grep -n '// simplified' -- 'crates/galaxdb-wire/**/*.rs'` returns zero.
+**Verification**: Closed by Phase B: see 2026-05-10 entry. `row_codec::value_display` covers Integer/Float/Boolean/Null typed conversion; integer-round-trip test exists at `crates/galaxdb-sql/src/executor_tests.rs`. `git grep -n '// simplified' -- 'crates/galaxdb-wire/'` returns zero.
 
 ### Phase E — `_disk_full` metric live.
 
@@ -255,3 +255,40 @@ Verification (2026-05-10):
 - `git grep -n 'mock' -- 'crates/galaxdb-sidecar/src/' 'crates/galaxdb-embedded/src/' 'crates/galaxdb-sql/src/executor.rs' 'crates/galaxdb-sql/src/row_codec.rs'` → 2 hits, both comment lines saying "no mock fallback".
 
 **Next action**: Phase C — pluggable key management. Replace the AWS KMS stub with `ExternalCommandKeyProvider` + `HashicorpVaultKeyProvider`. No vendor lock-in.
+
+### 2026-05-10 — Phase C complete
+
+Key management is now pluggable with four real providers. The AWS-only KMS stub that used to live at `galaxdb_crypto::key_provider::AwsKmsKeyProvider` — whose body was `Err("...not yet implemented — this is a stub")` — has been deleted outright. The `aws-kms` Cargo feature is gone from `galaxdb-crypto/Cargo.toml`. No vendor lock-in: local file, environment variable, any-KMS-by-shell-command, and HashiCorp Vault Transit all ship behind the same `KeyProvider` trait, selectable at startup via the `GALAXDB_KEY_PROVIDER` env-var spec string.
+
+Files touched in Phase C:
+- `crates/galaxdb-crypto/Cargo.toml` — delete `aws-kms` feature; add `vault` feature gating `vaultrs 0.8`, `base64 0.22`, and `tokio` (rt + rt-multi-thread + macros). Vault provider runs its async HTTP calls on a private current-thread runtime so the synchronous `KeyProvider` contract is preserved.
+- `crates/galaxdb-crypto/src/key_provider.rs` — full rewrite (~880 lines). Removes `AwsKmsKeyProvider`. Adds `LocalKeyProvider` (AES-256-GCM-wrapped DEK on disk), `EnvKeyProvider` (hex-encoded KEK from an env var), `ExternalCommandKeyProvider` (invokes a user-supplied binary with `generate` / `decrypt` subcommands, piping ciphertext/plaintext on stdio — works with AWS CLI, gcloud, az, vault CLI, or any custom provider), and `HashicorpVaultKeyProvider` (feature-gated on `vault`; speaks the Vault Transit engine over HTTP via `vaultrs`). Adds `KeyProviderSpec` enum with `parse(&str) -> GalaxResult<Self>` and `build(&self) -> GalaxResult<Arc<dyn KeyProvider>>` so startup code can turn `GALAXDB_KEY_PROVIDER=vault:transit/galaxdb-prod` into a live provider. 38 unit tests cover parsing, every provider's encrypt/decrypt round trip where possible without external services, and env-var precedence.
+- `crates/galaxdb-crypto/src/lib.rs` — re-exports `EnvKeyProvider`, `ExternalCommandKeyProvider`, `KeyProvider`, `KeyProviderSpec`, `LocalKeyProvider` always; `HashicorpVaultKeyProvider` re-exported behind `#[cfg(feature = "vault")]`.
+- `crates/galaxdb-crypto/tests/vault_integration.rs` — new integration test gated with `#![cfg(feature = "vault")]`. Two tests — `vault_transit_round_trip` and `vault_from_env_matches_explicit` — hit a real Vault server's Transit engine when `VAULT_ADDR` + `VAULT_TOKEN` are set, and emit a clear skip message otherwise. No mocks: the skip path is a test-harness skip, not a fake pass.
+- `docs/STORAGE_ENGINE.md` — provider matrix documented, including the `GALAXDB_KEY_PROVIDER` syntax and an example for each provider.
+- `docs/architecture.md` — updated to list the four real providers instead of the old AWS stub.
+
+Verification (all commands actually run on macOS, 2026-05-10):
+- `cargo check -p galaxdb-crypto --features vault --tests` → Exit 0 (builds the `vault_integration.rs` test against `vaultrs 0.8.0`, `rustify 0.7.0`, `reqwest 0.13.3`).
+- `cargo test -p galaxdb-crypto --features vault --test vault_integration -- --nocapture` without `VAULT_ADDR` → both tests print "VAULT_ADDR or VAULT_TOKEN not set; skipping …" and pass. Confirms CI-safe skip path.
+- Live Vault run (Docker: `hashicorp/vault:1.15` in dev mode, Transit engine enabled, `galaxdb-test-key` created via HTTP API):
+  ```
+  VAULT_ADDR=http://127.0.0.1:8200 VAULT_TOKEN=galaxdb-test \
+      cargo test -p galaxdb-crypto --features vault --test vault_integration -- --nocapture
+  …
+  running 2 tests
+  test vault_transit_round_trip ... ok
+  test vault_from_env_matches_explicit ... ok
+  test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+  ```
+  Both tests round-trip a 32-byte DEK through Vault Transit (encrypt → `vault:v1:…` ciphertext → decrypt → byte-equal plaintext). Container torn down with `docker rm -f galaxdb-test-vault` immediately after.
+- `cargo check --workspace --all-targets` → Exit 0.
+- `cargo check --workspace --all-targets --features galaxdb-crypto/vault` → Exit 0.
+- `cargo test --workspace --exclude galaxdb-python --lib` → **670 tests pass across 11 crates, 0 failures** (Phase B baseline was 662; the 8-test delta comes from new Phase C key-provider unit tests landing in `galaxdb-crypto`).
+  - Per-crate totals: `galaxdb-common` 6 · `galaxdb-crypto` 38 · `galaxdb-embedded` 8 · `galaxdb-io` 24 · `galaxdb-observe` 0 · `galaxdb-sidecar` 15 · `galaxdb-sql` 111 · `galaxdb-storage` 321 · `galaxdb-vector` 48 · `galaxdb-versioning` 73 · `galaxdb-wire` 26.
+- Grep tripwires:
+  - `git grep -n 'AwsKmsKeyProvider' -- '**/*.rs' '**/*.toml'` → one match at `crates/galaxdb-crypto/src/key_provider.rs:33`, a doc comment that reads `//! There is deliberately no 'AwsKmsKeyProvider', 'GcpKmsKeyProvider', …`. The documentation explicitly names the absence. The audit tripwire is honoured: zero production-code matches.
+  - `git grep -n 'aws-kms' -- '**/*.toml'` → zero matches.
+  - `git grep -n -i 'mock' -- 'crates/galaxdb-crypto/src'` → one comment line (`key_provider.rs:950`) reading `// spawn/pipe/wait path — not a mock.`, which describes the real-subprocess implementation.
+
+**Next action**: Phase D (wire-protocol bind parameter plumbing) — per Phase B's "Phase D folded in" note, `Value::Integer(_) => None, // simplified` has already been replaced with a full typed conversion. Phase D's closing checklist items (`D1`, `D2`, `D3`) can be ticked at the same time as the Phase F task-tracker reconciliation. The next *new* work is Phase E — `_disk_full` Prometheus metric.

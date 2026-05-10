@@ -87,7 +87,7 @@
 
 - [x] 12. Implement TDE encryption — galaxdb-crypto (Req 9)
   - [x] 12.1 Implement `TdeModule` with AES-256-GCM encryption/decryption using `aes-gcm` crate
-  - [x] 12.2 Implement pluggable key management via `KeyProvider` trait with LocalKeyProvider, EnvKeyProvider, and AwsKmsKeyProvider (stub behind feature flag)
+  - [x] 12.2 Implement pluggable key management via `KeyProvider` trait with LocalKeyProvider, EnvKeyProvider, ExternalCommandKeyProvider, and HashicorpVaultKeyProvider (behind `vault` feature). No AWS SDK lock-in.
   - [x] 12.3 Implement counter-based 96-bit nonce generation per block/record
   - [x] 12.4 Integrate TDE into PAX block write path: encrypt before IoScheduler write
   - [x] 12.5 Integrate TDE into WAL write path: encrypt each record before disk write
