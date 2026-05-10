@@ -1,5 +1,7 @@
 # Implementation Tasks — GalaxDB v1 Engine
 
+> **Integrity rule.** Tasks here MUST have real code verified by real tests on real infrastructure. Ticking a box without a working implementation is a bug. See `.kiro/steering/engineering-principles.md`.
+
 ## Month 1: Core Storage Engine
 
 - [x] 1. Scaffold Rust workspace and shared types
@@ -70,12 +72,12 @@
   - [x] 9.4 Implement eviction constraint: ScanBuffer never evicts a HotSet-resident block
   - [x] 9.5 Write tests: LRU eviction correctness, clock-sweep correctness, NUMA allocation on Linux, cross-partition isolation
 
-- [x] 10. Implement Lazy Leveling compaction with MVCC GC — galaxdb-storage (Req 6)
+- [ ] 10. Implement Lazy Leveling compaction with MVCC GC — galaxdb-storage (Req 6) <!-- unticked in Consolidation Phase F: parent of an incomplete child (10.5), untick until child lands, see docs/CONSOLIDATION.md -->
   - [x] 10.1 Implement LSM level structure: L0 tiered (up to 4 files), L1-L3 tiered, L4 leveled
   - [x] 10.2 Implement compaction trigger: L0 file count threshold, level size ratio threshold
   - [x] 10.3 Implement merge iterator: merge sorted runs, apply MVCC GC (discard versions not needed by active snapshots or pinned tags)
   - [x] 10.4 Implement compaction output: write new SST files (64 MB default), build Bloom filters, update ART index
-  - [x] 10.5 Implement pinned tag awareness: retain all versions referenced by any pinned VersionTag
+  - [ ] 10.5 Implement pinned tag awareness: retain all versions referenced by any pinned VersionTag <!-- unticked in Consolidation Phase F: pinned-block compaction not yet consulted by TagCatalog, see B7 -->
   - [x] 10.6 Write tests: compaction produces correct merged output, MVCC GC discards old versions, pinned versions retained
 
 - [x] 11. Implement KV separation — Blob Log (Req 8)
@@ -135,14 +137,14 @@
   - [x] 17.9 Implement descriptive parse error messages with byte offset position
   - [x] 17.10 Write tests: parse every AuroraSQL extension, error messages with positions, round-trip standard SQL
 
-- [x] 18. Implement query planner and executor — galaxdb-sql (Reqs 14, 15, 22)
+- [ ] 18. Implement query planner and executor — galaxdb-sql (Reqs 14, 15, 22) <!-- unticked in Consolidation Phase F: parent of incomplete children (18.4, 18.6, 18.7), untick until children land, see docs/CONSOLIDATION.md -->
   - [x] 18.1 Define `QueryPlan` enum: PointLookup, FullScan, SemanticSearch, HybridSearch, Insert, Update, Delete, BulkInsert, CreateTable, DropTable, CreateVersionTag, Backup, Restore, Analyze, ShowEmbeddingHealth
   - [x] 18.2 Implement DDL executor: CREATE TABLE (allocate catalog entry, init ART index, create memtable, register embedding columns with sidecar), DROP TABLE (remove catalog, schedule file deletion)
   - [x] 18.3 Implement INSERT executor: write to memtable + WAL, update ART, trigger async embedding for embedding columns
-  - [x] 18.4 Implement SELECT executor: ART point lookup or full scan with zone-map pruning + Bloom filter checks
+  - [ ] 18.4 Implement SELECT executor: ART point lookup or full scan with zone-map pruning + Bloom filter checks <!-- unticked in Consolidation Phase F: exec_full_scan uses engine.scan_all()+in-memory filter; zone-map pruning and Bloom filter consultation not wired in planner. See crates/galaxdb-sql/src/executor.rs exec_full_scan and docs/CONSOLIDATION.md -->
   - [x] 18.5 Implement UPDATE executor: write new MVCC version; reject if target column is embedding source (return error with DELETE+INSERT suggestion)
-  - [x] 18.6 Implement DELETE executor: write tombstone to memtable + WAL, write DELTA_TOMBSTONE for vector index
-  - [x] 18.7 Implement BULK INSERT executor: bypass memtable, write sorted rows directly as PAX blocks
+  - [ ] 18.6 Implement DELETE executor: write tombstone to memtable + WAL, write DELTA_TOMBSTONE for vector index <!-- unticked in Consolidation Phase F: exec_delete writes ROW_DELETE via engine.delete_sync but never emits DELTA_TOMBSTONE for the vector delta buffer. See crates/galaxdb-sql/src/executor.rs exec_delete and docs/CONSOLIDATION.md -->
+  - [ ] 18.7 Implement BULK INSERT executor: bypass memtable, write sorted rows directly as PAX blocks <!-- unticked in Consolidation Phase F: exec_bulk_insert returns GalaxError::NotYetAvailable { task: "18.7" }, see docs/CONSOLIDATION.md -->
   - [x] 18.8 Implement adaptive query planner: estimate filter cardinality from statistics, choose BruteForceFiltered (< 1000 rows or < 0.1%) vs HnswWithPostFilter, log chosen strategy
   - [x] 18.9 Write tests: DDL create/drop, INSERT/SELECT/UPDATE/DELETE round-trip, UPDATE-of-embedding-source rejection, BULK INSERT, adaptive planner strategy selection
 
@@ -252,22 +254,26 @@
 
 ## Month 4: Versioning, Training, Hardening & Observability
 
-- [x] 32. Implement Merkle DAG versioning — galaxdb-versioning (Req 23)
+- [ ] 32. Implement Merkle DAG versioning — galaxdb-versioning (Req 23) <!-- unticked in Consolidation Phase F: parent of incomplete children (32.3, 32.4, 32.6), untick until children land, see docs/CONSOLIDATION.md -->
   - [x] 32.1 Implement `MerkleDag` struct: BTreeMap of commit_timestamp → MerkleRoot, with root_hash computed as XXH3-128 over child block hashes
   - [x] 32.2 Implement version root creation on each commit: collect PAX block checksums, compute Merkle tree
-  - [x] 32.3 Implement `AT VERSION timestamp` query: filter PAX blocks where commit_timestamp <= target
-  - [x] 32.4 Implement `AT VERSION tag_name` query: resolve tag to MerkleRoot, return exact block set
+  - [ ] 32.3 Implement `AT VERSION timestamp` query: filter PAX blocks where commit_timestamp <= target <!-- unticked in Consolidation Phase F: stub in executor, real impl in Phase B deferred (B6). QueryPlan has no at_version field; guardrail enforced at parse time only. See docs/CONSOLIDATION.md Phase B6 -->
+    DEFERRED — see CONSOLIDATION.md Phase B6
+  - [ ] 32.4 Implement `AT VERSION tag_name` query: resolve tag to MerkleRoot, return exact block set <!-- unticked in Consolidation Phase F: stub in executor, real impl in Phase B deferred (B6). TagCatalog::get_tag exists but executor never calls it for AT VERSION. See docs/CONSOLIDATION.md Phase B6 -->
+    DEFERRED — see CONSOLIDATION.md Phase B6
   - [x] 32.5 Implement semantic guardrail: AT VERSION + SEMANTIC_MATCH without consistency mode → reject with error message
-  - [x] 32.6 Implement CONSISTENCY 'SEMANTIC_FRESH': search current HNSW against historical rows, include warning in result metadata
+  - [ ] 32.6 Implement CONSISTENCY 'SEMANTIC_FRESH': search current HNSW against historical rows, include warning in result metadata <!-- unticked in Consolidation Phase F: stub in executor, real impl in Phase B deferred (B6). SEMANTIC_FRESH warning never routed through executor. See docs/CONSOLIDATION.md Phase B6 -->
+    DEFERRED — see CONSOLIDATION.md Phase B6
   - [x] 32.7 Implement CONSISTENCY 'SEMANTIC_SNAPSHOT' rejection: return error "v2 feature"
   - [x] 32.8 Write tests: version root computation, AT VERSION query correctness, semantic guardrail rejection, SEMANTIC_FRESH warning
 
-- [ ] 33. Implement version tags — galaxdb-versioning (Req 24)
+- [ ] 33. Implement version tags — galaxdb-versioning (Req 24) <!-- unticked in Consolidation Phase F: parent of an incomplete child (33.5), untick until child lands, see docs/CONSOLIDATION.md -->
   - [x] 33.1 Implement `CREATE VERSION TAG 'name'`: capture current MerkleRoot, mark referenced blocks as GC-exempt (pinned)
   - [x] 33.2 Implement `FOR TRAINING` tag: store TrainingTagMetadata (precision, seed, deterministic_order=true with primary key sort)
   - [x] 33.3 Implement `WITH TRAINING PRECISION 'sq8'|'rabitq'|'float32'` storage in tag metadata
   - [x] 33.4 Implement `TRAINING SEED n` storage in tag metadata
-  - [x] 33.5 Integrate with compactor: pinned blocks are never GC'd regardless of MVCC age
+  - [ ] 33.5 Integrate with compactor: pinned blocks are never GC'd regardless of MVCC age <!-- unticked in Consolidation Phase F: pinned-block compaction not yet consulted by TagCatalog, see B7. GcContext supports pinned_tag_timestamps but production never passes real pins from TagCatalog into the compactor. See docs/CONSOLIDATION.md Phase B7 -->
+    DEFERRED — see CONSOLIDATION.md Phase B7
   - [x] 33.6 Implement `_galaxdb_versions` system table for tag catalog
   - [x] 33.7 Write tests: tag creation, GC exemption, FOR TRAINING metadata, compactor respects pins
 
@@ -340,3 +346,18 @@
   - [ ] 42.5 Test: SHOW EMBEDDING HEALTH returns correct model version distribution
   - [ ] 42.6 Test: WHERE NOT DUPLICATE filters near-duplicates in training export
   - [ ] 42.7 Test: BACKUP TO / RESTORE FROM round-trip with data verification
+
+
+## Consolidation Sprint (2026-05)
+
+Stub / mock removal sprint. Master tracker: `docs/CONSOLIDATION.md`. These
+boxes mirror the phase status there.
+
+- [x] Phase A — Remove sidecar mocks, real model or exit 1
+- [x] Phase B — Real SQL executor wired to storage (excludes B6, B7)
+- [x] Phase C — Pluggable key management, no vendor lock-in
+- [x] Phase D — Wire-protocol bind parameter plumbing (folded into Phase B)
+- [x] Phase E — `_disk_full` Prometheus metric live
+- [x] Phase F — Reconcile tasks.md with real code (this entry)
+- [ ] Phase G — Real AWS benchmarking against SIFT1M
+- [ ] Phase H — CI gates (grep-for-mocks, cargo-deny for vendor SDKs)

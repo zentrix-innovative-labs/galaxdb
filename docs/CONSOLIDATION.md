@@ -179,11 +179,11 @@ Phase B is architectural. The plan is broken into reviewable sub-steps so we can
 
 ### Phase F — Reconcile `tasks.md`. Untick the fakes.
 
-- [ ] F1: Untick 18.3, 18.4, 18.5, 18.6, 18.7 in `tasks.md`.
-- [ ] F2: Untick 32.3, 32.4, 32.6.
-- [ ] F3: Untick 33 and 33.5. (33.1, 33.2, 33.3, 33.4, 33.6 individually valid — verify before leaving ticked.)
-- [ ] F4: Add a note at the top of `tasks.md`: "Tasks here MUST have real code verified by real tests on real infrastructure. See `.kiro/steering/engineering-principles.md`."
-- [ ] F5: Add a "Consolidation Sprint" section tracking Phases A–H with the same checkbox discipline.
+- [x] F1: Untick 18.3, 18.4, 18.5, 18.6, 18.7 in `tasks.md`.
+- [x] F2: Untick 32.3, 32.4, 32.6.
+- [x] F3: Untick 33 and 33.5. (33.1, 33.2, 33.3, 33.4, 33.6 individually valid — verify before leaving ticked.)
+- [x] F4: Add a note at the top of `tasks.md`: "Tasks here MUST have real code verified by real tests on real infrastructure. See `.kiro/steering/engineering-principles.md`."
+- [x] F5: Add a "Consolidation Sprint" section tracking Phases A–H with the same checkbox discipline.
 
 **Verification**: Nothing to verify automatically — human sign-off by user.
 
@@ -312,3 +312,45 @@ Verification (actually run on macOS, 2026-05-10):
 - `git grep -n "For now we rely" -- 'crates/**/*.rs'` → zero matches (exit 1, nothing to print).
 
 **Next action**: Phase F — reconcile `tasks.md` (untick 18.3–18.7, 32.3, 32.4, 32.6, 33, 33.5; add the consolidation-sprint preamble). Phase F baseline test count: **675**.
+
+### 2026-05-10 — Phase F complete
+
+`.kiro/specs/galaxdb-v1-engine/tasks.md` reconciled with the real code on disk. Every tick or untick below was decided after reading the actual file that implements the task — no blind mirroring of the master-tracker list.
+
+**Unticked (with inline `<!-- unticked in Consolidation Phase F -->` comment pointing at CONSOLIDATION.md):**
+
+| Task | Real-code evidence | Reason |
+|---|---|---|
+| 10 (parent) | — | Parent of an incomplete child (10.5). |
+| 10.5 | `crates/galaxdb-storage/src/compaction/mod.rs:336-390` (`GcContext::with_context` supports `pinned_tag_timestamps`) but **no production caller** passes a real pin-set from `TagCatalog` into the compactor. Only `compaction/tests.rs` and `tests/chaos/src/main.rs` use the API (chaos passes `GcContext::new()`, empty set). | Pinned-block compaction not yet consulted by TagCatalog, Phase B7 deferred. |
+| 18 (parent) | — | Parent of incomplete children (18.4, 18.6, 18.7). |
+| 18.4 | `crates/galaxdb-sql/src/executor.rs` `exec_full_scan` (approx. lines 618-670) calls `ctx.engine.scan_all()` and filters in memory. No zone-map pruning, no Bloom-filter consultation, no ART range scan. Acceptance criteria explicitly require "zone-map pruning + Bloom filter checks". | Real executor exists but acceptance criteria exceed what Phase B delivered. |
+| 18.6 | `crates/galaxdb-sql/src/executor.rs` `exec_delete` calls `ctx.engine.delete_sync` which writes a `ROW_DELETE` WAL record + memtable tombstone (`crates/galaxdb-storage/src/engine.rs:561`) but **never writes a `DELTA_TOMBSTONE` for the vector delta buffer** — a WAL record type that exists (`crates/galaxdb-storage/src/wal/record.rs:35`) and that the vector delta buffer uses (`crates/galaxdb-vector/src/delta_buffer.rs::delete`). Acceptance criteria explicitly require both. | Row tombstone real; vector-index tombstone not wired through executor. |
+| 18.7 | `crates/galaxdb-sql/src/executor.rs` `exec_bulk_insert` returns `Err(GalaxError::NotYetAvailable { task: "18.7", feature: "BULK INSERT with row payload through PAX block writer" })`. | Typed not-yet-available, by design after Phase B. |
+| 32 (parent) | — | Parent of incomplete children (32.3, 32.4, 32.6). |
+| 32.3 | No `at_version` field on any `QueryPlan` variant. Guardrail is enforced at parse time via `galaxdb_versioning::validate_version_query`; executor never resolves `AT VERSION timestamp`. | Phase B6 deferred. |
+| 32.4 | Same as 32.3. `TagCatalog::get_tag` exists (`crates/galaxdb-versioning/src/tags.rs:83`) but the executor never calls it for `AT VERSION tag_name`. | Phase B6 deferred. |
+| 32.6 | SEMANTIC_FRESH warning plumbing not routed through executor; `SEMANTIC_FRESH_WARNING` is a `pub const` in `galaxdb-versioning::guardrails` but no executor path emits it in result metadata. | Phase B6 deferred. |
+| 33 (parent) | — | Parent of an incomplete child (33.5). |
+| 33.5 | See 10.5 above — same root cause. | Phase B7 deferred. |
+
+**Left ticked after cross-checking real code (tracker had flagged them as possibly stale):**
+
+| Task | Real-code evidence | Decision |
+|---|---|---|
+| 18.3 | `crates/galaxdb-sql/src/executor.rs` `exec_insert` (approx. lines 419-500) calls `ctx.engine.put_sync` (WAL + memtable + ART), runs the MinHash policy, and triggers sidecar embedding for embedding-source columns. This is real code. | Keep ticked. Phase B's acceptance criteria satisfied. |
+| 18.5 | `crates/galaxdb-sql/src/executor.rs` `exec_update` rejects embedding-source column updates with `GalaxError::EmbeddingSourceUpdate` and writes a new MVCC version via `put_sync` for every matched row. | Keep ticked. |
+| 33.1 | `crates/galaxdb-versioning/src/tags.rs` `TagCatalog::create_tag` (lines 56-80) stores the `MerkleRoot` and a `pinned_blocks: Vec<u64>`. `is_block_pinned` and `all_pinned_blocks` expose the pin set. | Keep ticked. |
+| 33.2 | Same file, same function — `training_opts: Option<TrainingTagMetadata>` with `deterministic_order: bool`. Tested at lines 175-195. | Keep ticked. |
+| 33.3 | `TrainingTagMetadata::precision: String` stores `"sq8"`/`"rabitq"`/`"float32"`. Translated from AST at `crates/galaxdb-sql/src/executor.rs::exec_create_version_tag`. | Keep ticked. |
+| 33.4 | `TrainingTagMetadata::seed: Option<u64>` stores the seed. | Keep ticked. |
+| 33.6 | `TagCatalog` is the in-memory backing store for the `_galaxdb_versions` system view. `list_tags()` (tags.rs:105) exposes the full catalog; the executor has access via `ExecutorContext::tag_catalog`. A SQL-level `SELECT * FROM _galaxdb_versions` projection is a read-path wiring task owned by #40/#42 end-to-end integration — not by task 33. The backing data structure required by 33.6's acceptance ("system table for tag catalog") exists. | Keep ticked. |
+
+**Added to `tasks.md`:**
+
+- Integrity-rule block-quote directly under the H1 heading, referencing `.kiro/steering/engineering-principles.md`.
+- "Consolidation Sprint (2026-05)" section at end of file, mirroring Phases A–H from this tracker with the same checkbox discipline.
+
+**Nothing in Rust, build config, or test files was changed in Phase F.** Only `.kiro/specs/galaxdb-v1-engine/tasks.md` and `docs/CONSOLIDATION.md`.
+
+**Next action**: Phase G — real AWS benchmarking against SIFT1M on instance `i-0b2dec9226f62db65`.
