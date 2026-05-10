@@ -4,11 +4,12 @@ pub mod ast;
 pub mod executor;
 pub mod parser;
 pub mod planner;
+pub mod row_codec;
 pub mod transaction;
 
 pub use executor::{
-    execute, execute_with_policies, is_text_column, Catalog, CatalogColumn, ExecuteResult,
-    InMemorySystemColumnSink, MinHashPolicy, NoOpVectorBackend, Row, SystemColumnSink,
+    execute_legacy, execute_with_context, is_text_column, Catalog, CatalogColumn, ExecuteResult,
+    ExecutorContext, InMemorySystemColumnSink, MinHashPolicy, Row, SystemColumnSink,
     SystemColumnWrite, TableEntry, VectorSearchBackend, VectorSearchResult,
 };
 

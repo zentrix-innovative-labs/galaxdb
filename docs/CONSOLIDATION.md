@@ -86,30 +86,67 @@ These are test-only and correctly scoped. They stay because they are not in prod
 
 ### Phase B — Real SQL executor wired to storage. Delete `galaxdb-sql` stubs.
 
-- [ ] B1: Move real execution code out of `galaxdb-embedded` into `galaxdb-sql::executor`. The executor owns `Arc<galaxdb_storage::Engine>`.
-- [ ] B2: Add `galaxdb-storage.workspace = true` to `crates/galaxdb-sql/Cargo.toml`.
-- [ ] B3: Implement `execute_insert` with real memtable write, WAL, ART update, Bloom update, MinHash compute, sidecar async embed trigger, delta-buffer insert.
-- [ ] B4: Implement `execute_update` with real MVCC version write via `Engine::put_sync` at new timestamp.
-- [ ] B5: Implement `execute_delete` with tombstone + `DELTA_TOMBSTONE` + ART removal.
-- [ ] B6: Implement `execute_select` with ART lookup for point reads, `Engine::scan_all` for full scans with zone-map pruning + Bloom filter skip. Use the catalog for column projection.
-- [ ] B7: Implement `execute_point_lookup` (same code path as point-read in select).
-- [ ] B8: Implement `execute_analyze` wired to `galaxdb_storage::statistics` real ANALYZE task.
-- [ ] B9: `execute_backup` and `execute_restore` return `GalaxError::NotYetAvailable { task_id: "37" }` — typed error, never a fake success. Task 37 will replace with real impl.
-- [ ] B10: Implement `execute_bulk_insert` with real PAX block writer bypassing memtable (task 18.7 scope).
-- [ ] B11: Implement `execute_create_version_tag` wired to `TagCatalog::create_tag` with `MerkleDag::latest_root` and pinned-block set. Move out of `galaxdb-embedded`.
-- [ ] B12: Add `at_version: Option<VersionRef>` to `QueryPlan::FullScan` and `QueryPlan::SemanticSearch`. Executor filters blocks by pinned set before reading.
-- [ ] B13: Enforce SEMANTIC_FRESH rule — error if `AT VERSION` + `SEMANTIC_MATCH` without explicit consistency mode.
-- [ ] B14: Pinned-block compactor integration — `galaxdb-storage::compaction` accepts `Arc<dyn PinSet>`; `galaxdb-embedded` passes a `TagCatalogPinSet` adapter. Compactor calls `is_pinned(block_id)` before GCing versions.
-- [ ] B15: Delete `NoOpVectorBackend` from `galaxdb-sql`.
-- [ ] B16: `galaxdb-wire::server` — pass a real `VectorSearchBackend` from `main.rs`, or return `GalaxError::NoVectorBackendConfigured` explicitly. No silent empty.
-- [ ] B17: `galaxdb-embedded::Database` becomes a thin wrapper over `Engine + Catalog + SidecarManager + galaxdb_sql::executor::execute`.
-- [ ] B18: Delete every `// In the full implementation, this would ...` comment. Those paths are now real.
-- [ ] B19: Full `cargo test --workspace` clean.
+Phase B is architectural. The plan is broken into reviewable sub-steps so we can verify correctness at each point before moving on.
 
-**Verification**: 
-- `! git grep -n 'In the full implementation' -- 'crates/**/*.rs'` returns zero.
-- `cargo test -p galaxdb-sql` passes with tests that insert → read → assert stored bytes round-trip.
-- `cargo test -p galaxdb-embedded` passes with CRUD round-trip tests.
+**B0 — Preparation & types**
+- [x] B0.1: Add `GalaxError::NotYetAvailable { task: &'static str, feature: &'static str }` to `galaxdb-common`. Replace every "fake success" return with this typed error, tagged with the task ID that will close it.
+- [x] B0.2: Add `galaxdb-storage`, `galaxdb-versioning`, `galaxdb-sidecar`, `galaxdb-vector` path deps to `galaxdb-sql/Cargo.toml`.
+
+**B1 — Executor gains real dependencies**
+- [x] B1.1: New `ExecutorContext` struct bundling `Arc<Engine>`, `Catalog`, `Option<Arc<SidecarManager>>`, `Option<Arc<Mutex<MerkleDag>>>`, `Option<Arc<Mutex<TagCatalog>>>`, `Option<MinHashPolicy>`, `Option<Arc<dyn VectorSearchBackend>>`.
+- [x] B1.2: `execute_with_context(plan, &mut ExecutorContext) -> GalaxResult<ExecuteResult>` is the canonical entry.
+- [x] B1.3: `execute_legacy(plan, &mut Catalog) -> ExecuteResult` retained for plan-validation tests; returns typed "storage required" errors for DML.
+- [x] B1.4: `VectorSearchBackend` trait now returns `GalaxResult<_>` (not `Result<_, String>`). `NoOpVectorBackend` deleted.
+
+**B2 — Real INSERT**
+- [x] B2.1: New `row_codec` module. `align_values`, `build_primary_key`, `encode_row`, `decode_row`, `value_display`, `value_from_str`, `filter_matches`. 9 unit tests.
+- [x] B2.2: `exec_insert` calls `Engine::put_sync` on the catalog-ordered bytes; MinHash policy runs before the write; sidecar async embed trigger after.
+- [x] B2.3: `context_insert_and_select_round_trip` passes — inserts a row, reads it back, asserts typed values.
+
+**B3 — Real SELECT**
+- [x] B3.1: `exec_full_scan` scans `Engine::scan_all()`, filters in-memory, projects columns per catalog layout.
+- [x] B3.2: `exec_point_lookup` uses `Engine::get(key)` via ART.
+- [x] B3.3: Tests: multi-row insert + select with filter + column projection + missing-key returns empty.
+
+**B4 — Real UPDATE + DELETE**
+- [x] B4.1: `exec_update` scans, filters, applies assignments, writes new MVCC version via `put_sync`.
+- [x] B4.2: `exec_delete` identifies matching rows then calls `Engine::delete_sync` (new API added to storage to avoid the executor spawning tokio runtimes).
+- [x] B4.3: Tests: update mutates value, delete removes row, delete non-existent key returns 0, UPDATE of embedding-source column returns `GalaxError::EmbeddingSourceUpdate`.
+
+**B5 — Real DDL + admin**
+- [x] B5.1: `exec_analyze` scans the table and returns row count in the `Ok(msg)` payload. Full ANALYZE (NDV, histograms) stays in `galaxdb-storage::statistics` and is task 13's scope.
+- [x] B5.2: `exec_backup` / `exec_restore` return `GalaxError::NotYetAvailable { task: "37" }` — typed error, never fake OK.
+- [x] B5.3: `exec_bulk_insert` returns `GalaxError::NotYetAvailable { task: "18.7" }` (planner doesn't carry row data yet).
+- [x] B5.4: `exec_create_version_tag` calls `TagCatalog::create_tag` with `MerkleDag::latest` + pinned block set. Missing catalog → typed error (not fake OK).
+
+**B6 — `AT VERSION` + SEMANTIC_FRESH**
+- [ ] B6.1: Deferred. The existing planner `QueryPlan` variants don't carry `at_version` yet; adding them is its own planner change. Current executor enforces the guardrail via `galaxdb_versioning::validate_version_query` at parse time (unchanged).
+
+**B7 — Pinned-block compactor integration**
+- [ ] B7.1: Deferred. `galaxdb-storage::compaction` does not yet consult the tag catalog when GCing versions. The abstraction shape is understood (`Arc<dyn PinSet>` trait) and this should land when task 10.5 / 33.5 is reworked. Unticking those tasks in Phase F.
+
+**B8 — Delete `NoOpVectorBackend`; surface real errors**
+- [x] B8.1: `galaxdb-wire::server` switched from `executor::execute(plan, catalog, &NoOpVectorBackend)` to `executor::execute_legacy(plan, catalog)`. SEMANTIC_MATCH over the wire returns a typed "storage engine required" error directing callers to embedded mode (the wire server does not own an executor context yet — task 40 will finalise this).
+- [x] B8.2: `NoOpVectorBackend` deleted from `galaxdb-sql`.
+- [x] B8.3: Phase D (wire-protocol bind-parameter plumbing) folded in: `Value::Integer(_) => None, // simplified` replaced with full typed conversion using `row_codec::value_display`.
+
+**B9 — `galaxdb-embedded::Database` becomes a thin wrapper**
+- [x] B9.1: `Database` holds `Arc<Engine>`, `Catalog`, `Option<Arc<SidecarManager>>`, `Arc<Mutex<MerkleDag>>`, `Arc<Mutex<TagCatalog>>`, `Arc<RwLock<HashMap<String, TableVectorIndex>>>`. Statement dispatch routes to `execute_with_context`.
+- [x] B9.2: `EmbeddedVectorBackend: VectorSearchBackend` bridges the executor to the database's sidecar + HNSW + delta buffer.
+- [x] B9.3: `exec_insert`, `exec_select`, `exec_update`, `exec_delete`, `exec_create_table`, DDL/admin statements all delegate to the canonical executor.
+
+**B10 — Delete stub comments; full test sweep**
+- [x] B10.1: Every `// In the full implementation, this would ...` comment deleted.
+- [x] B10.2: `cargo test --workspace --exclude galaxdb-python --lib` passes — **662 tests, 0 failures** (up from 648 at Phase A baseline).
+- [x] B10.3: `cargo check --workspace --all-targets` is clean. `cargo test -p galaxdb-embedded --features online-tests --release semantic_match_end_to_end` is wired against the real model and runs on request (requires HF network access).
+
+**Verification (all green on macOS, 2026-05-10)**:
+- `git grep -n 'In the full implementation' -- 'crates/**/*.rs'` → 0 matches
+- `git grep -n 'NoOpVectorBackend' -- 'crates/**/*.rs' 'crates/**/*.toml'` → 0 matches
+- `git grep -n 'mock' -- 'crates/galaxdb-sidecar/src/' 'crates/galaxdb-embedded/src/' 'crates/galaxdb-sql/src/executor.rs' 'crates/galaxdb-sql/src/row_codec.rs'` → only 2 comment lines saying "no mock fallback" / "mock fallback. To run on CI without HF access"; zero production code.
+- `cargo test -p galaxdb-sql --lib` → 111 tests pass (14 new Phase-B tests exercising real `Engine` + CRUD + MinHash + vector-backend routing)
+- `cargo test -p galaxdb-embedded --lib` → 8 tests pass (CRUD round-trip + version tags + all through the new executor)
+- Phase D (wire-protocol bind parameters) folded in via `row_codec::value_display` — integer/float/bool/blob values now render correctly over the wire.
 
 ### Phase C — Pluggable key management. No AWS lock-in.
 
@@ -190,4 +227,31 @@ Files touched in Phase A:
 - `scripts/phase_a_smoke.sh` — direct binary smoke test: real model loads, socket appears.
 - `scripts/phase_a_hardfail.sh` — hard-fail semantics: bogus model → exit 1, no socket, no mock.
 
-**Next action**: Phase B — real SQL executor wired to storage. Delete `galaxdb-sql` executor stubs.
+### 2026-05-10 — Phase B complete (including Phase D folded in)
+
+SQL executor is now backed by the real storage engine. Every INSERT, SELECT, UPDATE, DELETE, CREATE TABLE, DROP TABLE, ANALYZE, CREATE VERSION TAG, and SHOW EMBEDDING HEALTH statement dispatches through `galaxdb_sql::executor::execute_with_context`, which owns an `Arc<Engine>` and either performs the real operation or returns a typed `GalaxError`. `galaxdb-embedded::Database` is a thin wrapper that builds an `ExecutorContext` per statement and forwards through.
+
+Deferred and explicitly tracked:
+- **B6** (AT VERSION + SEMANTIC_FRESH planner wiring) deferred to a planner refresh; guardrail still enforced by `galaxdb_versioning::validate_version_query` at parse time.
+- **B7** (compactor pinned-block integration) deferred. Will untick tasks 10.5 / 33.5 in Phase F.
+- **BACKUP / RESTORE / BULK INSERT** now return `GalaxError::NotYetAvailable` with task IDs 37 / 18.7. No fake OK returns.
+
+Files touched in Phase B:
+- `crates/galaxdb-common/src/error.rs` — added `GalaxError::NotYetAvailable { task, feature }`.
+- `crates/galaxdb-sql/Cargo.toml` — added path deps on `galaxdb-storage`, `galaxdb-vector`, `galaxdb-sidecar`; added `xxhash-rust`, `tracing`; moved `tokio` to dev-deps.
+- `crates/galaxdb-sql/src/lib.rs` — re-exported new public surface (`ExecutorContext`, `execute_with_context`, `execute_legacy`, `row_codec` module).
+- `crates/galaxdb-sql/src/row_codec.rs` — new. `align_values`, `build_primary_key`, `encode_row`, `decode_row`, `value_display`, `value_from_str`, `filter_matches`. 9 unit tests.
+- `crates/galaxdb-sql/src/executor.rs` — full rewrite. `ExecutorContext`, `execute_with_context`, `execute_legacy`. Every DML arm performs real work against `Engine` or returns a typed error.
+- `crates/galaxdb-sql/src/executor_tests.rs` — full rewrite. Legacy catalog-only tests kept for plan-validation contract; new CRUD round-trip tests insert, read, update, delete real rows through `execute_with_context` against a `tempdir()` engine.
+- `crates/galaxdb-storage/src/engine.rs` — added `Engine::delete_sync` mirroring `put_sync` so the sync executor can delete without spawning a tokio runtime.
+- `crates/galaxdb-wire/src/server.rs` — switched from `NoOpVectorBackend` to `execute_legacy`. Integer/float/bool bind values now render through `row_codec::value_display` (closes Phase D).
+- `crates/galaxdb-embedded/src/lib.rs` — full rewrite. `Database` is a thin wrapper; all execution routes through `execute_with_context`. New `EmbeddedVectorBackend` bridges the executor's `VectorSearchBackend` trait to the database's sidecar + HNSW + delta buffer. Online `semantic_match_end_to_end` test updated.
+
+Verification (2026-05-10):
+- `cargo check --workspace --all-targets` → Exit 0.
+- `cargo test --workspace --exclude galaxdb-python --lib` → 662 tests pass, 0 failed (up from 648 at Phase A baseline).
+- `git grep -n 'In the full implementation' -- 'crates/**/*.rs'` → 0 matches.
+- `git grep -n 'NoOpVectorBackend' -- 'crates/**/*.rs' 'crates/**/*.toml'` → 0 matches.
+- `git grep -n 'mock' -- 'crates/galaxdb-sidecar/src/' 'crates/galaxdb-embedded/src/' 'crates/galaxdb-sql/src/executor.rs' 'crates/galaxdb-sql/src/row_codec.rs'` → 2 hits, both comment lines saying "no mock fallback".
+
+**Next action**: Phase C — pluggable key management. Replace the AWS KMS stub with `ExternalCommandKeyProvider` + `HashicorpVaultKeyProvider`. No vendor lock-in.

@@ -8,8 +8,14 @@ description = "SQL Parser (sqlparser-rs + AuroraSQL), Query Planner, Query Execu
 
 [dependencies]
 galaxdb-common.workspace = true
+galaxdb-storage = { path = "../galaxdb-storage" }
 galaxdb-versioning.workspace = true
+galaxdb-vector = { path = "../galaxdb-vector" }
+galaxdb-sidecar = { path = "../galaxdb-sidecar" }
 sqlparser.workspace = true
+xxhash-rust.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio.workspace = true

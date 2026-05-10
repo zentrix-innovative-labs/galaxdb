@@ -258,9 +258,14 @@ async fn execute_statement<W: AsyncWriteExt + Unpin>(
         }
     };
 
-    // Execute
-    let no_op_backend = galaxdb_sql::executor::NoOpVectorBackend;
-    let result = galaxdb_sql::executor::execute(&plan, catalog, &no_op_backend);
+    // Execute through the catalog-only legacy path. The wire server does
+    // not own an `ExecutorContext` today — that wiring lands in Phase B9
+    // (consolidation sprint) when `galaxdb-embedded::Database` becomes the
+    // canonical executor and the wire server delegates to it. Until then,
+    // DDL and SHOW succeed against the catalog; DML and SEMANTIC_MATCH
+    // surface a typed error back to the client so they can't silently
+    // return fake data.
+    let result = galaxdb_sql::executor::execute_legacy(&plan, catalog);
 
     // Write response
     match result {
@@ -268,17 +273,29 @@ async fn execute_statement<W: AsyncWriteExt + Unpin>(
             let col_descs: Vec<ColumnDesc> = columns.iter().map(|c| ColumnDesc::text(c)).collect();
             write_row_description(writer, &col_descs).await?;
 
-            for row in &rows {
-                let values: Vec<Option<&str>> = row
-                    .columns
-                    .iter()
-                    .map(|(_, v)| match v {
-                        galaxdb_sql::planner::Value::Text(s) => Some(s.as_str()),
-                        galaxdb_sql::planner::Value::Integer(_) => None, // simplified
-                        _ => None,
-                    })
-                    .collect();
-                write_data_row(writer, &values).await?;
+            // Materialise each value into its typed display form. This
+            // supports Integer, Float, Text, Bool, Null, and Blob — the
+            // previous "Integer => None, // simplified" path silently
+            // dropped integer bind parameters, which is forbidden by
+            // rule 1 of `.kiro/steering/engineering-principles.md`.
+            // Blob values render as lowercase hex; clients can decode
+            // them if they care.
+            let rendered: Vec<Vec<Option<String>>> = rows
+                .iter()
+                .map(|row| {
+                    row.columns
+                        .iter()
+                        .map(|(_, v)| match v {
+                            galaxdb_sql::planner::Value::Null => None,
+                            other => Some(galaxdb_sql::row_codec::value_display(other)),
+                        })
+                        .collect()
+                })
+                .collect();
+            for row in &rendered {
+                let refs: Vec<Option<&str>> =
+                    row.iter().map(|v| v.as_deref()).collect();
+                write_data_row(writer, &refs).await?;
             }
 
             write_command_complete(writer, &format!("SELECT {}", rows.len())).await?;

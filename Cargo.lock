@@ -2987,9 +2987,15 @@ name = "galaxdb-sql"
 version = "0.1.0"
 dependencies = [
  "galaxdb-common",
+ "galaxdb-sidecar",
+ "galaxdb-storage",
+ "galaxdb-vector",
  "galaxdb-versioning",
  "sqlparser 0.50.0",
  "tempfile",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]

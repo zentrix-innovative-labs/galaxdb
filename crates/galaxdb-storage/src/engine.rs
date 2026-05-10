@@ -551,6 +551,32 @@ impl Engine {
         Ok(true)
     }
 
+    /// Delete a row by primary key, synchronously (sync fsync).
+    ///
+    /// Mirror of [`Engine::delete`] for callers that run outside a tokio
+    /// runtime (embedded mode, the SQL executor's DELETE arm). Writes
+    /// the tombstone WAL record via `append_sync`, then updates the
+    /// memtable and ART. Returns `Ok(true)` if the key was present,
+    /// `Ok(false)` if there was nothing to delete.
+    pub fn delete_sync(&self, key: &[u8]) -> GalaxResult<bool> {
+        if self.art.lookup(key).is_none() {
+            return Ok(false);
+        }
+
+        let ts = self.next_ts();
+
+        self.wal
+            .append_sync(WalRecordType::RowDelete, key.to_vec())
+            .map_err(GalaxError::Io)?;
+
+        let active = self.memtable_mgr.active();
+        active.put(key.to_vec(), ts, None);
+
+        self.art.delete(key);
+
+        Ok(true)
+    }
+
     /// Scan all rows (for SELECT * without filter).
     /// Returns keys and values from the memtable.
     pub fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
