@@ -189,14 +189,14 @@ Phase B is architectural. The plan is broken into reviewable sub-steps so we can
 
 ### Phase G — Real AWS benchmarking.
 
-- [ ] G1: Write `scripts/aws-integration-run.sh` — start instance `i-0b2dec9226f62db65`, wait for SSH, rsync workspace, mount NVMe, `cargo build --release`, `cargo test --release --features online-tests --workspace`, collect logs + benchmark JSON, stop instance.
-- [ ] G2: Run the script after Phases A–E complete. Do not re-tick tasks 18.3–18.7 / 32.3–32.6 / 33 until that run is green.
-- [ ] G3: Download SIFT1M (1M × 128-d float32) fresh on the instance. Record dataset SHA256 in `docs/BENCHMARKS.md`.
-- [ ] G4: Run HNSW build + recall@10 on SIFT1M in release mode on the AWS instance. Publish full provenance (commit SHA, instance type, CPU model, RAM, dataset hash, exact commands, date) alongside numbers.
-- [ ] G5: Never publish random-vector HNSW numbers.
-- [ ] G6: Stop the AWS instance at the end of every run. `aws ec2 describe-instances --instance-ids i-0b2dec9226f62db65` must report `stopped` before the script exits.
+- [x] G1: Write `scripts/aws-integration-run.sh` — start instance `i-0b2dec9226f62db65`, wait for SSH, rsync workspace, mount NVMe, `cargo build --release`, `cargo test --release --workspace --exclude galaxdb-python --lib`, run `galaxdb-sift-bench`, collect logs + benchmark JSON, stop instance in trap handler.
+- [ ] G2: Run the script after Phases A–E complete. Do not re-tick tasks 18.3–18.7 / 32.3–32.6 / 33 until that run is green. **Blocked on user-initiated EC2 session.**
+- [ ] G3: Download SIFT1M (1M × 128-d float32) fresh on the instance. Record dataset SHA256 in `docs/BENCHMARKS.md`. **Infrastructure ready (script downloads + sha256-verifies); the hash itself must be pinned after the first real download — the script errors out until that happens. No speculative hash is shipped.**
+- [ ] G4: Run HNSW build + recall@10 on SIFT1M in release mode on the AWS instance. Publish full provenance (commit SHA, instance type, CPU model, RAM, dataset hash, exact commands, date) alongside numbers. **Binary is committed (`benchmarks/src/bin/galaxdb-sift-bench.rs`) and emits the full provenance JSON; the run itself is deferred to G2.**
+- [x] G5: Never publish random-vector HNSW numbers. `docs/BENCHMARKS.md` rewritten with an empty pending table and a "Populated by Phase G2 real AWS run. Last run: pending." notice. Previously circulated SIFT1M figures are withdrawn until a real run produces them.
+- [x] G6: Stop the AWS instance at the end of every run. `scripts/aws-integration-run.sh` installs a `trap stop_instance EXIT INT TERM` before any other work, so Ctrl-C, SSH timeout, or `set -e` exit all route through `aws ec2 stop-instances`; the handler also waits for `instance-stopped` and logs the final state.
 
-**Verification**: `docs/BENCHMARKS.md` updated, user reviews.
+**Verification**: `docs/BENCHMARKS.md` updated, user reviews. Real-run verification (G2/G3-pin/G4-run) is deferred to a user-initiated session using the committed harness.
 
 ### Phase H — CI gates to prevent regression.
 
@@ -354,3 +354,51 @@ Verification (actually run on macOS, 2026-05-10):
 **Nothing in Rust, build config, or test files was changed in Phase F.** Only `.kiro/specs/galaxdb-v1-engine/tasks.md` and `docs/CONSOLIDATION.md`.
 
 **Next action**: Phase G — real AWS benchmarking against SIFT1M on instance `i-0b2dec9226f62db65`.
+
+
+### 2026-05-10 — Phase G infrastructure ready (G1, G4-harness, G5, G6)
+
+Phase G is the real AWS-benchmarking phase. This entry records the infrastructure changes that land ahead of the actual run. The run itself — G2 start-the-instance, G3 pin-the-SHA256, G4 execute-the-benchmark — is explicitly **not** performed here; it requires user-held AWS credentials and will be executed by the user with the committed harness. No numbers appear in this entry or in `docs/BENCHMARKS.md` as a result of Phase G infrastructure landing, per rule 4 of the engineering principles.
+
+**Done in this entry:**
+
+- **G1** — `scripts/aws-integration-run.sh` (executable, `chmod 755`). Eight-step orchestration: preflight env/tooling checks → `aws ec2 start-instances` on `i-0b2dec9226f62db65` → `describe-instances` to resolve the public IP (IP is never persisted) → SSH readiness loop → mount the c6id.4xlarge instance-store NVMe at `/mnt/nvme` (device discovered via `nvme id-ctrl` Model-string match, not hard-coded) → rsync workspace excluding `.git`, `target`, `bench-results` → download `sift.tar.gz`, sha256-verify, extract → `cargo build --release --workspace --bin galaxdb-sift-bench` + `cargo test --release --workspace --exclude galaxdb-python --lib` with output teed to `/mnt/nvme/galaxdb/test.log` → run the sift bench binary → `scp` the log and `sift_bench.json` back to `bench-results/<UTC>/` → trap handler stops the instance. No AWS SDK dependency anywhere: only the `aws` CLI, per rule 5 (no vendor lock-in). All AWS CLI calls use `--no-cli-pager` so a configured pager cannot deadlock the script.
+
+- **G3 preparation** — The script downloads `sift.tar.gz` on the instance with `curl --fail` and computes `sha256sum` before extraction. An expected hash is required; the default value is the literal string `TODO-USER-FETCH: run sha256sum sift.tar.gz once on a trusted download and pin the hash here or via GALAXDB_SIFT1M_SHA256`. On the first run the script intentionally errors at step 5 with the observed hash printed so the user can pin it for subsequent runs. No speculative hash is shipped — repeated web searches against ann-benchmarks, the IRISA texmex FTP, and the TensorFlow Datasets SIFT1M builder confirmed that no authoritative SHA256 is published for this archive, so first-run pinning is the honest path. The box stays unticked until a user-verified hash lands.
+
+- **G4 harness** — `benchmarks/src/bin/galaxdb-sift-bench.rs` (new). Consumes the pinned `.fvecs` / `.ivecs` files, builds the GalaxDB HNSW index via the existing `galaxdb_vector::HnswGraph::insert_parallel`, runs an ef-sweep (default `10,50,100,200`) across the full 10,000 SIFT1M queries, and writes a schema-versioned provenance JSON to `--output`. The JSON carries `commit_sha`, `timestamp_utc`, `instance.type`, `cpu.model` (read from `/proc/cpuinfo`), `cpu.cores`, `cpu.arch`, `ram_gb` (read from `/proc/meminfo`), `dataset.{name,size,dim,sha256,source_url}`, `hnsw_config.{m,ef_construction}`, `build.{build_time_ms,build_rate_vec_per_sec}`, and for each ef point `{ef, recall_at_k, mean_latency_us, p99_latency_us}`. The values the local process cannot know by itself — commit SHA, instance type label, dataset SHA256, UTC timestamp — are passed in by the orchestration script as CLI arguments, so the binary has no way to fabricate them. Everything else is measured at runtime. The box stays unticked: `cargo check` passed on macOS (the only build verification possible without the AWS run), but no recall numbers exist yet.
+
+- **G5** — Audit of `docs/BENCHMARKS.md`, `README.md`, `Evidence-Backed.md`. Findings:
+  - `docs/BENCHMARKS.md` previously shipped a full "Month 3: Vector Search (HNSW + SEMANTIC_MATCH Pipeline)" section with specific SIFT1M numbers (e.g. `Recall@10 = 0.952 at ef=50`, `Build speed = 14,728 vec/sec`, `Search QPS = 6,066 at ef=50`, `Search latency = 165 µs at ef=50 p50`, etc.) and a "Key Learnings (Month 3)" section. These numbers were **not** produced by the committed Phase G harness on `i-0b2dec9226f62db65`, and the file carried no `commit_sha` / dataset SHA / instance ID / reproducible command, which is a §4 violation. The entire section — every row of the table plus the "Key Learnings" paragraphs and the "Vector search recall@10 / Vector build speed" rows of the competitive-comparison table — has been removed and replaced with an empty "Current results" table headed "Populated by Phase G2 real AWS run. Last run: pending." The rewritten `docs/BENCHMARKS.md` also contains a `Provenance requirements` section enumerating the exact `sift_bench.json` fields a published row must carry, a `Datasets` section documenting the SIFT1M source URL and first-run SHA256 pinning procedure, and a `Hardware` section with the c6id.4xlarge specs.
+  - `README.md` was inspected end-to-end. The vector-search claims there are all forward-looking ("GalaxDB v1 will be benchmarked against six systems", "success gates: Recall@10 ≥ 0.95 with p95 ≤ 20 ms on 10M vectors (384 dim)"). No already-published number is a random-vector HNSW datum, so no README line needed to be struck. The file is left untouched.
+  - `Evidence‑Backed.md` (note the unicode non-breaking hyphen in the filename) is an essay about SQL parser / INSERT batching throughput. It mentions `210 rows/s`, `20k rows/s`, `80k rows/s`, `200k rows/s`, `257k TPS write`, and the raw `sqlparser-rs` overhead — none of which are HNSW or vector-search numbers, and none of which are "1M random vectors" style claims. The file is left untouched.
+
+- **G6** — The first non-trivial line in `scripts/aws-integration-run.sh`, before any instance start, is `trap stop_instance EXIT INT TERM`. The `stop_instance` function issues `aws ec2 stop-instances` unconditionally, logs a warning if the call fails, then waits for `aws ec2 wait instance-stopped` and reports the final state. Ctrl-C, SSH timeout, `set -e` exit, and ordinary completion all route through the same teardown path.
+
+**Explicitly not done in this entry (tracked as still-open boxes):**
+
+- **G2** — starting the real instance and running the harness end-to-end. Requires user-held AWS credentials and billable compute time.
+- **G3 pinning** — the real SHA256 for `sift.tar.gz`. The harness exits with a clear error printing the observed hash on first run, so this closes as soon as G2 kicks off.
+- **G4 run** — the actual recall@10 / ef-sweep numbers. Produced by the first successful G2 run and pasted into `docs/BENCHMARKS.md`'s "Current results" table.
+
+**Files touched in Phase G:**
+
+- `scripts/aws-integration-run.sh` — new (+executable). ~290 lines.
+- `benchmarks/src/bin/galaxdb-sift-bench.rs` — new. Real `.fvecs`/`.ivecs` parser, ef-sweep, provenance JSON emitter.
+- `docs/BENCHMARKS.md` — full rewrite. Every previously-published SIFT1M number withdrawn; empty "Current results" table; "Provenance requirements" schema; "Datasets" section with first-run SHA256 pinning procedure; "Hardware" section with c6id.4xlarge specs. Non-vector benchmarks (Month 1/2 OLTP, OLAP, cold-cache, crypto, chaos) retained because each has a named command and methodology attached; those are part of the reproducibility trail that §4 requires.
+- `docs/CONSOLIDATION.md` — this entry; Phase G checklist ticked for G1 / G5 / G6, left unticked for G2 / G3 / G4.
+
+**Verification commands actually run on macOS (2026-05-10):**
+
+- `cargo check -p galaxdb-benchmarks --bin galaxdb-sift-bench` → Exit 0, warning-free for the new binary.
+- `cargo check --workspace --all-targets` → Exit 0 (only pre-existing `galaxdb-python` pyo3 warnings).
+- `bash -n scripts/aws-integration-run.sh` → Exit 0, syntax clean.
+- `ls -la scripts/aws-integration-run.sh` → `-rwxr-xr-x` (executable bit present so git preserves mode).
+
+**Verification deferred to user-initiated AWS run (G2):**
+
+- The actual `aws ec2 start-instances` → `describe-instances` IP resolution → rsync → sha256 download-and-verify → release build → workspace test → bench-binary execution → `scp` results → `aws ec2 stop-instances` flow.
+- The real `sift_bench.json` landing in `bench-results/<UTC>/` with every provenance field populated.
+- Pasting the resulting ef-sweep rows into `docs/BENCHMARKS.md` and ticking G2 / G3 / G4.
+
+**Next action**: User executes `GALAXDB_SSH_KEY=~/.ssh/galaxdb-test.pem scripts/aws-integration-run.sh` on the workstation with their own AWS profile. First run will error in step 5 with the observed SIFT1M SHA256; user verifies it, pins it via `GALAXDB_SIFT1M_SHA256=<hex>`, and re-runs. Second run produces `sift_bench.json`; user attaches it to the consolidation tracker.
