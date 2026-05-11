@@ -2509,10 +2509,14 @@ dependencies = [
  "galaxdb-common",
  "galaxdb-embedded",
  "galaxdb-io",
+ "galaxdb-server",
  "galaxdb-sql",
  "galaxdb-storage",
+ "postgres",
  "pyo3",
  "sqlparser 0.50.0",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -4805,6 +4809,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a106d1259c23fac8e543272398ae0e3c0b8d33c88ed73d0cc71b0f1d902618"
 dependencies = [
  "portable-atomic",
+]
+
+[[package]]
+name = "postgres"
+version = "0.19.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacf632d0554ff75f58183694f41dc8999c8a3a43a386994d0ec2d034f1dfbe1"
+dependencies = [
+ "bytes",
+ "fallible-iterator",
+ "futures-util",
+ "log",
+ "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]

@@ -174,7 +174,7 @@
 
 - [x] 22. Implement Python client — galaxdb-python (Req 32)
   - [x] 22.1 Create galaxdb-python package with PyO3 bindings for embedded mode (`galaxdb.Database(path)`)
-  - [ ] 22.2 Implement remote mode: connect via PostgreSQL wire protocol (`galaxdb.connect(connstring)`)
+  - [x] 22.2 Implement remote mode: connect via PostgreSQL wire protocol (`galaxdb.connect(connstring)`) <!-- Real implementation: `galaxdb-python/src/lib.rs::connect` uses the blocking `postgres` crate to open a pg-wire connection, returns a `Connection` PyO3 class with `.execute(sql)` that drives `SimpleQuery` and maps results back to the same shape embedded mode returns. Integration test `galaxdb-python/tests/remote_mode.rs::remote_crud_round_trip_via_postgres_client` starts a real `galaxdb-server` on port 0 against a tempdir and drives CREATE/INSERT/SELECT/WHERE/UPDATE/DELETE end-to-end. -->
   - [x] 22.3 Implement `db.execute(sql)` returning list of row dicts
   - [ ] 22.4 Implement `db.training_dataset(tag)` returning PyTorch IterableDataset backed by Lance
   - [x] 22.5 Ensure Python 3.9+ compatibility

@@ -17,3 +17,16 @@ galaxdb-io = { path = "../crates/galaxdb-io" }
 galaxdb-embedded = { path = "../crates/galaxdb-embedded" }
 pyo3 = { version = "0.24", features = ["extension-module"] }
 sqlparser = { version = "0.50", features = ["visitor"] }
+# Real PostgreSQL wire-protocol client for galaxdb.connect(connstring).
+# `postgres` is the blocking API (sync), which matches PyO3's sync
+# method signatures and avoids exposing a tokio runtime to Python.
+postgres = { version = "0.19" }
+
+[dev-dependencies]
+# Spin up a real galaxdb-server on port 0 for the remote-mode
+# integration test. The test drives the `postgres` crate directly —
+# the same wire-level path `Connection::execute` uses — so a pass
+# here is equivalent to a pass through the Python wrapper.
+galaxdb-server = { path = "../crates/galaxdb-server" }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
