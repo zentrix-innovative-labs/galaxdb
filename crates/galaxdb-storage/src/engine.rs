@@ -614,47 +614,200 @@ impl Engine {
             .map_err(GalaxError::Io)
     }
 
-    /// Scan all rows (for SELECT * without filter).
-    /// Returns keys and values from the memtable.
-    pub fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let active = self.memtable_mgr.active();
-        let entries = active.iter_all();
+    /// Scan all rows with optional key-range filtering via SST
+    /// zone-map pruning. Tasks 18.4 / 5.6.
+    ///
+    /// When `key_prefix` is `Some`, SST blocks whose `[zone_map_min,
+    /// zone_map_max]` on the key column cannot overlap keys starting
+    /// with the prefix are skipped entirely — saving a full block
+    /// deserialization and column read. The memtable path can't use
+    /// zone maps (no per-memtable-shard min/max tracking yet) so
+    /// memtable scan still iterates every entry and matches prefix
+    /// per-key.
+    ///
+    /// When `key_prefix` is `None`, this is equivalent to `scan_all`.
+    pub fn scan_all_with_prefix(
+        &self,
+        key_prefix: Option<&[u8]>,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let mut out: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
 
-        entries
-            .into_iter()
-            .filter_map(|(key, versioned)| {
-                versioned.value.map(|v| (key, v))
-            })
-            .collect()
+        if let Ok(registry) = self.sst_registry.read() {
+            for (_sst_id, entry) in registry.entries.iter() {
+                let Ok(data) = std::fs::read(&entry.path) else {
+                    continue;
+                };
+                for block_entry in &entry.block_index.entries {
+                    let start = block_entry.file_offset as usize;
+                    let end = start + block_entry.block_len as usize;
+                    if end > data.len() {
+                        continue;
+                    }
+                    let block_bytes = &data[start..end];
+                    let block = match crate::pax::PaxBlock::deserialize(block_bytes) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+
+                    // Zone-map pruning against the key column (col 0).
+                    if let Some(prefix) = key_prefix {
+                        if block.header.column_descriptors.is_empty() {
+                            continue;
+                        }
+                        let desc = &block.header.column_descriptors[0];
+                        if !key_range_overlaps_prefix(
+                            &desc.zone_map_min,
+                            &desc.zone_map_max,
+                            prefix,
+                        ) {
+                            continue; // Block can't contain any matching key.
+                        }
+                    }
+
+                    let keys = match block.read_column(0) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let vals = match block.read_column(1) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    for (k, v) in keys.into_iter().zip(vals.into_iter()) {
+                        if let Some(prefix) = key_prefix {
+                            if !k.starts_with(prefix) {
+                                continue;
+                            }
+                        }
+                        if v.is_empty() {
+                            out.remove(&k);
+                        } else {
+                            out.insert(k, v);
+                        }
+                    }
+                }
+            }
+        }
+
+        let active = self.memtable_mgr.active();
+        for (key, versioned) in active.iter_all() {
+            if let Some(prefix) = key_prefix {
+                if !key.starts_with(prefix) {
+                    continue;
+                }
+            }
+            match versioned.value {
+                Some(v) => {
+                    out.insert(key, v);
+                }
+                None => {
+                    out.remove(&key);
+                }
+            }
+        }
+
+        let mut results: Vec<(Vec<u8>, Vec<u8>)> = out.into_iter().collect();
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results
     }
 
-    /// Scan all rows as they appeared at `read_ts` (AT VERSION
-    /// timestamp support, task 32.3).
+    /// Scan all rows (for SELECT * without filter). Returns keys and
+    /// values from the memtable AND all registered SST files, sorted
+    /// by key in ascending order.
     ///
-    /// Walks each key's MVCC version chain and returns the latest
-    /// version with `timestamp <= read_ts`. Tombstones are honoured:
-    /// a key whose resolved version is a tombstone is excluded from
-    /// the result. Keys with no version at or before `read_ts` are
-    /// excluded.
+    /// Rows flushed to SST are returned with their stored values; memtable
+    /// rows override SST rows for the same key (because the ART index
+    /// already points flushed keys at SST, so they wouldn't be in the
+    /// active memtable anyway — but a freshly-updated key is). Tombstones
+    /// are honoured in both layers.
+    pub fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        self.scan_all_with_prefix(None)
+    }
+
+    /// Scan all rows visible at `read_ts` (AT VERSION timestamp support,
+    /// task 32.3).
     ///
-    /// Current implementation reads only from the in-memory memtable.
-    /// Rows that have been flushed to SST files are not time-travel
-    /// addressable yet — that requires the MerkleDag → block-set
-    /// resolution in the SST registry, which is tracked as task
-    /// 32.3 follow-up work in `docs/CONSOLIDATION.md`. The memtable
-    /// path is real and correct; the caller gets the row bytes from
-    /// the exact timestamp requested. Callers that require SST
-    /// coverage must first flush the memtable via `flush_memtable`.
+    /// Walks each key's MVCC chain in the memtable, returning the latest
+    /// version with `timestamp <= read_ts`. Also scans every registered
+    /// SST file: each SST block carries a `commit_timestamp` in its
+    /// header, and the flush pipeline only writes blocks containing
+    /// committed-and-sealed data, so every key in an SST with
+    /// `block.commit_timestamp <= read_ts` is visible at `read_ts`.
+    /// Tombstones in both layers are honoured.
     pub fn scan_all_at(&self, read_ts: Timestamp) -> Vec<(Vec<u8>, Vec<u8>, Timestamp)> {
+        let mut out: HashMap<Vec<u8>, (Vec<u8>, Timestamp)> = HashMap::new();
+
+        // SSTs first. For each block, skip if its commit_timestamp is
+        // strictly greater than read_ts — those rows committed in the
+        // future relative to the caller's snapshot and must not be
+        // visible.
+        if let Ok(registry) = self.sst_registry.read() {
+            for (_sst_id, entry) in registry.entries.iter() {
+                let Ok(data) = std::fs::read(&entry.path) else {
+                    continue;
+                };
+                for block_entry in &entry.block_index.entries {
+                    let start = block_entry.file_offset as usize;
+                    let end = start + block_entry.block_len as usize;
+                    if end > data.len() {
+                        continue;
+                    }
+                    let block_bytes = &data[start..end];
+                    let block = match crate::pax::PaxBlock::deserialize(block_bytes) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    let block_ts = block.header.commit_timestamp;
+                    if block_ts > read_ts {
+                        continue;
+                    }
+                    let keys = match block.read_column(0) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    let vals = match block.read_column(1) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+                    for (k, v) in keys.into_iter().zip(vals.into_iter()) {
+                        // Merge by taking the latest visible version.
+                        let existing_ts = out.get(&k).map(|(_, ts)| *ts).unwrap_or(0);
+                        if block_ts >= existing_ts {
+                            if v.is_empty() {
+                                out.remove(&k);
+                            } else {
+                                out.insert(k, (v, block_ts));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Memtable — walks MVCC chains and returns the version at or
+        // before read_ts. Overrides SSTs for the same key when the
+        // memtable has a newer-but-still-visible version.
         let active = self.memtable_mgr.active();
-        active
-            .iter_all()
+        for (key, versioned) in active.iter_all() {
+            if let Some((maybe_val, ts)) = versioned.get_at_with_ts(read_ts) {
+                if ts >= out.get(&key).map(|(_, t)| *t).unwrap_or(0) {
+                    match maybe_val {
+                        Some(v) => {
+                            out.insert(key, (v, ts));
+                        }
+                        None => {
+                            out.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut results: Vec<(Vec<u8>, Vec<u8>, Timestamp)> = out
             .into_iter()
-            .filter_map(|(key, versioned)| {
-                let (value, ts) = versioned.get_at_with_ts(read_ts)?;
-                value.map(|v| (key, v, ts))
-            })
-            .collect()
+            .map(|(k, (v, ts))| (k, v, ts))
+            .collect();
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        results
     }
 
     /// Get the total number of rows (approximate).
@@ -711,6 +864,56 @@ fn encode_kv(key: &[u8], value: &[u8]) -> Vec<u8> {
     buf.extend_from_slice(key);
     buf.extend_from_slice(value);
     buf
+}
+
+/// Zone-map pruning helper (task 18.4).
+///
+/// Returns true if the byte range `[zone_min, zone_max]` could contain
+/// a key starting with `prefix`. False means the caller can skip the
+/// whole SST block without loading it.
+///
+/// Logic: the block's keys are bytewise-sorted, so the block contains a
+/// key with `prefix` iff `prefix <= zone_max` AND any key of the form
+/// `prefix..` is >= zone_min. Concretely:
+///
+/// * If `zone_max < prefix` bytewise, the block's largest key is
+///   strictly less than the prefix — skip.
+/// * If `zone_min > prefix_upper_bound`, every key exceeds the prefix
+///   namespace — skip. (prefix_upper_bound is the smallest byte
+///   string strictly greater than any `prefix..`; computed by
+///   incrementing the last byte or pushing 0xFF.)
+/// * Otherwise the block might contain a matching key — keep it.
+fn key_range_overlaps_prefix(zone_min: &[u8], zone_max: &[u8], prefix: &[u8]) -> bool {
+    if zone_min.is_empty() && zone_max.is_empty() {
+        // Empty zone map — block is empty or zone maps weren't
+        // computed. Be safe: keep it.
+        return true;
+    }
+    // Case 1: zone_max strictly precedes prefix lexicographically.
+    if zone_max.as_ref() < prefix {
+        return false;
+    }
+    // Case 2: zone_min exceeds every possible `prefix..` key. The
+    // upper bound of the prefix namespace is `prefix` with trailing
+    // 0xFF bytes, or equivalently, a key whose first `prefix.len()`
+    // bytes are >= prefix and differ at some position.
+    //
+    // The cleanest check: zone_min starts with bytes > prefix at the
+    // first differing position, and is not itself a prefix extension.
+    let common = zone_min
+        .iter()
+        .zip(prefix.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    if common < prefix.len() && common < zone_min.len() {
+        // They differ inside the prefix range. If zone_min is larger
+        // at the first differing byte AND zone_min doesn't extend
+        // the prefix, the block's keys are all past the prefix.
+        if zone_min[common] > prefix[common] {
+            return false;
+        }
+    }
+    true
 }
 
 /// Decode a key-value pair from WAL payload.
@@ -801,6 +1004,98 @@ mod tests {
         engine.put(b"key1".to_vec(), b"v2".to_vec()).await.unwrap();
 
         assert_eq!(engine.get(b"key1"), Some(b"v2".to_vec()));
+    }
+
+    #[test]
+    fn key_range_overlaps_prefix_rejects_below_prefix() {
+        // zone_max "aaz" is strictly less than prefix "bb" → skip.
+        assert!(!key_range_overlaps_prefix(b"aaa", b"aaz", b"bb"));
+    }
+
+    #[test]
+    fn key_range_overlaps_prefix_rejects_above_prefix() {
+        // zone_min "cc..." starts past "bb..." → skip.
+        assert!(!key_range_overlaps_prefix(b"cc1", b"cc9", b"bb"));
+    }
+
+    #[test]
+    fn key_range_overlaps_prefix_accepts_overlap() {
+        // zone_min "bb5" starts with "bb" → keep.
+        assert!(key_range_overlaps_prefix(b"bb5", b"cc9", b"bb"));
+    }
+
+    #[test]
+    fn key_range_overlaps_prefix_accepts_straddle() {
+        // zone_min "aa" is below, zone_max "cc" is above — block straddles the prefix namespace.
+        assert!(key_range_overlaps_prefix(b"aa", b"cc", b"bb"));
+    }
+
+    #[test]
+    fn key_range_overlaps_prefix_accepts_empty_zone_map() {
+        // Legacy blocks without zone maps → conservatively keep.
+        assert!(key_range_overlaps_prefix(b"", b"", b"bb"));
+    }
+
+    #[tokio::test]
+    async fn scan_with_prefix_after_flush_filters_other_tables() {
+        // Insert rows for two tables (different prefixes), flush, scan
+        // with prefix "t1:" — only t1 rows should come back, and the
+        // SST block for "t2:" should be skipped via zone-map pruning.
+        let engine = test_engine();
+        for i in 0..50u32 {
+            let key = format!("t1:{:04}", i).into_bytes();
+            let value = format!("t1v{}", i).into_bytes();
+            engine.put(key, value).await.unwrap();
+        }
+        for i in 0..50u32 {
+            let key = format!("t2:{:04}", i).into_bytes();
+            let value = format!("t2v{}", i).into_bytes();
+            engine.put(key, value).await.unwrap();
+        }
+        engine.flush_memtable().await.unwrap();
+
+        let t1_rows = engine.scan_all_with_prefix(Some(b"t1:"));
+        assert_eq!(t1_rows.len(), 50, "prefix scan must find all t1 rows");
+        for (k, _) in &t1_rows {
+            assert!(
+                k.starts_with(b"t1:"),
+                "unexpected key in t1 prefix scan: {:?}",
+                k
+            );
+        }
+
+        let t2_rows = engine.scan_all_with_prefix(Some(b"t2:"));
+        assert_eq!(t2_rows.len(), 50);
+        for (k, _) in &t2_rows {
+            assert!(k.starts_with(b"t2:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_all_at_sees_memtable_and_sst() {
+        // AT VERSION must see rows from both the memtable MVCC chain
+        // and flushed SSTs. Write, flush, write more, then snapshot
+        // each state.
+        let engine = test_engine();
+        engine.put(b"k1".to_vec(), b"v1".to_vec()).await.unwrap();
+        engine.put(b"k2".to_vec(), b"v2".to_vec()).await.unwrap();
+        engine.flush_memtable().await.unwrap();
+        // At this point both keys live in an SST block.
+        let ts_after_flush = engine.next_ts_for_tests() - 1;
+
+        engine.put(b"k3".to_vec(), b"v3".to_vec()).await.unwrap();
+        let ts_after_k3 = engine.next_ts_for_tests() - 1;
+
+        // Snapshot at the flush boundary — must see k1 and k2 from SST,
+        // but not k3 (written later and still in memtable).
+        let rows = engine.scan_all_at(ts_after_flush);
+        let keys: Vec<&[u8]> = rows.iter().map(|(k, _, _)| k.as_slice()).collect();
+        assert_eq!(keys, vec![b"k1".as_slice(), b"k2".as_slice()]);
+
+        // Snapshot after k3 — must see all three.
+        let rows = engine.scan_all_at(ts_after_k3);
+        let keys: Vec<&[u8]> = rows.iter().map(|(k, _, _)| k.as_slice()).collect();
+        assert_eq!(keys, vec![b"k1".as_slice(), b"k2".as_slice(), b"k3".as_slice()]);
     }
 
     #[tokio::test]

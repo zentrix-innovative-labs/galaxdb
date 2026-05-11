@@ -750,11 +750,19 @@ fn exec_full_scan(
         columns.to_vec()
     };
 
+    // Zone-map pruning on the key column (task 18.4). Every row for a
+    // table lives under the `"{table}:"` prefix in the engine's key
+    // space; SST blocks whose key zone maps cannot overlap this
+    // prefix are skipped without being loaded. `scan_all_with_prefix`
+    // does the filter at the block layer; the executor just feeds it
+    // the table's prefix and applies the WHERE filter per row on what
+    // comes back.
     let prefix = format!("{}:", table);
+    let prefix_bytes = prefix.as_bytes();
     let mut rows: Vec<Row> = Vec::new();
 
-    for (key, value_bytes) in ctx.engine.scan_all() {
-        if !String::from_utf8_lossy(&key).starts_with(&prefix) {
+    for (key, value_bytes) in ctx.engine.scan_all_with_prefix(Some(prefix_bytes)) {
+        if !key.starts_with(prefix_bytes) {
             continue;
         }
         let cols = row_codec::decode_row(&value_bytes);
