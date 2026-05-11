@@ -79,6 +79,26 @@ impl Database {
         self.inner.table_exists(name)
     }
 
+    /// Export the table at `tag` as a Lance dataset on disk and
+    /// return the absolute path to that dataset (Req 32 / task 22.4).
+    ///
+    /// `tag` must name a version tag that was created with
+    /// `FOR TRAINING`. The return value is the path to a Lance
+    /// dataset directory; wrap it on the Python side with
+    /// `lance.dataset(path).to_pytorch()` to get a PyTorch
+    /// `IterableDataset` with zero-copy memory-mapped access to the
+    /// columnar data.
+    ///
+    /// The path lives under `<database>/training_exports/<tag>_<ts>/`
+    /// and is overwritten on repeat calls with the same tag.
+    fn training_dataset(&self, tag: &str) -> PyResult<String> {
+        let path = self
+            .inner
+            .training_dataset(tag)
+            .map_err(|e| PyRuntimeError::new_err(format!("{}", e)))?;
+        Ok(path.to_string_lossy().into_owned())
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Database(path='{}', tables={})",

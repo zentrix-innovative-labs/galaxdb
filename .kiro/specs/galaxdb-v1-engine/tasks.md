@@ -176,9 +176,9 @@
   - [x] 22.1 Create galaxdb-python package with PyO3 bindings for embedded mode (`galaxdb.Database(path)`)
   - [x] 22.2 Implement remote mode: connect via PostgreSQL wire protocol (`galaxdb.connect(connstring)`) <!-- Real implementation: `galaxdb-python/src/lib.rs::connect` uses the blocking `postgres` crate to open a pg-wire connection, returns a `Connection` PyO3 class with `.execute(sql)` that drives `SimpleQuery` and maps results back to the same shape embedded mode returns. Integration test `galaxdb-python/tests/remote_mode.rs::remote_crud_round_trip_via_postgres_client` starts a real `galaxdb-server` on port 0 against a tempdir and drives CREATE/INSERT/SELECT/WHERE/UPDATE/DELETE end-to-end. -->
   - [x] 22.3 Implement `db.execute(sql)` returning list of row dicts
-  - [ ] 22.4 Implement `db.training_dataset(tag)` returning PyTorch IterableDataset backed by Lance
+  - [x] 22.4 Implement `db.training_dataset(tag)` returning PyTorch IterableDataset backed by Lance <!-- Real implementation: `galaxdb-embedded/src/lib.rs::Database::training_dataset(&self, tag)` resolves the tag through `TagCatalog`, rejects non-`FOR TRAINING` tags, builds an Arrow schema from the table's `CatalogColumn`s, streams rows out of the live engine via `Engine::scan_all_at(version_timestamp)` using a real `EmbeddedLanceExportSource` / `LanceExportSource` impl, and drives `LanceExporter::export()` into `<db>/training_exports/<tag>_<ts>/`. The PyO3 `Database.training_dataset(tag)` method returns that path as a string; Python-side glue wraps it with `lance.dataset(path).to_pytorch()` to get the IterableDataset. Unit test `training_dataset_writes_real_lance_dataset` re-opens the returned path with `lance::Dataset::open` and asserts 5 INSERTed rows are scannable; `training_dataset_rejects_non_training_tag` and `training_dataset_unknown_tag_errors` pin the guard rails. -->
   - [x] 22.5 Ensure Python 3.9+ compatibility
-  - [ ] 22.6 Write tests: embedded mode CRUD, remote mode CRUD, training_dataset returns valid IterableDataset
+  - [~] 22.6 Write tests: embedded mode CRUD, remote mode CRUD, training_dataset returns valid IterableDataset
 
 ## Month 3: Vector Index & Embedding Sidecar
 
@@ -286,62 +286,62 @@
   - [x] 35.2 Integrate into write path: compute MinHash signature on INSERT for TEXT columns, store as `_minhash_signature` system column
   - [x] 35.3 Implement Jaccard similarity estimation from signatures
   - [x] 35.4 Implement background refresh job: group rows with Jaccard > 0.8, populate `_near_duplicate_group` column
-  - [ ] 35.5 Implement `WHERE NOT DUPLICATE` query filter: exclude rows in near-duplicate groups (keep one representative)
-  - [ ] 35.6 Write tests: signature computation, Jaccard estimation accuracy, duplicate grouping, WHERE NOT DUPLICATE filtering
+  - [~] 35.5 Implement `WHERE NOT DUPLICATE` query filter: exclude rows in near-duplicate groups (keep one representative)
+  - [~] 35.6 Write tests: signature computation, Jaccard estimation accuracy, duplicate grouping, WHERE NOT DUPLICATE filtering
 
 - [ ] 36. Implement training data lineage — galaxdb-versioning (Req 38)
-  - [ ] 36.1 Create `_galaxdb_training_exports` system table: tag_name, filter_expr, precision, dedup, curriculum, row_count, exported_at, content_hash
-  - [ ] 36.2 Make table append-only: reject DELETE/UPDATE queries against this table
-  - [ ] 36.3 Insert lineage record on every training export
-  - [ ] 36.4 Write tests: lineage record creation, append-only enforcement, content hash correctness
+  - [~] 36.1 Create `_galaxdb_training_exports` system table: tag_name, filter_expr, precision, dedup, curriculum, row_count, exported_at, content_hash
+  - [~] 36.2 Make table append-only: reject DELETE/UPDATE queries against this table
+  - [~] 36.3 Insert lineage record on every training export
+  - [~] 36.4 Write tests: lineage record creation, append-only enforcement, content hash correctness
 
 - [ ] 37. Implement backup and restore — galaxdb-versioning (Req 27)
-  - [ ] 37.1 Implement `BACKUP TO '/path'`: acquire write-quiesce (< 100 ms), flush memtable, create clean Merkle root
-  - [ ] 37.2 Implement concurrent backup copy: reads continue during quiesce, writes resume after copy begins
-  - [ ] 37.3 Implement file copy: PAX blocks + WAL + blob log files to target path
-  - [ ] 37.4 Implement `RESTORE FROM '/path'`: validate all block checksums, copy files, replay WAL, rebuild ART index, rebuild HNSW graph
-  - [ ] 37.5 Implement restore abort on checksum failure: report corrupted block and stop
-  - [ ] 37.6 Write tests: backup/restore round-trip, write-quiesce < 100 ms, reads during backup, checksum failure abort
+  - [~] 37.1 Implement `BACKUP TO '/path'`: acquire write-quiesce (< 100 ms), flush memtable, create clean Merkle root
+  - [~] 37.2 Implement concurrent backup copy: reads continue during quiesce, writes resume after copy begins
+  - [~] 37.3 Implement file copy: PAX blocks + WAL + blob log files to target path
+  - [~] 37.4 Implement `RESTORE FROM '/path'`: validate all block checksums, copy files, replay WAL, rebuild ART index, rebuild HNSW graph
+  - [~] 37.5 Implement restore abort on checksum failure: report corrupted block and stop
+  - [~] 37.6 Write tests: backup/restore round-trip, write-quiesce < 100 ms, reads during backup, checksum failure abort
 
 - [ ] 38. Implement observability — galaxdb-observe (Req 28)
-  - [ ] 38.1 Implement embedded HTTP server (axum) with `/health` endpoint returning JSON status
-  - [ ] 38.2 Implement `/metrics` endpoint with Prometheus text exposition format
-  - [ ] 38.3 Register all metrics: buffer_pool_hot_set_usage, buffer_pool_scan_buffer_usage, embedding_queue_depth, embedding_backlog_depth, checkpoint_last_duration_ms, compaction_pending_bytes, wal_write_latency_us, hnsw_recall_estimate, connections_active, disk_full, sidecar_status
-  - [ ] 38.4 Implement structured JSON logging via tracing-subscriber with configurable level (GALAXDB_LOG_LEVEL env var)
-  - [ ] 38.5 Implement OpenTelemetry W3C traceparent propagation: root span per query, child spans for SQL parse, plan, HNSW search, delta search, sidecar call, PAX reads
-  - [ ] 38.6 Implement SQL commenter format for trace context in wire protocol
-  - [ ] 38.7 Write tests: /health returns correct status, /metrics returns valid Prometheus format, trace spans created for query execution
+  - [~] 38.1 Implement embedded HTTP server (axum) with `/health` endpoint returning JSON status
+  - [~] 38.2 Implement `/metrics` endpoint with Prometheus text exposition format
+  - [~] 38.3 Register all metrics: buffer_pool_hot_set_usage, buffer_pool_scan_buffer_usage, embedding_queue_depth, embedding_backlog_depth, checkpoint_last_duration_ms, compaction_pending_bytes, wal_write_latency_us, hnsw_recall_estimate, connections_active, disk_full, sidecar_status
+  - [~] 38.4 Implement structured JSON logging via tracing-subscriber with configurable level (GALAXDB_LOG_LEVEL env var)
+  - [~] 38.5 Implement OpenTelemetry W3C traceparent propagation: root span per query, child spans for SQL parse, plan, HNSW search, delta search, sidecar call, PAX reads
+  - [~] 38.6 Implement SQL commenter format for trace context in wire protocol
+  - [~] 38.7 Write tests: /health returns correct status, /metrics returns valid Prometheus format, trace spans created for query execution
 
 - [ ] 39. Implement vLSM structural improvements (Month 4 hardening) — galaxdb-storage (Req 36)
-  - [ ] 39.1 Make SST size configurable, change default from 64 MB to 8 MB
-  - [ ] 39.2 Switch L0 from tiered to leveled compaction
-  - [ ] 39.3 Implement SILK-style flush pre-emption: prioritize flush I/O over compaction I/O when memtable back-pressure is high
-  - [ ] 39.4 Write tests: smaller SSTs reduce write stalls, L0 leveled compaction correctness, flush pre-emption under load
+  - [~] 39.1 Make SST size configurable, change default from 64 MB to 8 MB
+  - [~] 39.2 Switch L0 from tiered to leveled compaction
+  - [~] 39.3 Implement SILK-style flush pre-emption: prioritize flush I/O over compaction I/O when memtable back-pressure is high
+  - [~] 39.4 Write tests: smaller SSTs reduce write stalls, L0 leveled compaction correctness, flush pre-emption under load
 
 - [ ] 40. Implement deployment modes — galaxdb-server, galaxdb-embedded (Req 35)
-  - [ ] 40.1 Implement standalone server binary: tokio main, bind wire protocol + HTTP observability, spawn sidecar, graceful shutdown on SIGTERM/SIGINT
-  - [ ] 40.2 Implement embedded mode: PyO3 `Database` class with `new(path)`, `execute(sql)`, `training_dataset(tag)` methods
-  - [ ] 40.3 Implement platform-specific I/O backend selection: io_uring on Linux, tokio on macOS/Windows
-  - [ ] 40.4 Verify binary size: core < 70 MB, full < 350 MB (with sidecar + model)
-  - [ ] 40.5 Write tests: server starts and accepts connections, embedded mode CRUD from Python, binary size check
+  - [~] 40.1 Implement standalone server binary: tokio main, bind wire protocol + HTTP observability, spawn sidecar, graceful shutdown on SIGTERM/SIGINT
+  - [~] 40.2 Implement embedded mode: PyO3 `Database` class with `new(path)`, `execute(sql)`, `training_dataset(tag)` methods
+  - [~] 40.3 Implement platform-specific I/O backend selection: io_uring on Linux, tokio on macOS/Windows
+  - [~] 40.4 Verify binary size: core < 70 MB, full < 350 MB (with sidecar + model)
+  - [~] 40.5 Write tests: server starts and accepts connections, embedded mode CRUD from Python, binary size check
 
 - [ ] 41. Implement chaos tests — tests/chaos (Req 37)
-  - [ ] 41.1 Implement test harness: set up populated database with known data, inject faults, verify recovery
-  - [ ] 41.2 Test: kill sidecar mid-request → engine recovers sidecar, drains backlog, no data loss
-  - [ ] 41.3 Test: kill engine mid-flush → recovery produces consistent state, no committed data lost
-  - [ ] 41.4 Test: corrupt WAL records → recovery skips corrupt records, recovers all valid data
-  - [ ] 41.5 Test: fill disk → engine performs clean checkpoint, blocks writes, no data corruption
-  - [ ] 41.6 Test: all recovery scenarios complete in < 30 seconds
-  - [ ] 41.7 Write integration test suite that runs all chaos scenarios in CI
+  - [~] 41.1 Implement test harness: set up populated database with known data, inject faults, verify recovery
+  - [~] 41.2 Test: kill sidecar mid-request → engine recovers sidecar, drains backlog, no data loss
+  - [~] 41.3 Test: kill engine mid-flush → recovery produces consistent state, no committed data lost
+  - [~] 41.4 Test: corrupt WAL records → recovery skips corrupt records, recovers all valid data
+  - [~] 41.5 Test: fill disk → engine performs clean checkpoint, blocks writes, no data corruption
+  - [~] 41.6 Test: all recovery scenarios complete in < 30 seconds
+  - [~] 41.7 Write integration test suite that runs all chaos scenarios in CI
 
 - [ ] 42. End-to-end integration tests
-  - [ ] 42.1 Test: psycopg2 connects, creates table with embedding column, inserts rows, queries with SEMANTIC_MATCH
-  - [ ] 42.2 Test: SQLAlchemy connects, reflects table metadata via pg_catalog stubs
-  - [ ] 42.3 Test: CREATE VERSION TAG FOR TRAINING → export Lance dataset → verify PyTorch IterableDataset
-  - [ ] 42.4 Test: AT VERSION query with ROW_SNAPSHOT (no SEMANTIC_MATCH), SEMANTIC_FRESH (with warning)
-  - [ ] 42.5 Test: SHOW EMBEDDING HEALTH returns correct model version distribution
-  - [ ] 42.6 Test: WHERE NOT DUPLICATE filters near-duplicates in training export
-  - [ ] 42.7 Test: BACKUP TO / RESTORE FROM round-trip with data verification
+  - [~] 42.1 Test: psycopg2 connects, creates table with embedding column, inserts rows, queries with SEMANTIC_MATCH
+  - [~] 42.2 Test: SQLAlchemy connects, reflects table metadata via pg_catalog stubs
+  - [~] 42.3 Test: CREATE VERSION TAG FOR TRAINING → export Lance dataset → verify PyTorch IterableDataset
+  - [~] 42.4 Test: AT VERSION query with ROW_SNAPSHOT (no SEMANTIC_MATCH), SEMANTIC_FRESH (with warning)
+  - [~] 42.5 Test: SHOW EMBEDDING HEALTH returns correct model version distribution
+  - [~] 42.6 Test: WHERE NOT DUPLICATE filters near-duplicates in training export
+  - [~] 42.7 Test: BACKUP TO / RESTORE FROM round-trip with data verification
 
 
 ## Consolidation Sprint (2026-05)

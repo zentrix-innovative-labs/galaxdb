@@ -2469,6 +2469,7 @@ dependencies = [
 name = "galaxdb-embedded"
 version = "0.1.0"
 dependencies = [
+ "arrow",
  "galaxdb-common",
  "galaxdb-io",
  "galaxdb-sidecar",
@@ -2476,6 +2477,7 @@ dependencies = [
  "galaxdb-storage",
  "galaxdb-vector",
  "galaxdb-versioning",
+ "lance",
  "sqlparser 0.50.0",
  "tempfile",
  "tokio",

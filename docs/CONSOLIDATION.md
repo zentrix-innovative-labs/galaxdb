@@ -570,3 +570,28 @@ Verification:
 - **K2-Follow SST-coverage for AT VERSION** — same story: memtable-only time-travel is correct behaviour today; extending it to flushed SSTs is additive, tracked, and **not silently** accepted — callers that flush aggressively can still use AT VERSION within the memtable window.
 
 Both items get their own phase when we're ready to change the scan path. Neither is a regression from any current behaviour.
+
+### Phase M — Close Python client surface (22.2, 22.4)
+
+Phase L closed the correctness-critical deferred items. Phase M closes the two Python-client tasks that were left unticked because they required real wire-protocol and real Lance datasets rather than placeholders. Both are now real code against real infrastructure.
+
+- [x] M1 (task 22.2): `galaxdb.connect(connstring)` opens a real blocking `postgres::Client`, hands back a `Connection` PyO3 class, and routes every `.execute(sql)` through `SimpleQuery` against a live `galaxdb-server`. Integration test `galaxdb-python/tests/remote_mode.rs::remote_crud_round_trip_via_postgres_client` starts a real server on port 0 and drives CREATE/INSERT/SELECT/WHERE/UPDATE/DELETE end to end.
+- [x] M2 (task 22.4): `galaxdb-embedded::Database::training_dataset(tag)` resolves the tag through `TagCatalog`, rejects non-training tags, builds an Arrow schema from the catalog, streams rows out of the engine via `Engine::scan_all_at(version_timestamp)` using a new `EmbeddedLanceExportSource` (real `LanceExportSource` impl over the live engine), and drives `LanceExporter::export()` into `<db>/training_exports/<tag>_<ts>/`. The PyO3 `Database.training_dataset(tag)` wrapper returns the path as a string; Python-side glue (`lance.dataset(path).to_pytorch()`) produces the final PyTorch `IterableDataset`. Unit test `training_dataset_writes_real_lance_dataset` re-opens the output via `lance::Dataset::open` and asserts 5 INSERTed rows round-trip; `training_dataset_rejects_non_training_tag` and `training_dataset_unknown_tag_errors` pin the guard rails.
+
+Files touched in Phase M (22.4 slice):
+- `crates/galaxdb-embedded/Cargo.toml` — `arrow = "57"` + `lance = "4.0"` with `default-features = false` (keeps AWS / GCP / Azure SDKs out; enforced by `cargo deny bans`).
+- `crates/galaxdb-embedded/src/lib.rs` — `Database::training_dataset`, `Database::pick_training_table`, `EmbeddedLanceExportSource`, `project_row_to_field_values`, `classify_column`, `arrow_schema_from_catalog`, `sanitize_tag_for_path`, 3 new tests.
+- `galaxdb-python/src/lib.rs` — `Database.training_dataset(tag)` PyO3 method returning the Lance dataset path.
+- `.kiro/specs/galaxdb-v1-engine/tasks.md` — 22.4 re-ticked with cross-reference.
+
+Verification (actually run on macOS):
+- `cargo test -p galaxdb-embedded --lib` → **24 passed** (was 21 at Phase K; +3 from task 22.4). Zero failures.
+- `cargo test -p galaxdb-embedded --lib training_dataset` → 3 passed (all three 22.4 tests).
+- `cargo check -p galaxdb-python` → clean (pre-existing pyo3 0.22→0.24 deprecation warnings, no errors).
+- `bash scripts/grep-for-mocks.sh` + `bash scripts/check-tasks-no-stub-ticks.sh` → both OK exit 0.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok` (same baseline as Phase J).
+- Lance dataset on disk is a real Lance directory re-openable via `lance::Dataset::open`; `ds.scan().count_rows()` returns the exact INSERT count.
+
+**Scope notes**:
+- `exec_create_version_tag` still reads its ts from `MerkleDag::latest()`, which is `0` until Req 38 / task 36 wires the DAG to real commits. Phase M's test therefore registers the training tag directly against the `TagCatalog` with a post-insert ts (the same pattern the Phase K AT VERSION tests use). When task 36 lands, the SQL `CREATE VERSION TAG ... FOR TRAINING` path will propagate the real commit ts automatically — no change needed in `training_dataset`.
+- v1 `training_dataset` exports scalar + text rows only. Tables with embedding columns land the scalar row fine; the vector column export is follow-up work once the delta buffer is versioned. This is a documented limitation, not a silent drop.

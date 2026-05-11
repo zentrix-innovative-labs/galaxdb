@@ -22,6 +22,15 @@ galaxdb-io = { path = "../galaxdb-io" }
 sqlparser.workspace = true
 tokio.workspace = true
 tracing = { workspace = true }
+# Arrow schema construction for `Database::training_dataset` (task 22.4).
+# MUST match the version `galaxdb-versioning` uses (Lance 4.0.1 ↔ Arrow 57).
+# If these drift, `Arc<ArrowSchema>` from here becomes incompatible with
+# the exporter's `LanceExporter::new` signature at compile time.
+arrow = "57"
+# Needed to open the dataset back in the unit test via `Dataset::open`.
+# Default features disabled to keep AWS/GCP/Azure SDKs out of the
+# dependency graph (Rule 5, enforced by the `cargo deny bans` gate).
+lance = { version = "4.0", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
