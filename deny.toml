@@ -65,6 +65,13 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "0BSD",
+    # Boost Software License — used by xxhash-rust. Permissive,
+    # Apache-2.0-compatible.
+    "BSL-1.0",
+    # Creative Commons / Linux Foundation CDLA-Permissive 2.0 — used
+    # by webpki-roots 0.26/1.0 (Mozilla's root store bundle). Compatible
+    # with everything we ship.
+    "CDLA-Permissive-2.0",
     # aes-gcm / rsa style
     "OpenSSL",
 ]
@@ -73,11 +80,35 @@ confidence-threshold = 0.8
 # human has to review. This is deliberate.
 
 [advisories]
-# Fail on any unmaintained crate or open security advisory.
+# Fail on any open security advisory that we can fix. The three
+# entries below are documented exceptions for transitive deps whose
+# upstream has not released a fix yet. Every new exception MUST have
+# a comment explaining which crate pulls the affected version, which
+# advisory is accepted, and the condition under which the exception
+# is removed.
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-# ignore = []  # Add specific RUSTSEC IDs here if a known advisory has a
-#              # documented mitigation in this workspace.
+ignore = [
+    # protobuf v2.28: uncontrolled recursion panic (RUSTSEC-2024-0437).
+    # Pulled in by `prometheus 0.13.4` (our metrics backend), which
+    # pins protobuf 2.x via its own Cargo.toml. The fix requires
+    # `prometheus 0.14+` using protobuf 3.7+ — not yet released at
+    # time of audit (2026-05-10). This affects metric serialization,
+    # not data path. Remove this ignore when `prometheus` ships a
+    # release that moves to `protobuf 3.7+`.
+    { id = "RUSTSEC-2024-0437", reason = "prometheus 0.13 transitively pins protobuf 2.x; metrics-path-only; tracked upstream" },
+    # paste v1.0.15: unmaintained (RUSTSEC-2024-0436). Pulled in by
+    # `datafusion-common 52` and `lance 4`. Proc-macro only, no
+    # runtime attack surface. Remove when datafusion 53+ moves off
+    # it.
+    { id = "RUSTSEC-2024-0436", reason = "proc-macro only, pulled by datafusion/lance, tracked upstream" },
+    # number_prefix v0.4.0: unmaintained (RUSTSEC-2025-0119). Pulled
+    # in by `indicatif 0.17` via `hf-hub` and `tokenizers`. Used only
+    # for pretty-printing progress bars during model download — no
+    # runtime data-path exposure. Remove when `indicatif 0.18+` drops
+    # the dep (already in flight upstream).
+    { id = "RUSTSEC-2025-0119", reason = "CLI progress-bar formatting only; pulled by hf-hub/tokenizers; tracked upstream" },
+]
 
 [sources]
 unknown-registry = "warn"

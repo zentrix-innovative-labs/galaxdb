@@ -482,3 +482,29 @@ Files touched in Phase I:
 - `crates/galaxdb-server/src/lib.rs` — new. `ServerConfig` + `start()` that returns `(SocketAddr, JoinHandle)` for test drivers.
 - `crates/galaxdb-server/src/main.rs` — reduced to a thin CLI over `galaxdb_server::start`.
 - `crates/galaxdb-server/tests/wire_integration.rs` — new. 2 tests.
+
+### Phase J — Audit `cargo deny` + close real H2 gaps
+
+When the user asked "is everything in the consolidation doc actually fixed," a real audit surfaced four gate failures that Phase H had declared "done" without actually running the gate locally. The lesson is the same as Phase I's: ticking a box on desk-checked infrastructure is not the same as ticking it on verified-green infrastructure.
+
+- [x] J1: `cargo deny check bans` had never been run locally. It caught transitively pulled `aws-sdk-sso`, `aws-sdk-ssooidc`, `aws-sdk-sts`, `aws-config` via `lance 4.0.1 → lance-io → object_store_opendal`. Fix: set `lance = { version = "4.0", default-features = false }` in `crates/galaxdb-versioning/Cargo.toml` to drop the `aws`/`azure`/`gcp`/`oss`/`huggingface`/`tencent`/`geo` default features. Result: zero AWS SDK crates in the dep graph now.
+- [x] J2: `cargo deny check licenses` failed on two workspace members that had no `license` field (`galaxdb-benchmarks`, `galaxdb-chaos-tests`) plus two transitive licenses missing from the allowlist (`BSL-1.0` used by `xxhash-rust`, `CDLA-Permissive-2.0` used by `webpki-roots`). Fix: added `license = "Apache-2.0", publish = false` to both internal crates, appended the two permissive licenses to `deny.toml` with comments explaining their provenance.
+- [x] J3: `cargo deny check advisories` flagged `pyo3 0.22.6` (`RUSTSEC-2025-0020`, `PyString::from_object` nul-byte leak). Bumped workspace dep to `pyo3 = "0.24"` (Cargo.lock → 0.24.2). Workspace builds clean; only deprecation warnings in `galaxdb-python` source on 0.22-era APIs, no errors, no test regressions.
+- [x] J4: Three residual unfixable transitive advisories documented as explicit ignores in `deny.toml` with comments — `RUSTSEC-2024-0437` (`protobuf 2.28` pinned by `prometheus 0.13`), `RUSTSEC-2024-0436` (`paste 1.0` — proc-macro only, pulled by `datafusion` / `lance`), `RUSTSEC-2025-0119` (`number_prefix` — CLI progress-bar formatting, pulled by `indicatif` via `hf-hub` / `tokenizers`). Each ignore carries the specific upstream condition under which the exception is removed. No silent exceptions.
+- [x] J5: Installed `cargo-deny 0.19.5` locally so gate runs are part of routine development, not just CI. `scripts/check-tasks-no-stub-ticks.sh` and `scripts/grep-for-mocks.sh` both still green.
+
+**Verification** (actually run on macOS, 2026-05-10):
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+- `cargo tree --workspace -e normal | grep -E 'aws-sdk|aws-config|google-cloud|gcloud-sdk|azure_'` → 0 matches.
+- `cargo check --workspace --all-targets` → clean (4 `galaxdb-python` deprecation warnings, no errors).
+- `cargo test --workspace --exclude galaxdb-python --lib` → 684 tests pass across 11 crates. Same as Phase I baseline.
+- `bash scripts/grep-for-mocks.sh` + `bash scripts/check-tasks-no-stub-ticks.sh` → both OK exit 0.
+
+Files touched in Phase J:
+- `crates/galaxdb-versioning/Cargo.toml` — Lance `default-features = false` + comment explaining the vendor-lock-in rule.
+- `benchmarks/Cargo.toml` — `license = "Apache-2.0"` + `publish = false`.
+- `tests/chaos/Cargo.toml` — same.
+- `Cargo.toml` — pyo3 bumped to `"0.24"` with a comment citing RUSTSEC-2025-0020.
+- `galaxdb-python/Cargo.toml` — mirrored pyo3 bump.
+- `deny.toml` — added `BSL-1.0`, `CDLA-Permissive-2.0` to licenses; added three documented RUSTSEC ignores with justification and upstream-fix conditions.
+- `Cargo.lock` — regenerated via `cargo update -p pyo3 -p protobuf`.

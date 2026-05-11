@@ -83,8 +83,10 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # Testing utilities
 tempfile = "3"
 
-# Python FFI
-pyo3 = { version = "0.22", features = ["extension-module"] }
+# Python FFI. Bumped from 0.22 → 0.24 to close RUSTSEC-2025-0020
+# (PyString::from_object overread). Phase H advisories gate fails
+# on anything < 0.24.1.
+pyo3 = { version = "0.24", features = ["extension-module"] }
 
 # SQL parsing
 sqlparser = { version = "0.50", features = ["visitor"] }
