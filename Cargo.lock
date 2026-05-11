@@ -2479,6 +2479,7 @@ dependencies = [
  "sqlparser 0.50.0",
  "tempfile",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

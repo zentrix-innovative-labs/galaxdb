@@ -40,7 +40,7 @@ use galaxdb_sidecar::protocol::EmbedRequest;
 use galaxdb_storage::engine::Engine;
 use galaxdb_versioning::{MerkleDag, MinHashDedup, TagCatalog, SIGNATURE_BYTES};
 
-use crate::ast::SemanticMatchExpr;
+use crate::ast::{AtVersionExpr, ConsistencyMode, SemanticMatchExpr, VersionRef};
 use crate::planner::*;
 use crate::row_codec;
 
@@ -110,6 +110,29 @@ pub trait VectorSearchBackend: Send + Sync {
         k: usize,
         filter: &FilterExpr,
     ) -> GalaxResult<Vec<VectorSearchResult>>;
+
+    /// Record a row deletion in the vector-index side of the world.
+    ///
+    /// When the SQL executor deletes a row from a table that carries an
+    /// embedding column, it must also tell the vector backend so the
+    /// delta buffer tombstones the row id and future SEMANTIC_MATCH
+    /// queries stop returning it. The backend is responsible for
+    /// writing the `DELTA_TOMBSTONE` WAL record (so the tombstone
+    /// survives crash recovery) and for updating the in-memory delta
+    /// buffer.
+    ///
+    /// `row_key` is the raw primary-key bytes as stored in the engine
+    /// (identical to what `Engine::delete_sync` receives), NOT a
+    /// synthetic `row_id`. The backend is free to hash this to its
+    /// internal vector-row-id space.
+    ///
+    /// Default implementation is a no-op so backends that don't need
+    /// per-delete notification (e.g. a test stub) don't have to
+    /// implement this. Any backend that manages a real delta buffer
+    /// MUST override.
+    fn on_row_deleted(&self, _table: &str, _row_key: &[u8]) -> GalaxResult<()> {
+        Ok(())
+    }
 }
 
 /// Catalog entry for a table.
@@ -404,6 +427,13 @@ pub fn execute_with_context(
             columns,
         } => exec_full_scan(table, columns, filter.as_ref(), ctx),
 
+        QueryPlan::FullScanAtVersion {
+            table,
+            filter,
+            columns,
+            at,
+        } => exec_full_scan_at_version(table, columns, filter.as_ref(), at, ctx),
+
         QueryPlan::PointLookup { table, key } => exec_point_lookup(table, key, ctx),
 
         QueryPlan::Analyze { table } => exec_analyze(table, ctx),
@@ -622,9 +652,9 @@ fn exec_delete(
     filter: &Option<FilterExpr>,
     ctx: &mut ExecutorContext,
 ) -> GalaxResult<ExecuteResult> {
-    if !ctx.catalog.table_exists(table) {
+    let Some(table_entry) = ctx.catalog.get_table(table).cloned() else {
         return Err(GalaxError::TableNotFound(table.to_string()));
-    }
+    };
 
     // Collect the keys first so we don't mutate storage while scanning.
     let mut doomed: Vec<Vec<u8>> = Vec::new();
@@ -643,8 +673,8 @@ fn exec_delete(
     }
 
     let mut deleted = 0u64;
-    for key in doomed {
-        match ctx.engine.delete_sync(&key) {
+    for key in &doomed {
+        match ctx.engine.delete_sync(key) {
             Ok(true) => deleted += 1,
             Ok(false) => {} // already gone
             Err(e) => {
@@ -653,6 +683,33 @@ fn exec_delete(
                     e
                 )));
             }
+        }
+    }
+
+    // Task 18.6: when the deleted row carried an embedding column, tell
+    // the vector backend so it tombstones the row in its delta buffer
+    // and emits the DELTA_TOMBSTONE WAL record. Missing the backend is
+    // tolerated (the caller may be in pure-SQL mode) but is logged so
+    // operators notice the drift.
+    if deleted > 0 && table_entry.has_embedding {
+        if let Some(backend) = ctx.vector_backend.as_ref() {
+            for key in &doomed {
+                if let Err(e) = backend.on_row_deleted(table, key) {
+                    tracing::warn!(
+                        table = %table,
+                        error = %e,
+                        "vector backend on_row_deleted failed",
+                    );
+                }
+            }
+        } else {
+            tracing::warn!(
+                table = %table,
+                deleted = deleted,
+                "deleted rows from table with embedding column but no vector \
+                 backend is attached; DELTA_TOMBSTONE records were NOT written. \
+                 Future SEMANTIC_MATCH queries may still surface the tombstoned rows.",
+            );
         }
     }
 
@@ -685,6 +742,105 @@ fn exec_full_scan(
     let mut rows: Vec<Row> = Vec::new();
 
     for (key, value_bytes) in ctx.engine.scan_all() {
+        if !String::from_utf8_lossy(&key).starts_with(&prefix) {
+            continue;
+        }
+        let cols = row_codec::decode_row(&value_bytes);
+        if let Some(f) = filter {
+            if !row_codec::filter_matches(&cols, f) {
+                continue;
+            }
+        }
+        let projected: Vec<(String, Value)> = project
+            .iter()
+            .map(|name| {
+                let v = cols
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.clone())
+                    .unwrap_or(Value::Null);
+                (name.clone(), v)
+            })
+            .collect();
+        rows.push(Row { columns: projected });
+    }
+
+    Ok(ExecuteResult::Rows {
+        columns: project,
+        rows,
+    })
+}
+
+/// Execute a `SELECT … AT VERSION <ref> [CONSISTENCY <mode>]` plan.
+///
+/// Semantics (task 32.3 / 32.4 / 32.6):
+///
+/// 1. Resolve the version reference to a commit timestamp:
+///    * `AT VERSION <u64>` → that timestamp directly.
+///    * `AT VERSION '<tag>'` → look up the tag in the
+///      [`TagCatalog`] and use its pinned `version_timestamp`.
+/// 2. Walk each key's MVCC chain in the storage engine and return the
+///    version whose `commit_timestamp <= read_ts` (tombstones honoured).
+/// 3. Apply the WHERE filter and column projection as in a normal scan.
+/// 4. If the caller asked for `CONSISTENCY 'SEMANTIC_FRESH'` we do
+///    not actually embed anything here (SEMANTIC_MATCH is a separate
+///    plan arm); the consistency mode is stored on the plan so the
+///    caller can attach the warning if they compose AT VERSION with a
+///    semantic match in a hybrid plan. In plain SELECT form the mode
+///    is a no-op with a logged breadcrumb, not a silent discard.
+fn exec_full_scan_at_version(
+    table: &str,
+    columns: &[String],
+    filter: Option<&FilterExpr>,
+    at: &AtVersionExpr,
+    ctx: &mut ExecutorContext,
+) -> GalaxResult<ExecuteResult> {
+    let table_entry = ctx
+        .catalog
+        .get_table(table)
+        .cloned()
+        .ok_or_else(|| GalaxError::TableNotFound(table.to_string()))?;
+
+    // Resolve the target read timestamp.
+    let read_ts: u64 = match &at.version {
+        VersionRef::Timestamp(ts) => *ts,
+        VersionRef::Tag(name) => {
+            let Some(tag_catalog) = ctx.tag_catalog.as_ref() else {
+                return Err(GalaxError::NotYetAvailable {
+                    task: "33",
+                    feature: "AT VERSION '<tag>' requires a configured tag catalog",
+                });
+            };
+            let tc = tag_catalog
+                .lock()
+                .map_err(|_| GalaxError::Internal("tag catalog mutex poisoned".into()))?;
+            tc.get_tag(name)
+                .map(|t| t.version_timestamp)
+                .ok_or_else(|| GalaxError::Internal(format!("unknown version tag: {name}")))?
+        }
+    };
+
+    // The SEMANTIC_FRESH flag would only fire if AT VERSION were composed
+    // with a SEMANTIC_MATCH predicate; at this plan arm the filter is a
+    // plain WHERE, so a semantic consistency hint is informational.
+    if matches!(at.consistency, Some(ConsistencyMode::SemanticFresh)) {
+        tracing::debug!(
+            table = %table,
+            "AT VERSION with CONSISTENCY 'SEMANTIC_FRESH' on a non-semantic \
+             SELECT — no re-embedding required; warning is a no-op at this arm.",
+        );
+    }
+
+    let project: Vec<String> = if columns.is_empty() {
+        table_entry.columns.iter().map(|c| c.name.clone()).collect()
+    } else {
+        columns.to_vec()
+    };
+
+    let prefix = format!("{}:", table);
+    let mut rows: Vec<Row> = Vec::new();
+
+    for (key, value_bytes, _row_ts) in ctx.engine.scan_all_at(read_ts) {
         if !String::from_utf8_lossy(&key).starts_with(&prefix) {
             continue;
         }
@@ -1174,6 +1330,16 @@ pub fn execute_legacy(plan: &QueryPlan, catalog: &mut Catalog) -> ExecuteResult 
             } else {
                 ExecuteResult::Error(
                     "SEMANTIC_MATCH + filter requires a vector backend; use execute_with_context"
+                        .to_string(),
+                )
+            }
+        }
+        QueryPlan::FullScanAtVersion { table, .. } => {
+            if !catalog.table_exists(table) {
+                ExecuteResult::Error(format!("table not found: {}", table))
+            } else {
+                ExecuteResult::Error(
+                    "AT VERSION queries require a storage engine; use execute_with_context"
                         .to_string(),
                 )
             }

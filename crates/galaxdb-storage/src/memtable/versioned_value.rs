@@ -61,6 +61,28 @@ impl VersionedValue {
         self.timestamp
     }
 
+    /// Like [`get_at`](Self::get_at), but also returns the commit
+    /// timestamp of the version that was resolved. Used by the
+    /// storage engine's AT VERSION scan to enrich result metadata
+    /// with the real version that satisfied the query.
+    ///
+    /// Returns:
+    /// * `Some((Some(bytes), ts))` — live value at version `ts`
+    /// * `Some((None, ts))` — tombstone at version `ts`
+    /// * `None` — no version at or before `read_ts`
+    pub fn get_at_with_ts(&self, read_ts: u64) -> Option<(Option<Vec<u8>>, u64)> {
+        let mut current = self;
+        loop {
+            if current.timestamp <= read_ts {
+                return Some((current.value.clone(), current.timestamp));
+            }
+            match &current.prev {
+                Some(prev) => current = prev,
+                None => return None,
+            }
+        }
+    }
+
     /// Returns the number of versions in this chain.
     pub fn chain_length(&self) -> usize {
         let mut count = 1;

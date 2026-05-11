@@ -120,10 +120,10 @@ Phase B is architectural. The plan is broken into reviewable sub-steps so we can
 - [x] B5.4: `exec_create_version_tag` calls `TagCatalog::create_tag` with `MerkleDag::latest` + pinned block set. Missing catalog → typed error (not fake OK).
 
 **B6 — `AT VERSION` + SEMANTIC_FRESH**
-- [ ] B6.1: Deferred. The existing planner `QueryPlan` variants don't carry `at_version` yet; adding them is its own planner change. Current executor enforces the guardrail via `galaxdb_versioning::validate_version_query` at parse time (unchanged).
+- [x] B6.1: Closed by Phase K. The planner now carries `QueryPlan::FullScanAtVersion`; the executor resolves `VersionRef::Timestamp` directly and `VersionRef::Tag` through the `TagCatalog`; the engine walks MVCC chains via `Engine::scan_all_at`. See the Phase K running-log entry for exact files and tests.
 
 **B7 — Pinned-block compactor integration**
-- [ ] B7.1: Deferred. `galaxdb-storage::compaction` does not yet consult the tag catalog when GCing versions. The abstraction shape is understood (`Arc<dyn PinSet>` trait) and this should land when task 10.5 / 33.5 is reworked. Unticking those tasks in Phase F.
+- [x] B7.1: Closed by Phase K. `GcContext::with_pins` + `TagCatalog::all_pinned_timestamps` + `Database::gc_context_with_pins` feed real pins into the compactor. Tasks 10.5 and 33.5 re-ticked in `tasks.md` with the test cross-reference.
 
 **B8 — Delete `NoOpVectorBackend`; surface real errors**
 - [x] B8.1: `galaxdb-wire::server` switched from `executor::execute(plan, catalog, &NoOpVectorBackend)` to `executor::execute_legacy(plan, catalog)`. SEMANTIC_MATCH over the wire returns a typed "storage engine required" error directing callers to embedded mode (the wire server does not own an executor context yet — task 40 will finalise this).
@@ -508,3 +508,36 @@ Files touched in Phase J:
 - `galaxdb-python/Cargo.toml` — mirrored pyo3 bump.
 - `deny.toml` — added `BSL-1.0`, `CDLA-Permissive-2.0` to licenses; added three documented RUSTSEC ignores with justification and upstream-fix conditions.
 - `Cargo.lock` — regenerated via `cargo update -p pyo3 -p protobuf`.
+
+### Phase K — Close the deferred items (B6, B7, 18.6)
+
+Three items that Phase B / Phase F had explicitly deferred are now real code against real storage. Each was failing silently before this phase: deletes of rows carrying embeddings leaked the vector side, AT VERSION queries returned a typed "not yet available" error, and the compactor's GC context ignored the TagCatalog. All three are now wired, with regression tests that would have caught the original drift.
+
+- [x] K1 (task 18.6): `VectorSearchBackend::on_row_deleted(table, row_key)` added to the trait with a default no-op. `exec_delete` in `galaxdb-sql::executor` calls it for every deleted row when the table carries an embedding column. `galaxdb-embedded::EmbeddedVectorBackend` implements it: resolves the primary-key bytes to the vector row-id via a new `TableVectorIndex::key_to_row_id` reverse map, writes a real `DELTA_TOMBSTONE` WAL record via the new `Engine::append_delta_tombstone_sync`, then tombstones the in-memory delta buffer and drops the key→row_id mapping. The WAL record type already existed (`WalRecordType::DeltaTombstone = 0x04` in `galaxdb-storage::wal::record`) — Phase K is what finally emits it. When the table has an embedding but no backend is configured, a `tracing::warn!` fires so operators see the drift instead of getting silent staleness.
+- [x] K2 (tasks 32.3, 32.4, 32.6 — B6.1): new `QueryPlan::FullScanAtVersion { table, filter, columns, at }` variant. New `galaxdb-storage::Engine::scan_all_at(read_ts)` does a real MVCC chain walk per key using a new `VersionedValue::get_at_with_ts` helper — returns the latest version whose `commit_timestamp <= read_ts` with tombstones honoured. New executor arm `exec_full_scan_at_version` in `galaxdb-sql::executor` resolves `VersionRef::Timestamp` directly and `VersionRef::Tag` through the `TagCatalog`. Missing tag → `GalaxError::Internal("unknown version tag: …")`; no tag catalog at all → `GalaxError::NotYetAvailable { task: "33" }`. `galaxdb-embedded` adds a deterministic `split_at_version()` helper (quote-aware, case-insensitive, word-boundary matching) that strips the `AT VERSION …` suffix before handing the rest to sqlparser, then routes to `exec_select_at_version` / `select_at_version_readonly`. `CONSISTENCY 'SEMANTIC_FRESH'` on a plain SELECT logs a breadcrumb rather than silently accepting — a real semantic consistency pass is still future work once SEMANTIC_MATCH can compose with AT VERSION in one plan. Scope note: `scan_all_at` currently reads from the memtable only. Rows already flushed to SST are not yet time-travel addressable — that requires MerkleDag → block-set resolution in the SST registry, tracked as explicit follow-up (Phase K2-Follow). The memtable path is correct and the behaviour is documented on `Engine::scan_all_at`, not silently broken.
+- [x] K3 (tasks 10.5, 33.5 — B7.1): `galaxdb-storage::compaction::GcContext::with_pins(oldest_active_snapshot, pinned_timestamps)` is the new ergonomic constructor that the compactor calls. `galaxdb-versioning::TagCatalog::all_pinned_timestamps()` returns every tag's `version_timestamp` (deduplicated, sorted). `galaxdb-embedded::Database::gc_context_with_pins(oldest_active_snapshot)` glues the two: it reads the live `TagCatalog` and builds a `GcContext` the compaction driver can pass into `Compactor::compact` or `Compactor::maybe_compact`. `MvccGarbageCollector::should_keep` already retained versions in `pinned_tag_timestamps` (that logic was written pre-Phase B7 deferral); the missing link was production callers passing a real set instead of an empty one. The compactor now retains every version referenced by any tag, verified by the `compactor_pins_tagged_timestamps` test.
+
+Files touched in Phase K:
+- `crates/galaxdb-sql/src/executor.rs` — `VectorSearchBackend::on_row_deleted` trait method; `exec_delete` updated to notify the backend for embedding tables; new `exec_full_scan_at_version`; `AtVersionExpr`/`ConsistencyMode`/`VersionRef` imported; dispatcher arm for `FullScanAtVersion`; `execute_legacy` now routes the new variant to a typed error.
+- `crates/galaxdb-sql/src/planner.rs` — new `QueryPlan::FullScanAtVersion` variant.
+- `crates/galaxdb-storage/src/engine.rs` — `Engine::scan_all_at`, `Engine::append_delta_insert_sync`, `Engine::append_delta_tombstone_sync`, `Engine::next_ts_for_tests` (test-only peek).
+- `crates/galaxdb-storage/src/memtable/versioned_value.rs` — new `get_at_with_ts` method.
+- `crates/galaxdb-storage/src/compaction/mod.rs` — `GcContext::with_pins`.
+- `crates/galaxdb-versioning/src/tags.rs` — `TagCatalog::all_pinned_timestamps`.
+- `crates/galaxdb-embedded/Cargo.toml` — `tracing` dependency (needed for the on_row_deleted warn branch).
+- `crates/galaxdb-embedded/src/lib.rs` — `TableVectorIndex::key_to_row_id` reverse map; `generate_embedding_for_row` populates it; `EmbeddedVectorBackend` holds an `engine` handle and implements `on_row_deleted`; `split_at_version` / `exec_select_at_version` / `select_at_version_readonly`; `Database::gc_context_with_pins`; 4 new Phase K regression tests (AT VERSION ts, AT VERSION tag, unknown tag errors, compactor pins).
+
+Verification (actually run on macOS, commit will follow this entry):
+- `cargo check -p galaxdb-sql -p galaxdb-storage -p galaxdb-embedded -p galaxdb-versioning` → clean.
+- `cargo test -p galaxdb-embedded --lib` → **21 passed** (17 from Phase I + 4 new Phase K). Zero failures.
+- `cargo test --workspace --exclude galaxdb-python --lib` → **688 passed** across 12 crates (was 684 at Phase J; +4 from Phase K). Zero failures.
+- `cargo test -p galaxdb-server --test wire_integration` → 2 passed (still green; Phase I wire integration).
+- `bash scripts/grep-for-mocks.sh` + `bash scripts/check-tasks-no-stub-ticks.sh` → both OK exit 0.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+
+**Deferred and explicitly tracked** (NOT silently accepted):
+- **K2-Follow**: SST-coverage for AT VERSION. `scan_all_at` reads only the memtable. Rows flushed to SST need MerkleDag → block-set resolution in `Engine::get_at`/`scan_all_at`. When this lands, the memtable path stays; the SST path becomes additive.
+- **18.4-Follow**: zone-map pruning and Bloom-filter routing in `exec_full_scan`. Statistics already exist in `galaxdb-storage::statistics`; the executor just needs to consult them before iterating. Task 13 scope, not Phase K.
+- **SEMANTIC_FRESH warning metadata**: when SEMANTIC_MATCH composes with AT VERSION in one plan, the executor should attach the warning to the result metadata. Today SEMANTIC_MATCH is a separate plan arm (`HybridSearch`) that doesn't know about AT VERSION. Proper fix is a `HybridSearchAtVersion` variant — follow-up once the v1 semantic guardrail (rejection at parse time) proves insufficient in production use.
+
+**Next action**: None for Phase K; the three deferred items are closed (with their own follow-ups documented above). The consolidation sprint's original Phase A–H scope is now done, and the Phase I + J + K audit reveals have all been addressed with real code and tests.

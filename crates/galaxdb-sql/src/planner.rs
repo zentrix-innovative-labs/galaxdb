@@ -18,6 +18,22 @@ pub enum QueryPlan {
         filter: Option<FilterExpr>,
         columns: Vec<String>,
     },
+    /// Time-travel scan: a FullScan constrained to rows whose
+    /// `commit_timestamp` is visible at the resolved version
+    /// (timestamp or named tag). The `at` field carries the parsed
+    /// `AT VERSION ...` fragment from the SQL.
+    ///
+    /// SEMANTIC_MATCH combined with `AT VERSION` is rejected at parse
+    /// time unless the caller explicitly passes `CONSISTENCY
+    /// 'SEMANTIC_FRESH'`, in which case the plan also carries the
+    /// consistency mode so the executor can emit the SEMANTIC_FRESH
+    /// warning in the result metadata (task 32.6).
+    FullScanAtVersion {
+        table: String,
+        filter: Option<FilterExpr>,
+        columns: Vec<String>,
+        at: AtVersionExpr,
+    },
     /// Semantic vector search.
     SemanticSearch {
         table: String,

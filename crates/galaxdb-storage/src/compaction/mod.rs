@@ -361,6 +361,32 @@ impl GcContext {
         }
     }
 
+    /// Build a GC context that pins every timestamp currently
+    /// referenced by a version tag (task 33.5 / 10.5). The tag
+    /// catalog records each tag's `version_timestamp`; compactor
+    /// callers pass the full set here so MVCC garbage collection
+    /// retains any row version that tagged snapshots depend on.
+    ///
+    /// `pinned_timestamps` is typically produced by iterating a
+    /// `galaxdb_versioning::TagCatalog::list_tags()` result and
+    /// collecting each tag's `version_timestamp`. Passed as a plain
+    /// slice so the `galaxdb-storage` crate does not take a
+    /// dependency on `galaxdb-versioning` (cycle avoidance).
+    ///
+    /// `oldest_active_snapshot` comes from the MVCC transaction
+    /// manager. When `None`, only pinned versions are retained;
+    /// otherwise versions `>= oldest_active_snapshot` are also
+    /// retained for in-flight readers.
+    pub fn with_pins(
+        oldest_active_snapshot: Option<Timestamp>,
+        pinned_timestamps: impl IntoIterator<Item = Timestamp>,
+    ) -> Self {
+        Self {
+            oldest_active_snapshot,
+            pinned_tag_timestamps: pinned_timestamps.into_iter().collect(),
+        }
+    }
+
     /// Determines whether a specific version should be kept.
     ///
     /// A version is kept if:

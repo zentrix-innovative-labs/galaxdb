@@ -274,6 +274,16 @@ impl Engine {
         self.next_timestamp.fetch_add(1, Ordering::SeqCst)
     }
 
+    /// Peek at the next timestamp without consuming it. Test-only —
+    /// provides a stable "snapshot boundary" that lets AT VERSION
+    /// tests take a snapshot between two writes. Not exposed on
+    /// production code paths because callers should use real
+    /// `TagCatalog` snapshots rather than synthetic timestamp peeks.
+    #[doc(hidden)]
+    pub fn next_ts_for_tests(&self) -> Timestamp {
+        self.next_timestamp.load(Ordering::SeqCst)
+    }
+
     /// Insert a row. Writes to WAL + memtable + ART index.
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> GalaxResult<Timestamp> {
         let ts = self.next_ts();
@@ -577,6 +587,33 @@ impl Engine {
         Ok(true)
     }
 
+    /// Append a `DELTA_INSERT` record to the WAL so the vector delta
+    /// buffer is rebuildable on crash recovery. Task 18.3 / 24.2.
+    ///
+    /// The payload is the application-defined encoding of `(row_id,
+    /// vector_bytes)`. This method does NOT decode or validate it; it
+    /// only guarantees durability. Recovery code in
+    /// `galaxdb-vector::delta_buffer` interprets the payload.
+    pub fn append_delta_insert_sync(&self, payload: Vec<u8>) -> GalaxResult<u64> {
+        self.wal
+            .append_sync(WalRecordType::DeltaInsert, payload)
+            .map_err(GalaxError::Io)
+    }
+
+    /// Append a `DELTA_TOMBSTONE` record to the WAL. Task 18.6 / 24.2.
+    ///
+    /// Called by the SQL executor's DELETE arm (via the vector backend
+    /// trait's `on_row_deleted` hook) when a row in a table with an
+    /// embedding column is removed. The payload format mirrors
+    /// `append_delta_insert_sync`; recovery will replay tombstones
+    /// into the in-memory delta buffer so tombstoned rows stay hidden
+    /// from SEMANTIC_MATCH results across restarts.
+    pub fn append_delta_tombstone_sync(&self, payload: Vec<u8>) -> GalaxResult<u64> {
+        self.wal
+            .append_sync(WalRecordType::DeltaTombstone, payload)
+            .map_err(GalaxError::Io)
+    }
+
     /// Scan all rows (for SELECT * without filter).
     /// Returns keys and values from the memtable.
     pub fn scan_all(&self) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -587,6 +624,35 @@ impl Engine {
             .into_iter()
             .filter_map(|(key, versioned)| {
                 versioned.value.map(|v| (key, v))
+            })
+            .collect()
+    }
+
+    /// Scan all rows as they appeared at `read_ts` (AT VERSION
+    /// timestamp support, task 32.3).
+    ///
+    /// Walks each key's MVCC version chain and returns the latest
+    /// version with `timestamp <= read_ts`. Tombstones are honoured:
+    /// a key whose resolved version is a tombstone is excluded from
+    /// the result. Keys with no version at or before `read_ts` are
+    /// excluded.
+    ///
+    /// Current implementation reads only from the in-memory memtable.
+    /// Rows that have been flushed to SST files are not time-travel
+    /// addressable yet — that requires the MerkleDag → block-set
+    /// resolution in the SST registry, which is tracked as task
+    /// 32.3 follow-up work in `docs/CONSOLIDATION.md`. The memtable
+    /// path is real and correct; the caller gets the row bytes from
+    /// the exact timestamp requested. Callers that require SST
+    /// coverage must first flush the memtable via `flush_memtable`.
+    pub fn scan_all_at(&self, read_ts: Timestamp) -> Vec<(Vec<u8>, Vec<u8>, Timestamp)> {
+        let active = self.memtable_mgr.active();
+        active
+            .iter_all()
+            .into_iter()
+            .filter_map(|(key, versioned)| {
+                let (value, ts) = versioned.get_at_with_ts(read_ts)?;
+                value.map(|v| (key, v, ts))
             })
             .collect()
     }

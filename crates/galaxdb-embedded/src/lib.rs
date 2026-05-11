@@ -85,6 +85,13 @@ struct TableVectorIndex {
     next_row_id: u64,
     /// Row-id → vector (for re-ranking).
     vectors: HashMap<u64, Vec<f32>>,
+    /// Primary-key bytes → vector row-id. Populated when the sidecar
+    /// returns an embedding for a newly inserted row; consumed by
+    /// `on_row_deleted` so we know which vector row to tombstone when
+    /// the user issues `DELETE FROM t WHERE ...`. Without this map,
+    /// SQL-level DELETEs would leave orphaned vectors in the HNSW
+    /// graph (task 18.6 hole surfaced during the Phase I audit).
+    key_to_row_id: HashMap<Vec<u8>, u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -194,6 +201,15 @@ impl Database {
     /// Synchronous execute — for embedded Rust callers and the Python
     /// FFI.
     pub fn execute(&mut self, sql: &str) -> GalaxResult<QueryResult> {
+        // AT VERSION intercept: sqlparser doesn't understand the
+        // AuroraSQL `AT VERSION ...` suffix, so if we see one on a
+        // SELECT we split the SQL into (stripped, at_version) and
+        // dispatch to the versioned plan arm directly. See task 32.3 /
+        // 32.4 in docs/CONSOLIDATION.md.
+        if let Some((stripped, at)) = split_at_version(sql)? {
+            return self.exec_select_at_version(&stripped, at);
+        }
+
         let stmts = parser::parse(sql)?;
         let mut last = QueryResult::Ok("OK".to_string());
         for stmt in &stmts {
@@ -213,6 +229,12 @@ impl Database {
     /// callers holding the database behind an `RwLock` that want to
     /// allow concurrent reads.
     pub fn execute_readonly(&self, sql: &str) -> GalaxResult<QueryResult> {
+        // AT VERSION on the read path: same intercept as `execute`, but
+        // we don't need `&mut self` because the plan only scans storage.
+        if let Some((stripped, at)) = split_at_version(sql)? {
+            return self.select_at_version_readonly(&stripped, at);
+        }
+
         let stmts = parser::parse(sql)?;
         let mut last = QueryResult::Ok("OK".to_string());
         for stmt in &stmts {
@@ -278,6 +300,7 @@ impl Database {
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
             sidecar: self.sidecar.clone(),
             indexes: self.vector_indexes.clone(),
+            engine: self.engine.clone(),
         }));
         let res = execute_with_context(&plan, &mut ctx)?;
         Ok(query_result_from(res))
@@ -408,6 +431,7 @@ impl Database {
                         source_column: col.name.clone(),
                         next_row_id: 0,
                         vectors: HashMap::new(),
+                        key_to_row_id: HashMap::new(),
                     };
                     self.vector_indexes
                         .write()
@@ -498,6 +522,27 @@ impl Database {
         let text = text.clone();
         drop(indexes);
 
+        // Compute the storage primary key for this row so we can
+        // remember the mapping `primary_key -> vector_row_id`. SQL
+        // DELETEs later use this to tombstone the right delta-buffer
+        // entry (task 18.6). Failure to build the key is non-fatal —
+        // the row still gets embedded, it just can't be reverse-mapped
+        // later. We log at warn level so operators see the drift.
+        let row_key = match row_codec::align_values(entry, column_names, values)
+            .and_then(|ordered| row_codec::build_primary_key(table, entry, &ordered))
+        {
+            Ok(k) => Some(k),
+            Err(e) => {
+                tracing::warn!(
+                    table = %table,
+                    error = %e,
+                    "could not compute primary key for embedding row; \
+                     DELETE of this row will not tombstone its vector",
+                );
+                None
+            }
+        };
+
         let row_id = {
             let mut indexes = self.vector_indexes.write().unwrap();
             let Some(mut_idx) = indexes.get_mut(table) else {
@@ -518,6 +563,9 @@ impl Database {
             if let Some(mut_idx) = indexes.get_mut(table) {
                 mut_idx.delta.insert(row_id, response.embedding.clone());
                 mut_idx.vectors.insert(row_id, response.embedding);
+                if let Some(key) = row_key {
+                    mut_idx.key_to_row_id.insert(key, row_id);
+                }
             }
         }
     }
@@ -533,6 +581,97 @@ impl Database {
         let mut ctx = self.context();
         let res = execute_with_context(&plan, &mut ctx)?;
         self.catalog = std::mem::take(&mut ctx.catalog);
+        Ok(query_result_from(res))
+    }
+
+    /// Dispatch a `SELECT ... AT VERSION <ref> [CONSISTENCY <mode>]`
+    /// query to the canonical executor. The SQL text passed in has
+    /// already had the AT VERSION suffix stripped by
+    /// [`split_at_version`]; we parse the remainder as a normal
+    /// SELECT so we can reuse `extract_projection_and_filter`, then
+    /// build a `FullScanAtVersion` plan.
+    fn exec_select_at_version(
+        &mut self,
+        stripped_sql: &str,
+        at: galaxdb_sql::ast::AtVersionExpr,
+    ) -> GalaxResult<QueryResult> {
+        let stmts = parser::parse(stripped_sql)?;
+        let Some(stmt) = stmts.first() else {
+            return Err(GalaxError::Internal(
+                "AT VERSION: SELECT body parsed to zero statements".into(),
+            ));
+        };
+        let AuroraStatement::Standard(boxed) = stmt else {
+            return Err(GalaxError::Internal(
+                "AT VERSION is only supported on SELECT statements".into(),
+            ));
+        };
+        let sqlparser::ast::Statement::Query(q) = boxed.as_ref() else {
+            return Err(GalaxError::Internal(
+                "AT VERSION is only supported on SELECT statements".into(),
+            ));
+        };
+
+        let table = extract_table(q);
+        let (columns, filter) = extract_projection_and_filter(q);
+        let plan = QueryPlan::FullScanAtVersion {
+            table,
+            filter,
+            columns,
+            at,
+        };
+        let mut ctx = self.context();
+        let res = execute_with_context(&plan, &mut ctx)?;
+        self.catalog = std::mem::take(&mut ctx.catalog);
+        Ok(query_result_from(res))
+    }
+
+    /// `&self` variant of [`Self::exec_select_at_version`] used by the
+    /// wire-protocol read path.
+    fn select_at_version_readonly(
+        &self,
+        stripped_sql: &str,
+        at: galaxdb_sql::ast::AtVersionExpr,
+    ) -> GalaxResult<QueryResult> {
+        let stmts = parser::parse(stripped_sql)?;
+        let Some(stmt) = stmts.first() else {
+            return Err(GalaxError::Internal(
+                "AT VERSION: SELECT body parsed to zero statements".into(),
+            ));
+        };
+        let AuroraStatement::Standard(boxed) = stmt else {
+            return Err(GalaxError::Internal(
+                "AT VERSION is only supported on SELECT statements".into(),
+            ));
+        };
+        let sqlparser::ast::Statement::Query(q) = boxed.as_ref() else {
+            return Err(GalaxError::Internal(
+                "AT VERSION is only supported on SELECT statements".into(),
+            ));
+        };
+
+        let table = extract_table(q);
+        let (columns, filter) = extract_projection_and_filter(q);
+        if table != "unknown" && !self.catalog.table_exists(&table) {
+            return Err(GalaxError::TableNotFound(table));
+        }
+        let plan = QueryPlan::FullScanAtVersion {
+            table,
+            filter,
+            columns,
+            at,
+        };
+
+        let mut ctx = ExecutorContext::new(self.engine.clone());
+        ctx.catalog = self.catalog.clone();
+        ctx.tag_catalog = Some(self.tag_catalog.clone());
+        ctx.merkle_dag = Some(self.merkle_dag.clone());
+        ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
+            sidecar: self.sidecar.clone(),
+            indexes: self.vector_indexes.clone(),
+            engine: self.engine.clone(),
+        }));
+        let res = execute_with_context(&plan, &mut ctx)?;
         Ok(query_result_from(res))
     }
 
@@ -620,6 +759,7 @@ impl Database {
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
             sidecar: self.sidecar.clone(),
             indexes: self.vector_indexes.clone(),
+            engine: self.engine.clone(),
         }));
         ctx
     }
@@ -635,6 +775,33 @@ impl Database {
     }
     pub fn row_count(&self) -> u64 {
         self.engine.row_count()
+    }
+
+    /// Build a [`galaxdb_storage::compaction::GcContext`] that pins
+    /// every commit timestamp currently referenced by a version tag.
+    /// Tasks 10.5 and 33.5: ensures the compactor's MVCC GC retains
+    /// row versions that tagged snapshots depend on.
+    ///
+    /// `oldest_active_snapshot` should be the minimum active
+    /// transaction's read timestamp (None if there are no active
+    /// readers). When compaction runs from embedded-mode callers with
+    /// no transaction manager, passing `None` is safe: pinned
+    /// timestamps alone are sufficient to keep training snapshots
+    /// alive, and unreferenced versions are already beyond any
+    /// caller's interest.
+    pub fn gc_context_with_pins(
+        &self,
+        oldest_active_snapshot: Option<u64>,
+    ) -> galaxdb_storage::compaction::GcContext {
+        let pins = self
+            .tag_catalog
+            .lock()
+            .map(|tc| tc.all_pinned_timestamps())
+            .unwrap_or_default();
+        galaxdb_storage::compaction::GcContext::with_pins(
+            oldest_active_snapshot,
+            pins,
+        )
     }
 }
 
@@ -652,6 +819,10 @@ impl Drop for Database {
 struct EmbeddedVectorBackend {
     sidecar: Option<Arc<SidecarManager>>,
     indexes: Arc<RwLock<HashMap<String, TableVectorIndex>>>,
+    /// Real storage engine, shared with the `Database`. Needed so
+    /// `on_row_deleted` can append a `DELTA_TOMBSTONE` WAL record
+    /// durably before the in-memory delta buffer is tombstoned.
+    engine: Arc<Engine>,
 }
 
 impl VectorSearchBackend for EmbeddedVectorBackend {
@@ -729,6 +900,45 @@ impl VectorSearchBackend for EmbeddedVectorBackend {
             k,
             SearchStrategy::HnswWithPostFilter,
         )
+    }
+
+    fn on_row_deleted(&self, table: &str, row_key: &[u8]) -> GalaxResult<()> {
+        // Resolve the primary-key bytes to the vector-row-id we stored
+        // when the embedding was generated. If we don't have a mapping
+        // (table has no vector index, or the embedding never landed)
+        // the delete is a no-op for the vector side, which is correct.
+        let row_id = {
+            let indexes = self.indexes.read().unwrap();
+            let Some(idx) = indexes.get(table) else {
+                return Ok(());
+            };
+            match idx.key_to_row_id.get(row_key) {
+                Some(id) => *id,
+                None => {
+                    // No vector for this row_key — nothing to tombstone.
+                    return Ok(());
+                }
+            }
+        };
+
+        // WAL first, memory after. The payload is
+        // `[u64 le vector_row_id][row_key]` so replay on recovery can
+        // rebuild the tombstone set and the key→row_id mapping.
+        let mut payload = Vec::with_capacity(8 + row_key.len());
+        payload.extend_from_slice(&row_id.to_le_bytes());
+        payload.extend_from_slice(row_key);
+        self.engine.append_delta_tombstone_sync(payload)?;
+
+        // Tombstone the in-memory delta buffer and drop the mapping so
+        // re-insert of the same key allocates a fresh vector row-id.
+        let mut indexes = self.indexes.write().unwrap();
+        if let Some(idx) = indexes.get_mut(table) {
+            idx.delta.delete(row_id);
+            idx.vectors.remove(&row_id);
+            idx.key_to_row_id.remove(row_key);
+        }
+
+        Ok(())
     }
 }
 
@@ -828,6 +1038,65 @@ fn extract_projection_and_filter(
     let filter = s.selection.as_ref().and_then(filter_from_expr);
 
     (columns, filter)
+}
+
+/// If the SQL is a `SELECT` with an `AT VERSION ...` suffix, return
+/// `Some((rest_of_sql_without_at_version, parsed_AtVersionExpr))`.
+/// If no `AT VERSION` is present, return `None`. If parsing the
+/// version fragment fails, propagate the parser error.
+///
+/// The matcher is deliberately conservative: it requires the literal
+/// token `AT VERSION` to appear case-insensitively outside quotes and
+/// after a `FROM` clause. The rest of the string (from `AT VERSION`
+/// to the end, minus a trailing semicolon) is handed to
+/// `galaxdb_sql::parser::parse_at_version`. This keeps the suffix
+/// syntax consistent with `galaxdb-sql::parser::parse_at_version`.
+fn split_at_version(
+    sql: &str,
+) -> GalaxResult<Option<(String, galaxdb_sql::ast::AtVersionExpr)>> {
+    let trimmed = sql.trim().trim_end_matches(';');
+    let upper: String = trimmed
+        .chars()
+        .map(|c| if c == '\'' { '\'' } else { c.to_ascii_uppercase() })
+        .collect();
+
+    // Case-insensitive search that skips quoted regions. We need the
+    // position in the *original* string, which matches the uppercase
+    // string byte-for-byte because we only mapped ASCII letters.
+    let bytes = trimmed.as_bytes();
+    let upper_bytes = upper.as_bytes();
+    let needle = b"AT VERSION";
+    let mut in_quote = false;
+    let mut i = 0usize;
+    let mut found: Option<usize> = None;
+
+    while i + needle.len() <= bytes.len() {
+        if bytes[i] == b'\'' {
+            in_quote = !in_quote;
+            i += 1;
+            continue;
+        }
+        if !in_quote && &upper_bytes[i..i + needle.len()] == needle {
+            let before_ok = i == 0 || !bytes[i - 1].is_ascii_alphanumeric();
+            let after_idx = i + needle.len();
+            let after_ok =
+                after_idx == bytes.len() || !bytes[after_idx].is_ascii_alphanumeric();
+            if before_ok && after_ok {
+                found = Some(i);
+                break;
+            }
+        }
+        i += 1;
+    }
+
+    let Some(pos) = found else {
+        return Ok(None);
+    };
+
+    let stripped = trimmed[..pos].trim_end().to_string();
+    let fragment = &trimmed[pos..];
+    let at = galaxdb_sql::parser::parse_at_version(fragment)?;
+    Ok(Some((stripped, at)))
 }
 
 /// If `expr` is a bare column reference, return its name.
@@ -1378,5 +1647,137 @@ mod tests {
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0].1, "3");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase K regressions — AT VERSION + DELTA_TOMBSTONE + compactor
+    // pin-set (tasks 18.6, 32.3, 32.4, 33.5).
+    //
+    // These tests go through the canonical `Database::execute` path
+    // so they exercise the SQL parser, the plan dispatch, the storage
+    // engine's MVCC memtable, and the tag catalog together. Anything
+    // that regresses the real behaviour on any of those layers will
+    // fail here.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn at_version_timestamp_returns_historical_snapshot() {
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'alpha')")
+            .unwrap();
+        // The INSERT above consumed the latest allocated ts.
+        // `next_ts_for_tests()` returns the next one that *would* be
+        // allocated, so to read "as of just after the INSERT but before
+        // any update", we subtract 1.
+        let read_ts = db.engine.next_ts_for_tests() - 1;
+        // Now mutate the row; the UPDATE lands at a higher ts.
+        db.execute("UPDATE t SET name = 'beta' WHERE id = 1")
+            .unwrap();
+
+        // Plain SELECT sees the latest value.
+        let rows = rows_of(db.execute("SELECT id, name FROM t").unwrap());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[1].1, "beta");
+
+        // AT VERSION <read_ts> sees the pre-update value.
+        let sql = format!("SELECT id, name FROM t AT VERSION {read_ts}");
+        let rows = rows_of(db.execute(&sql).unwrap());
+        assert_eq!(rows.len(), 1, "AT VERSION must see exactly one row");
+        assert_eq!(
+            rows[0].values[1].1,
+            "alpha",
+            "AT VERSION must return the value as of the snapshot ts"
+        );
+    }
+
+    #[test]
+    fn at_version_tag_resolves_through_tag_catalog() {
+        use galaxdb_versioning::{MerkleRoot, TrainingTagMetadata};
+
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'v1')")
+            .unwrap();
+        let tag_ts = db.engine.next_ts_for_tests() - 1;
+        // Register a real tag that points at the just-committed ts.
+        {
+            let mut tc = db.tag_catalog.lock().unwrap();
+            tc.create_tag(
+                "snap-v1".to_string(),
+                tag_ts, // created_at
+                MerkleRoot { hash: 0xC0DE },
+                tag_ts, // version_timestamp
+                vec![], // no pinned blocks for this test
+                false,
+                None::<TrainingTagMetadata>,
+            )
+            .expect("create tag");
+        }
+        db.execute("UPDATE t SET name = 'v2' WHERE id = 1").unwrap();
+
+        let rows = rows_of(
+            db.execute("SELECT id, name FROM t AT VERSION 'snap-v1'").unwrap(),
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].values[1].1, "v1",
+            "AT VERSION '<tag>' must resolve through the tag catalog and return the pre-update row",
+        );
+    }
+
+    #[test]
+    fn at_version_unknown_tag_errors() {
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        let err = db
+            .execute("SELECT id FROM t AT VERSION 'does-not-exist'")
+            .expect_err("unknown tag must error");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("unknown version tag") || msg.contains("does-not-exist"),
+            "expected an 'unknown version tag' error, got: {msg}",
+        );
+    }
+
+    #[test]
+    fn compactor_pins_tagged_timestamps() {
+        use galaxdb_storage::compaction::GcContext;
+
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'alpha')")
+            .unwrap();
+        let tag_ts = db.engine.next_ts_for_tests();
+        {
+            let mut tc = db.tag_catalog.lock().unwrap();
+            tc.create_tag(
+                "keep-me".to_string(),
+                tag_ts,
+                galaxdb_versioning::MerkleRoot { hash: 1 },
+                tag_ts,
+                vec![],
+                false,
+                None,
+            )
+            .unwrap();
+        }
+        db.execute("UPDATE t SET name = 'beta' WHERE id = 1")
+            .unwrap();
+
+        let gc: GcContext = db.gc_context_with_pins(None);
+        assert!(
+            gc.pinned_tag_timestamps.contains(&tag_ts),
+            "compactor pin-set must include the tag's version_timestamp ({tag_ts}); \
+             got {:?}",
+            gc.pinned_tag_timestamps,
+        );
+        // Compaction-time decision: the tagged version must be retained,
+        // a non-tagged intermediate version may be discarded.
+        assert!(gc.should_keep(tag_ts, /* is_latest = */ false));
     }
 }

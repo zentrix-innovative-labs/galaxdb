@@ -101,6 +101,23 @@ impl TagCatalog {
         blocks
     }
 
+    /// Get every commit timestamp currently pinned by a version tag.
+    /// Compaction consumes this set via
+    /// `galaxdb_storage::compaction::GcContext::with_pins` so MVCC GC
+    /// retains the exact versions that tagged snapshots reference
+    /// (tasks 33.5 and 10.5). Duplicates are removed; the iteration
+    /// order is unspecified.
+    pub fn all_pinned_timestamps(&self) -> Vec<u64> {
+        let mut stamps: Vec<u64> = self
+            .tags
+            .values()
+            .map(|tag| tag.version_timestamp)
+            .collect();
+        stamps.sort();
+        stamps.dedup();
+        stamps
+    }
+
     /// List all tag names.
     pub fn list_tags(&self) -> Vec<&str> {
         self.tags.keys().map(|s| s.as_str()).collect()

@@ -46,24 +46,25 @@ check_stub_tick '18\.7' 'task: "18.7"' crates/galaxdb-sql/src/executor.rs
 check_stub_tick '37 ' 'task: "37"' crates/galaxdb-sql/src/executor.rs
 check_stub_tick '37\.\d' 'task: "37"' crates/galaxdb-sql/src/executor.rs
 
-# 32.3 / 32.4 AT VERSION — planner must carry at_version field
-# (looser: look for the deferred marker in the tracker instead)
+# 32.3 / 32.4 AT VERSION — when these are ticked in tasks.md, the tracker
+# must NOT still contain an explicit "Deferred" marker for Phase B6.
+# We look for the exact phrase the Phase B entry used to carry
+# (`[ ] B6.1: Deferred.`) rather than a loose substring, so "closed by
+# Phase B6" references in later entries don't false-positive.
 for tid in '32\.3' '32\.4' '32\.6'; do
   if grep -E "^\s*- \[x\] $tid" "$TASKS" >/dev/null 2>&1; then
-    if grep -q "B6\|Phase B6 deferred" docs/CONSOLIDATION.md; then
-      # CONSOLIDATION.md still says B6 is deferred — that means 32.3/4/6
-      # should NOT be ticked.
-      echo "::error::Task '$tid' is ticked but CONSOLIDATION.md still marks Phase B6 as deferred."
+    if grep -q '^\s*-\s*\[\s\]\s*B6\.1: Deferred\.' docs/CONSOLIDATION.md; then
+      echo "::error::Task '$tid' is ticked but CONSOLIDATION.md still carries an open B6.1 deferral."
       fail=1
     fi
   fi
 done
 
-# 33.5 / 10.5 Pinned-block compactor — must carry Phase B7 deferral
+# 33.5 / 10.5 Pinned-block compactor — same rule for Phase B7.
 for tid in '10\.5' '33\.5'; do
   if grep -E "^\s*- \[x\] $tid" "$TASKS" >/dev/null 2>&1; then
-    if grep -q "Phase B7 deferred\|B7.*deferred" docs/CONSOLIDATION.md; then
-      echo "::error::Task '$tid' is ticked but CONSOLIDATION.md still marks Phase B7 as deferred."
+    if grep -q '^\s*-\s*\[\s\]\s*B7\.1: Deferred\.' docs/CONSOLIDATION.md; then
+      echo "::error::Task '$tid' is ticked but CONSOLIDATION.md still carries an open B7.1 deferral."
       fail=1
     fi
   fi
