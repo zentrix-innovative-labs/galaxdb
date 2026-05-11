@@ -338,6 +338,8 @@ impl Database {
             }
             AuroraStatement::BulkInsert(bi) => self.dispatch(QueryPlan::BulkInsert {
                 table: bi.table.clone(),
+                columns: bi.columns.clone(),
+                values: bi.values.clone(),
             }),
             AuroraStatement::AtVersion(_) => Err(GalaxError::NotYetAvailable {
                 task: "B6",

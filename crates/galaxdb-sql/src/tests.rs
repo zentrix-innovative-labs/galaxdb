@@ -267,8 +267,44 @@ fn parse_bulk_insert_basic() {
     match &stmts[0] {
         AuroraStatement::BulkInsert(bi) => {
             assert_eq!(bi.table, "documents");
+            assert_eq!(bi.columns, vec!["id", "content"]);
+            assert_eq!(bi.values.len(), 1);
+            assert_eq!(bi.values[0], vec!["1", "'hello'"]);
         }
         other => panic!("expected BulkInsert, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_bulk_insert_multirow() {
+    let stmts = parse(
+        "BULK INSERT INTO t (id, name) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+    )
+    .unwrap();
+    match &stmts[0] {
+        AuroraStatement::BulkInsert(bi) => {
+            assert_eq!(bi.table, "t");
+            assert_eq!(bi.columns, vec!["id", "name"]);
+            assert_eq!(bi.values.len(), 3);
+            assert_eq!(bi.values[0], vec!["1", "'a'"]);
+            assert_eq!(bi.values[2], vec!["3", "'c'"]);
+        }
+        other => panic!("expected BulkInsert, got {:?}", other),
+    }
+}
+
+#[test]
+fn parse_bulk_insert_mismatched_cols_errors() {
+    let err = parse("BULK INSERT INTO t (id, name) VALUES (1, 'a', 'extra')").unwrap_err();
+    match err {
+        GalaxError::SqlParse { message, .. } => {
+            assert!(
+                message.contains("values")
+                    && (message.contains("column list") || message.contains("3")),
+                "expected row/column count mismatch, got: {message}",
+            );
+        }
+        other => panic!("expected SqlParse, got {:?}", other),
     }
 }
 

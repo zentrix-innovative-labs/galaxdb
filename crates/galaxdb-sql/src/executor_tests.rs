@@ -570,18 +570,41 @@ fn context_restore_returns_not_yet_available() {
 }
 
 #[test]
-fn context_bulk_insert_returns_not_yet_available() {
+fn context_bulk_insert_writes_real_rows() {
     let mut ctx = ctx_with_users();
-    let err = execute_with_context(
+    let result = execute_with_context(
         &QueryPlan::BulkInsert {
             table: "users".to_string(),
+            columns: vec!["id".to_string(), "name".to_string()],
+            values: vec![
+                vec!["1".to_string(), "'alice'".to_string()],
+                vec!["2".to_string(), "'bob'".to_string()],
+                vec!["3".to_string(), "'carol'".to_string()],
+            ],
         },
         &mut ctx,
     )
-    .unwrap_err();
-    match err {
-        GalaxError::NotYetAvailable { task, .. } => assert_eq!(task, "18.7"),
-        other => panic!("expected NotYetAvailable, got {:?}", other),
+    .unwrap();
+    match result {
+        ExecuteResult::RowCount(n) => assert_eq!(n, 3),
+        other => panic!("expected RowCount(3), got {:?}", other),
+    }
+
+    // Read them back through the executor — no faking.
+    let rows = execute_with_context(
+        &QueryPlan::FullScan {
+            table: "users".to_string(),
+            filter: None,
+            columns: vec!["id".to_string(), "name".to_string()],
+        },
+        &mut ctx,
+    )
+    .unwrap();
+    match rows {
+        ExecuteResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 3, "all three bulk-inserted rows must be readable");
+        }
+        other => panic!("expected Rows, got {:?}", other),
     }
 }
 

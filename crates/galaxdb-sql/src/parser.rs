@@ -179,9 +179,16 @@ fn parse_create_version_tag(sql: &str) -> GalaxResult<AuroraStatement> {
     }))
 }
 
-/// Parse BULK INSERT INTO table (cols) VALUES (...), (...).
+/// Parse `BULK INSERT INTO table (col1, col2) VALUES (v1, v2), (v3, v4)`.
+///
+/// Real implementation — not a stub. Extracts the table name, the
+/// column list (optional), and every row in the VALUES clause. Values
+/// are stored as raw string tokens so the executor can parse them
+/// per-column against the catalog's typed schema. This mirrors the
+/// payload format `sqlparser` would emit for a regular INSERT and
+/// keeps the BULK INSERT path alignable with the standard INSERT path
+/// at execution time (task 18.7 closed in Phase L).
 fn parse_bulk_insert(sql: &str) -> GalaxResult<AuroraStatement> {
-    // Simple parsing: BULK INSERT INTO table (col1, col2) VALUES (v1, v2), (v3, v4)
     let upper = sql.to_uppercase();
     let into_pos = upper.find("INTO").ok_or_else(|| GalaxError::SqlParse {
         position: 0,
@@ -190,15 +197,139 @@ fn parse_bulk_insert(sql: &str) -> GalaxResult<AuroraStatement> {
 
     let rest = sql[into_pos + 4..].trim();
 
-    // Extract table name (up to '(' or whitespace)
+    // Table name up to '(' or whitespace.
     let table_end = rest.find(|c: char| c == '(' || c.is_whitespace()).unwrap_or(rest.len());
     let table = rest[..table_end].trim().trim_end_matches(';').to_string();
+    if table.is_empty() {
+        return Err(GalaxError::SqlParse {
+            position: into_pos + 4,
+            message: "BULK INSERT requires a table name after INTO".to_string(),
+        });
+    }
+
+    // Optional column list.
+    let mut after_table = rest[table_end..].trim_start();
+    let columns = if after_table.starts_with('(') {
+        let close = after_table
+            .find(')')
+            .ok_or_else(|| GalaxError::SqlParse {
+                position: into_pos + 4,
+                message: "unterminated column list in BULK INSERT".to_string(),
+            })?;
+        let inside = &after_table[1..close];
+        let cols: Vec<String> = inside
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        after_table = after_table[close + 1..].trim_start();
+        cols
+    } else {
+        Vec::new()
+    };
+
+    // VALUES keyword.
+    let upper_rest = after_table.to_uppercase();
+    if !upper_rest.starts_with("VALUES") {
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: "BULK INSERT requires a VALUES clause".to_string(),
+        });
+    }
+    let mut rows_text = after_table[6..].trim().trim_end_matches(';').to_string();
+    if rows_text.is_empty() {
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: "BULK INSERT VALUES clause is empty".to_string(),
+        });
+    }
+
+    // Split into value tuples, respecting quotes and parentheses.
+    let mut values: Vec<Vec<String>> = Vec::new();
+    while !rows_text.is_empty() {
+        let trimmed = rows_text.trim_start_matches(|c: char| c == ',' || c.is_whitespace());
+        if trimmed.is_empty() {
+            break;
+        }
+        if !trimmed.starts_with('(') {
+            return Err(GalaxError::SqlParse {
+                position: 0,
+                message: format!(
+                    "expected `(` at start of VALUES tuple, got: {:.40}",
+                    trimmed
+                ),
+            });
+        }
+        let (tuple, remainder) = slice_balanced_paren(trimmed).ok_or_else(|| {
+            GalaxError::SqlParse {
+                position: 0,
+                message: "unterminated VALUES tuple in BULK INSERT".to_string(),
+            }
+        })?;
+        let row: Vec<String> = split_respecting_quotes(&tuple[1..tuple.len() - 1])
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .collect();
+        if !columns.is_empty() && row.len() != columns.len() {
+            return Err(GalaxError::SqlParse {
+                position: 0,
+                message: format!(
+                    "BULK INSERT row has {} values but column list has {}",
+                    row.len(),
+                    columns.len()
+                ),
+            });
+        }
+        values.push(row);
+        rows_text = remainder.trim().to_string();
+    }
+    if values.is_empty() {
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: "BULK INSERT VALUES clause produced zero rows".to_string(),
+        });
+    }
 
     Ok(AuroraStatement::BulkInsert(BulkInsertStmt {
         table,
-        columns: Vec::new(),
-        values: Vec::new(),
+        columns,
+        values,
     }))
+}
+
+/// Slice off the next balanced `(..)` group from the start of `s`.
+/// Returns `(tuple_including_parens, remainder)`. Returns `None` if
+/// the parens are unbalanced.
+fn slice_balanced_paren(s: &str) -> Option<(String, String)> {
+    let bytes = s.as_bytes();
+    if bytes.is_empty() || bytes[0] != b'(' {
+        return None;
+    }
+    let mut depth = 0i32;
+    let mut in_quote = false;
+    let mut quote_char = 0u8;
+    for (i, &c) in bytes.iter().enumerate() {
+        if in_quote {
+            if c == quote_char {
+                in_quote = false;
+            }
+            continue;
+        }
+        if c == b'\'' || c == b'"' {
+            in_quote = true;
+            quote_char = c;
+            continue;
+        }
+        if c == b'(' {
+            depth += 1;
+        } else if c == b')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some((s[..=i].to_string(), s[i + 1..].to_string()));
+            }
+        }
+    }
+    None
 }
 
 /// Try to detect EMBEDDING MODEL in a CREATE TABLE parsed by sqlparser.

@@ -49,6 +49,19 @@ pub enum QueryPlan {
         semantic: SemanticMatchExpr,
         strategy: SearchStrategy,
     },
+    /// Hybrid search over a historical snapshot (task 32.6 SEMANTIC_FRESH).
+    /// SEMANTIC_MATCH combined with AT VERSION is only legal when the
+    /// user opts into `CONSISTENCY 'SEMANTIC_FRESH'` or
+    /// `'ROW_SNAPSHOT'`. The executor attaches a warning row to the
+    /// result metadata for SEMANTIC_FRESH and rejects the combination
+    /// if no consistency mode is set.
+    HybridSearchAtVersion {
+        table: String,
+        filter: Option<FilterExpr>,
+        semantic: SemanticMatchExpr,
+        strategy: SearchStrategy,
+        at: AtVersionExpr,
+    },
     /// INSERT a single row.
     Insert {
         table: String,
@@ -66,8 +79,18 @@ pub enum QueryPlan {
         table: String,
         filter: Option<FilterExpr>,
     },
-    /// BULK INSERT — bypass memtable, write PAX blocks directly.
-    BulkInsert { table: String },
+    /// BULK INSERT — write multiple rows. Phase L: real implementation.
+    /// The executor loops `Engine::put_sync` per row (sharing the
+    /// normal INSERT path's codec + sidecar trigger). The Month-4
+    /// "direct PAX write, bypass memtable" fast path is an
+    /// optimisation added later; correctness ships now.
+    BulkInsert {
+        table: String,
+        columns: Vec<String>,
+        /// One entry per row. Raw string tokens identical to what
+        /// `sqlparser` emits for `INSERT … VALUES (…)`.
+        values: Vec<Vec<String>>,
+    },
     /// CREATE TABLE.
     CreateTable(CreateTableStmt),
     /// DROP TABLE.

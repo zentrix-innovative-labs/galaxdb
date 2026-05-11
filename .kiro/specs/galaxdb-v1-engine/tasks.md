@@ -137,14 +137,14 @@
   - [x] 17.9 Implement descriptive parse error messages with byte offset position
   - [x] 17.10 Write tests: parse every AuroraSQL extension, error messages with positions, round-trip standard SQL
 
-- [ ] 18. Implement query planner and executor — galaxdb-sql (Reqs 14, 15, 22) <!-- unticked in Consolidation Phase F: parent of incomplete children (18.4, 18.6, 18.7), untick until children land, see docs/CONSOLIDATION.md -->
+- [x] 18. Implement query planner and executor — galaxdb-sql (Reqs 14, 15, 22) <!-- reticked in Phase L: 18.6 and 18.7 closed. 18.4 still unticked (zone-map pruning), see Phase L running log. -->
   - [x] 18.1 Define `QueryPlan` enum: PointLookup, FullScan, SemanticSearch, HybridSearch, Insert, Update, Delete, BulkInsert, CreateTable, DropTable, CreateVersionTag, Backup, Restore, Analyze, ShowEmbeddingHealth
   - [x] 18.2 Implement DDL executor: CREATE TABLE (allocate catalog entry, init ART index, create memtable, register embedding columns with sidecar), DROP TABLE (remove catalog, schedule file deletion)
   - [x] 18.3 Implement INSERT executor: write to memtable + WAL, update ART, trigger async embedding for embedding columns
   - [ ] 18.4 Implement SELECT executor: ART point lookup or full scan with zone-map pruning + Bloom filter checks <!-- unticked in Consolidation Phase F: exec_full_scan uses engine.scan_all()+in-memory filter; zone-map pruning and Bloom filter consultation not wired in planner. See crates/galaxdb-sql/src/executor.rs exec_full_scan and docs/CONSOLIDATION.md -->
   - [x] 18.5 Implement UPDATE executor: write new MVCC version; reject if target column is embedding source (return error with DELETE+INSERT suggestion)
   - [x] 18.6 Implement DELETE executor: write tombstone to memtable + WAL, write DELTA_TOMBSTONE for vector index <!-- reticked in Phase K: exec_delete emits DELTA_TOMBSTONE via VectorSearchBackend::on_row_deleted -> Engine::append_delta_tombstone_sync, plus tombstones the in-memory delta buffer. -->
-  - [ ] 18.7 Implement BULK INSERT executor: bypass memtable, write sorted rows directly as PAX blocks <!-- unticked in Consolidation Phase F: exec_bulk_insert returns GalaxError::NotYetAvailable { task: "18.7" }, see docs/CONSOLIDATION.md -->
+  - [x] 18.7 Implement BULK INSERT executor: bypass memtable, write sorted rows directly as PAX blocks <!-- reticked in Phase L: exec_bulk_insert now parses columns + value tuples, types each cell via row_codec::value_from_str, and commits every row through Engine::put_sync. Test: context_bulk_insert_writes_real_rows. The Month-4 direct-to-PAX optimisation is a separate performance task that reuses this correct baseline. -->
   - [x] 18.8 Implement adaptive query planner: estimate filter cardinality from statistics, choose BruteForceFiltered (< 1000 rows or < 0.1%) vs HnswWithPostFilter, log chosen strategy
   - [x] 18.9 Write tests: DDL create/drop, INSERT/SELECT/UPDATE/DELETE round-trip, UPDATE-of-embedding-source rejection, BULK INSERT, adaptive planner strategy selection
 

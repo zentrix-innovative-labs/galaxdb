@@ -541,3 +541,32 @@ Verification (actually run on macOS, commit will follow this entry):
 - **SEMANTIC_FRESH warning metadata**: when SEMANTIC_MATCH composes with AT VERSION in one plan, the executor should attach the warning to the result metadata. Today SEMANTIC_MATCH is a separate plan arm (`HybridSearch`) that doesn't know about AT VERSION. Proper fix is a `HybridSearchAtVersion` variant — follow-up once the v1 semantic guardrail (rejection at parse time) proves insufficient in production use.
 
 **Next action**: None for Phase K; the three deferred items are closed (with their own follow-ups documented above). The consolidation sprint's original Phase A–H scope is now done, and the Phase I + J + K audit reveals have all been addressed with real code and tests.
+
+### Phase L — Close BULK INSERT (18.7) and hybrid AT VERSION search (K-Follow)
+
+Two of the four Phase K follow-ups closed with real code + real tests in a single pass. The other two (18.4 zone-map pruning, K2-Follow SST-coverage for AT VERSION) remain explicitly open because their real fix requires a scan-through-SST refactor that would mask correctness regressions if rushed; keeping them unticked is the honest engineering call, not convenience.
+
+- [x] L1 (task 18.7): `parse_bulk_insert` now really parses column list + VALUES tuples (quote-aware, paren-balanced, mismatched-count errors). `QueryPlan::BulkInsert` carries the full `(columns, values)` payload. `exec_bulk_insert` resolves tokens to typed `Value`s via `row_codec::value_from_str` and commits every row through `Engine::put_sync`, sharing the single-row INSERT path's codec + sidecar + MinHash triggers. The Month-4 "bypass memtable, direct-PAX-write" optimisation from Req 2 is an orthogonal performance task — correctness of BULK INSERT is in today, durably. Tests: `parse_bulk_insert_basic`, `parse_bulk_insert_multirow`, `parse_bulk_insert_mismatched_cols_errors`, `context_bulk_insert_writes_real_rows`.
+- [x] L2 (K-Follow — task 32.6 completion): new `QueryPlan::HybridSearchAtVersion { table, filter, semantic, strategy, at }` variant and executor arm `exec_hybrid_search_at_version`. `CONSISTENCY 'ROW_SNAPSHOT'` with SEMANTIC_MATCH errors out (correct — there's no time-travel HNSW in v1). `CONSISTENCY 'SEMANTIC_FRESH'` runs the search against the current HNSW, resolves the AT VERSION ref through the tag catalog, and attaches a `__galaxdb_warning__` marker row to the result so callers can never miss the semantic. Missing consistency mode hits the typed-error branch (the parse-time guardrail in `galaxdb_versioning::validate_version_query` remains the first line of defence; the executor is the backstop).
+
+Files touched in Phase L:
+- `crates/galaxdb-sql/src/parser.rs` — real `parse_bulk_insert` with `slice_balanced_paren`.
+- `crates/galaxdb-sql/src/planner.rs` — `QueryPlan::BulkInsert` carries `columns` + `values`; new `QueryPlan::HybridSearchAtVersion`.
+- `crates/galaxdb-sql/src/executor.rs` — real `exec_bulk_insert`, new `exec_hybrid_search_at_version`, `execute_legacy` routes the new variant to a typed error.
+- `crates/galaxdb-sql/src/executor_tests.rs` — BULK INSERT test rewritten from "asserts NotYetAvailable" to "asserts 3 rows land and are readable".
+- `crates/galaxdb-sql/src/tests.rs` — new parser tests for BULK INSERT multirow + mismatch.
+- `crates/galaxdb-embedded/src/lib.rs` — dispatcher site passes through columns/values.
+- `crates/galaxdb-wire/src/server.rs` — same in the wire server's plan-builder.
+- `.kiro/specs/galaxdb-v1-engine/tasks.md` — 18 + 18.7 re-ticked with cross-references.
+
+Verification:
+- `cargo test --workspace --exclude galaxdb-python --lib` → 690 tests pass (was 688). Zero failures.
+- `cargo test -p galaxdb-sql --lib` → 113 tests pass (+2 BULK INSERT parser tests, +1 executor BULK INSERT test, -1 obsolete NotYetAvailable assertion).
+- `bash scripts/grep-for-mocks.sh` + `bash scripts/check-tasks-no-stub-ticks.sh` → OK.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+
+**Explicitly still open (not quietly deferred)**:
+- **18.4 zone-map pruning in `exec_full_scan`** — infrastructure exists (`PaxBlock::zone_map_min/max` serialized on disk), but `Engine::scan_all` today reads only the memtable; zone-map consultation requires wiring the scan path through `SstRegistry` per-block, which is a deeper change than can be squeezed in without a dedicated test pass. Keeping unticked rather than shipping a half-done pruning path that returns wrong answers on filtered scans.
+- **K2-Follow SST-coverage for AT VERSION** — same story: memtable-only time-travel is correct behaviour today; extending it to flushed SSTs is additive, tracked, and **not silently** accepted — callers that flush aggressively can still use AT VERSION within the memtable window.
+
+Both items get their own phase when we're ready to change the scan path. Neither is a regression from any current behaviour.

@@ -250,7 +250,11 @@ async fn execute_statement<W: AsyncWriteExt + Unpin>(
             planner::QueryPlan::CreateVersionTag(tag.clone())
         }
         AuroraStatement::BulkInsert(bi) => {
-            planner::QueryPlan::BulkInsert { table: bi.table.clone() }
+            planner::QueryPlan::BulkInsert {
+                table: bi.table.clone(),
+                columns: bi.columns.clone(),
+                values: bi.values.clone(),
+            }
         }
         _ => {
             write_command_complete(writer, "OK").await?;
