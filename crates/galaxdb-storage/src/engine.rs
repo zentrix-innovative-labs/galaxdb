@@ -284,6 +284,20 @@ impl Engine {
         self.next_timestamp.load(Ordering::SeqCst)
     }
 
+    /// Return the timestamp most recently allocated by `next_ts`, i.e.
+    /// the commit ts of the most recent write that has landed in the
+    /// engine.
+    ///
+    /// Zero if nothing has been written yet. Callers use this to pin
+    /// a training snapshot at "everything committed so far" — the
+    /// same boundary an external observer sees after
+    /// [`Self::put_sync`] / [`Self::delete_sync`] returns.
+    pub fn latest_commit_ts(&self) -> Timestamp {
+        self.next_timestamp
+            .load(Ordering::SeqCst)
+            .saturating_sub(1)
+    }
+
     /// Insert a row. Writes to WAL + memtable + ART index.
     pub async fn put(&self, key: Vec<u8>, value: Vec<u8>) -> GalaxResult<Timestamp> {
         let ts = self.next_ts();

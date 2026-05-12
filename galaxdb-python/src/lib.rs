@@ -99,6 +99,27 @@ impl Database {
         Ok(path.to_string_lossy().into_owned())
     }
 
+    /// Create a `FOR TRAINING` version tag pinned at the latest
+    /// committed row and return the `version_timestamp` used.
+    ///
+    /// Bridges the gap between `CREATE VERSION TAG 'name' FOR
+    /// TRAINING` (which today reads `MerkleDag::latest()` and the
+    /// DAG stays at 0 until task 36) and a working end-to-end
+    /// training snapshot. Preferred path for tools and tests that
+    /// want a repeatable Lance export:
+    ///
+    /// ```python
+    /// db.execute("INSERT INTO t (id, body) VALUES (1, 'hello')")
+    /// ts = db.create_training_snapshot('train-v1', seed=42)
+    /// path = db.training_dataset('train-v1')
+    /// ```
+    #[pyo3(signature = (name, seed = None))]
+    fn create_training_snapshot(&self, name: &str, seed: Option<u64>) -> PyResult<u64> {
+        self.inner
+            .create_training_snapshot(name, seed)
+            .map_err(|e| PyRuntimeError::new_err(format!("{}", e)))
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Database(path='{}', tables={})",

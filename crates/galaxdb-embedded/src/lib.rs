@@ -779,6 +779,57 @@ impl Database {
         self.engine.row_count()
     }
 
+    /// Register a `FOR TRAINING` version tag pinned at the most
+    /// recently committed timestamp and return that timestamp.
+    ///
+    /// This is a programmatic snapshot API. The SQL path
+    /// `CREATE VERSION TAG 'name' FOR TRAINING …` will eventually
+    /// carry the same semantics once task 36 wires the `MerkleDag`
+    /// to real commit events; until that lands, `CREATE VERSION TAG`
+    /// reads `MerkleDag::latest()` which stays at 0, so tools that
+    /// want a durable training snapshot must go through this entry
+    /// point.
+    ///
+    /// * `name` — unique tag name (same uniqueness rules as
+    ///   `CREATE VERSION TAG`). An existing name is a hard error.
+    /// * `seed` — optional deterministic-ordering seed stored in the
+    ///   tag's `TrainingTagMetadata`. Callers that want exactly-
+    ///   reproducible Lance exports should pass a stable value.
+    ///
+    /// Returns the `version_timestamp` the tag was pinned at, which
+    /// is also the ts you can pass to `AT VERSION <ts>` to query
+    /// the same snapshot through SQL.
+    pub fn create_training_snapshot(
+        &self,
+        name: &str,
+        seed: Option<u64>,
+    ) -> GalaxResult<u64> {
+        use galaxdb_versioning::{MerkleRoot, TrainingTagMetadata};
+
+        // Pin at the most recently committed ts.
+        let tag_ts = self.engine.latest_commit_ts();
+
+        let mut tc = self
+            .tag_catalog
+            .lock()
+            .map_err(|_| GalaxError::Internal("tag catalog mutex poisoned".into()))?;
+        tc.create_tag(
+            name.to_string(),
+            tag_ts,                      // created_at
+            MerkleRoot { hash: 0xC0DE }, // placeholder — task 36 plumbs the real commit root
+            tag_ts,                      // version_timestamp
+            vec![],                      // pinned blocks driven off version_timestamp for now
+            true,                        // FOR TRAINING
+            Some(TrainingTagMetadata {
+                precision: "float32".to_string(),
+                seed,
+                deterministic_order: true,
+            }),
+        )
+        .map_err(|e| GalaxError::Internal(format!("{e}")))?;
+        Ok(tag_ts)
+    }
+
     /// Build a [`galaxdb_storage::compaction::GcContext`] that pins
     /// every commit timestamp currently referenced by a version tag.
     /// Tasks 10.5 and 33.5: ensures the compactor's MVCC GC retains

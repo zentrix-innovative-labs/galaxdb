@@ -35,3 +35,4 @@ _galaxdb_reserve
 # Environment
 .env
 .env.local
+__pycache__/

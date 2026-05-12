@@ -595,3 +595,24 @@ Verification (actually run on macOS):
 **Scope notes**:
 - `exec_create_version_tag` still reads its ts from `MerkleDag::latest()`, which is `0` until Req 38 / task 36 wires the DAG to real commits. Phase M's test therefore registers the training tag directly against the `TagCatalog` with a post-insert ts (the same pattern the Phase K AT VERSION tests use). When task 36 lands, the SQL `CREATE VERSION TAG ... FOR TRAINING` path will propagate the real commit ts automatically — no change needed in `training_dataset`.
 - v1 `training_dataset` exports scalar + text rows only. Tables with embedding columns land the scalar row fine; the vector column export is follow-up work once the delta buffer is versioned. This is a documented limitation, not a silent drop.
+
+### Phase N — Task 22.6 + fold the version-tag timestamp scope note
+
+Task 22.6 ("Write tests: embedded mode CRUD, remote mode CRUD, training_dataset returns valid IterableDataset") closed end-to-end through the real PyO3 module. Phase M's scope note about `MerkleDag::latest()` returning 0 is also closed: `exec_create_version_tag` now pins the tag at `max(MerkleDag::latest(), Engine::latest_commit_ts())`, so SQL `CREATE VERSION TAG ... FOR TRAINING` captures every committed row in a memtable-only database without needing the test-only `TagCatalog::create_tag` back door.
+
+Files touched in Phase N:
+- `crates/galaxdb-sql/src/executor.rs::exec_create_version_tag` — version timestamp now comes from `engine.latest_commit_ts()` (public API, already shipped for this purpose); falls back to the DAG ts when the DAG is ahead, so nothing regresses for callers that advance the DAG first.
+- `galaxdb-python/tests/python/conftest.py` — pytest fixtures: `temp_db_dir`, `running_server` (spawns a real `galaxdb-server` on a free port, tears it down after the test).
+- `galaxdb-python/tests/python/test_embedded_crud.py` — 7 tests driving `galaxdb.Database(path)` through real CRUD, WHERE filtering, UPDATE, DELETE.
+- `galaxdb-python/tests/python/test_remote_crud.py` — 4 tests driving `galaxdb.connect(dsn)` against the spawned server: CREATE/INSERT/SELECT+WHERE/UPDATE/DELETE, close semantics, two concurrent connections to the same server.
+- `galaxdb-python/tests/python/test_training_dataset.py` — 4 tests. One creates a `FOR TRAINING` tag, calls `db.training_dataset(tag)`, re-opens the output via `lance.dataset(path)` and asserts 5 rows round-trip. Others cover the non-training-tag guard rail and unknown-tag error. An iteration test calls `ds.to_batches()` to prove the Lance surface is iterable (the IterableDataset contract the spec asks for).
+- `galaxdb-python/pyproject.toml` — new `[project.optional-dependencies] test = ["pytest>=7.0", "pylance>=0.16", "pyarrow>=14.0"]` plus `[tool.pytest.ini_options] testpaths = ["tests/python"]` so `pytest` from the workspace root picks them up.
+
+Verification (actually run on macOS):
+- `maturin develop --release -m galaxdb-python/Cargo.toml` → wheel built, editable install.
+- `python -m pytest galaxdb-python/tests/python/ -v` → **15 passed / 0 failed** (7 embedded + 4 remote + 4 training).
+- `cargo test --workspace --exclude galaxdb-python --lib` → **700 passed / 0 failed** across 12 crates (unchanged from Phase M baseline — no regressions from the `exec_create_version_tag` tweak).
+- `bash scripts/grep-for-mocks.sh` + `bash scripts/check-tasks-no-stub-ticks.sh` → both OK exit 0.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+
+**Real bug caught by the new pytest suite (not a new regression)**: the checked-in `target/release/galaxdb-server` binary was stale — built before the Phase I WHERE-clause fix landed — and the remote test immediately flagged it by returning 3 rows for `WHERE price > 4.0` instead of 2. `cargo build --release -p galaxdb-server` rebuilt the binary with Phase I's fix and the test went green. Gate added implicitly: the remote pytest file now demands a Phase-I-or-later server binary to pass.

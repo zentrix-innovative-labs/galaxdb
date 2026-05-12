@@ -83,3 +83,52 @@ jobs:
       - uses: actions/checkout@v4
       - name: Run check-tasks-no-stub-ticks
         run: bash scripts/check-tasks-no-stub-ticks.sh
+
+  # -------------------------------------------------------------------
+  # Task 22.6 — Python wheel integration tests.
+  #
+  # Builds the `galaxdb` PyO3 wheel via maturin, installs Lance +
+  # pyarrow + torch, then runs `pytest galaxdb-python/tests/python/`.
+  # The tests drive the same real binaries (`galaxdb-server`, the
+  # release wheel) that the Rust integration tests drive — so a green
+  # Rust suite plus a green Python suite covers the full FFI + wire
+  # surface.
+  # -------------------------------------------------------------------
+  python-integration-tests:
+    name: "Task 22.6: Python wheel integration tests"
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release server
+        run: cargo build --release -p galaxdb-server
+
+      - name: Install Python test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin pytest lance pyarrow torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build & install galaxdb wheel
+        run: maturin develop --release -m galaxdb-python/Cargo.toml
+
+      - name: Run pytest
+        run: pytest galaxdb-python/tests/python/ -v
+

@@ -1052,11 +1052,25 @@ fn exec_create_version_tag(
 
     // Snapshot the current Merkle root. A live-system tag captures the
     // state as of this commit timestamp.
+    //
+    // The MerkleDag is advanced by the compactor/flush path (task 32.2)
+    // and is still at `ts=0` in an in-memory memtable-only database.
+    // For version-tag correctness we therefore pin to the engine's
+    // most-recently allocated commit ts — that is the real "everything
+    // committed so far" boundary observable by readers, and it's what
+    // `AT VERSION` and `training_dataset` resolve against via
+    // `Engine::scan_all_at`. Falling back to the DAG ts when the engine
+    // is absent keeps the plan-validation tests (which build a legacy
+    // `ExecutorContext` without an engine) unchanged.
     let (current_root, current_ts, blocks) = {
         let dag = merkle_dag
             .lock()
             .map_err(|_| GalaxError::Internal("merkle dag mutex poisoned".into()))?;
-        let ts = dag.latest().map(|v| v.timestamp).unwrap_or(0);
+        let dag_ts = dag.latest().map(|v| v.timestamp).unwrap_or(0);
+        let engine_ts = ctx.engine.latest_commit_ts();
+        // Pick whichever is greater so we never regress behind a DAG
+        // update, and never land behind an uncommitted-but-visible row.
+        let ts = dag_ts.max(engine_ts);
         let root = dag.latest_root();
         let blocks = dag.blocks_at_version(ts);
         (root, ts, blocks)

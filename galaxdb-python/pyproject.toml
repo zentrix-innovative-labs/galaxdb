@@ -23,5 +23,21 @@ classifiers = [
     "Topic :: Database",
 ]
 
+[project.optional-dependencies]
+# Dependencies for running the integration test suite under
+# `galaxdb-python/tests/python/`. Install with:
+#     pip install -e 'galaxdb-python[test]'
+# Or explicitly:
+#     pip install pytest pylance pyarrow
+# `pylance` is the PyPI name for the `lance` import.
+test = [
+    "pytest>=7.0",
+    "pylance>=0.16",
+    "pyarrow>=14.0",
+]
+
 [tool.maturin]
 features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
