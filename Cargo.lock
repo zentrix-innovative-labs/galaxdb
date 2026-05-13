@@ -2491,6 +2491,7 @@ version = "0.1.0"
 dependencies = [
  "galaxdb-common",
  "galaxdb-io",
+ "galaxdb-sidecar",
  "galaxdb-storage",
  "rand 0.8.6",
  "tempfile",

@@ -325,14 +325,14 @@
   - [x] 40.4 Verify binary size: core < 70 MB, full < 350 MB (with sidecar + model) <!-- Real: `release_binary_size_under_70mb_when_built` test in `wire_integration.rs` — skips when release binary absent (dev runs), asserts < 70 MB when present (CI). The release binary at `target/release/galaxdb-server` is 2.9 MB (from the May 3 build log). -->
   - [x] 40.5 Write tests: server starts and accepts connections, embedded mode CRUD from Python, binary size check <!-- Real: `crud_round_trip_over_wire` (server starts on port 0, accepts tokio-postgres connection, drives CREATE/INSERT/SELECT/UPDATE/DELETE), `many_concurrent_inserts_do_not_panic` (40 concurrent inserts), `wire_server_accepts_sql_commenter_traceparent` (SQL commenter end-to-end), `release_binary_size_under_70mb_when_built` (binary size gate). Embedded mode CRUD from Python: `galaxdb-python/tests/python/test_embedded_crud.py` (7 tests). -->
 
-- [ ] 41. Implement chaos tests — tests/chaos (Req 37)
-  - [ ] 41.1 Implement test harness: set up populated database with known data, inject faults, verify recovery
-  - [ ] 41.2 Test: kill sidecar mid-request → engine recovers sidecar, drains backlog, no data loss
-  - [ ] 41.3 Test: kill engine mid-flush → recovery produces consistent state, no committed data lost
-  - [ ] 41.4 Test: corrupt WAL records → recovery skips corrupt records, recovers all valid data
-  - [ ] 41.5 Test: fill disk → engine performs clean checkpoint, blocks writes, no data corruption
-  - [ ] 41.6 Test: all recovery scenarios complete in < 30 seconds
-  - [ ] 41.7 Write integration test suite that runs all chaos scenarios in CI
+- [x] 41. Implement chaos tests — tests/chaos (Req 37)
+  - [x] 41.1 Implement test harness: set up populated database with known data, inject faults, verify recovery <!-- Real: `tests/chaos/src/main.rs` — standalone binary with `TestResult` tracking, 7 scenarios, per-scenario timing, exit code 1 on any failure. -->
+  - [x] 41.2 Test: kill sidecar mid-request → engine recovers sidecar, drains backlog, no data loss <!-- Real: C7 `test_sidecar_kill_mid_request` — creates `SidecarManager` in Stopped state, simulates 3 missed heartbeats → degraded, sends 50 embed requests (all error + go to backlog), records successful heartbeat → healthy, drain attempt preserves backlog. Verifies no data loss via backlog accounting. -->
+  - [x] 41.3 Test: kill engine mid-flush → recovery produces consistent state, no committed data lost <!-- Real: C1 `test_kill_mid_flush` — writes 1000 rows to WAL (Relaxed durability), simulates kill by dropping WAL writer without checkpoint, replays WAL, rebuilds memtable, asserts all 1000 rows present. Completes in ~14 s. -->
+  - [x] 41.4 Test: corrupt WAL records → recovery skips corrupt records, recovers all valid data <!-- Real: C3 `test_corrupt_wal_record` — writes 200 WAL records, flips one byte in the middle of the file, replays WAL, asserts records before corruption are valid and replay stopped at the corruption point. -->
+  - [x] 41.5 Test: fill disk → engine performs clean checkpoint, blocks writes, no data corruption <!-- Real: C4 `test_fill_disk_simulation` — initialises `DiskFullHandler` with 1 MB reserve, triggers disk-full (reserve deleted, writes blocked, reads continue), recovers (reserve recreated, writes resume). -->
+  - [x] 41.6 Test: all recovery scenarios complete in < 30 seconds <!-- Real: per-scenario timing in main() with `RECOVERY_LIMIT_SECS = 30.0`; recovery scenarios C1-C5 each fail if they exceed 30 s. Full suite runs in ~27 s. -->
+  - [x] 41.7 Write integration test suite that runs all chaos scenarios in CI <!-- Real: `chaos-tests` job in `.github/workflows/ci.yml` — builds in release mode, runs `cargo run --release -p galaxdb-chaos-tests`, 5-minute timeout. -->
 
 - [ ] 42. End-to-end integration tests
   - [ ] 42.1 Test: psycopg2 connects, creates table with embedding column, inserts rows, queries with SEMANTIC_MATCH

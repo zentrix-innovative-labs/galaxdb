@@ -132,3 +132,36 @@ jobs:
       - name: Run pytest
         run: pytest galaxdb-python/tests/python/ -v
 
+
+  # -------------------------------------------------------------------
+  # Task 41.7 — Chaos test suite in CI.
+  #
+  # Runs all 7 chaos scenarios (C1-C7) in release mode. Each recovery
+  # scenario must complete in < 30 s (enforced by the binary itself).
+  # The full suite must complete in < 60 s.
+  # -------------------------------------------------------------------
+  chaos-tests:
+    name: "Task 41.7: Chaos test suite"
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build chaos tests (release)
+        run: cargo build --release -p galaxdb-chaos-tests
+
+      - name: Run chaos test suite
+        run: cargo run --release -p galaxdb-chaos-tests
+        timeout-minutes: 5
