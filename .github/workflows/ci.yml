@@ -44,14 +44,11 @@ jobs:
         run: cargo clippy -- -D warnings
 
   # -------------------------------------------------------------------
-  # Phase H consolidation gates. See docs/CONSOLIDATION.md Phase H and
-  # .github/workflows/README.md. These run independently of the main
-  # build so a mock regression fails fast even while the slow build is
-  # still warming up.
+  # Quality gates — run independently so regressions fail fast.
   # -------------------------------------------------------------------
 
   no-mocks-gate:
-    name: "Gate H1: no mocks in production code"
+    name: "Gate: no mocks in production code"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -61,7 +58,7 @@ jobs:
         run: bash scripts/grep-for-mocks.sh
 
   no-vendor-sdk-gate:
-    name: "Gate H2: no vendor cloud SDKs in Cargo.lock"
+    name: "Gate: no vendor cloud SDKs in Cargo.lock"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -77,7 +74,7 @@ jobs:
         run: cargo deny check advisories
 
   task-tracker-gate:
-    name: "Gate H3: tasks.md consistent with production code"
+    name: "Gate: tasks.md consistent with production code"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
