@@ -5,16 +5,15 @@
 //!   galaxdb-server --port 5434              # custom port
 //!   galaxdb-server --data-dir /tmp/galaxdb  # custom data directory
 //!   galaxdb-server --sidecar /path/to/galaxdb-sidecar --model sentence-transformers/all-MiniLM-L6-v2
+//!   galaxdb-server --observe-port 9090      # HTTP /health + /metrics port (default 9090)
 //!
 //! The accept loop + connection handler live in [`galaxdb_server`] (lib.rs)
 //! so integration tests can drive a real TCP listener against a temp dir.
 //!
-//! Task 40.1: graceful shutdown on SIGTERM/SIGINT — the server installs
-//! signal handlers and waits for the accept loop to drain before exiting.
+//! Task 40.1: tokio main, wire protocol + HTTP observability, sidecar spawn,
+//! graceful shutdown on SIGTERM/SIGINT.
 
 use galaxdb_server::{start, ServerConfig};
-
-// Task 38.4: structured JSON logging.
 use galaxdb_observe;
 
 #[tokio::main]
@@ -47,6 +46,13 @@ async fn main() {
         .position(|a| a == "--model")
         .and_then(|i| std::env::args().nth(i + 1));
 
+    // HTTP observability port (task 40.1 / task 38.1-38.2).
+    let observe_port = std::env::args()
+        .position(|a| a == "--observe-port")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(9090);
+
     let cfg = ServerConfig {
         bind_addr: format!("0.0.0.0:{port}"),
         data_dir,
@@ -55,14 +61,23 @@ async fn main() {
         model_id,
     };
 
+    // Task 40.1: start the HTTP observability server (/health + /metrics)
+    // alongside the wire-protocol server. Both run concurrently on the
+    // same tokio runtime.
+    let observe_cfg = galaxdb_observe::ObserveConfig {
+        bind_addr: format!("0.0.0.0:{observe_port}"),
+    };
+    let (observe_addr, _observe_handle) = galaxdb_observe::start_http(observe_cfg)
+        .await
+        .expect("failed to bind HTTP observability server");
+    tracing::info!(addr = %observe_addr, "HTTP observability server listening (/health, /metrics)");
+    eprintln!("GalaxDB observability listening on {observe_addr}");
+
     let (addr, handle) = start(cfg).await.expect("failed to bind");
-    tracing::info!(addr = %addr, "GalaxDB server listening");
+    tracing::info!(addr = %addr, "GalaxDB wire-protocol server listening");
     eprintln!("GalaxDB server listening on {addr}");
 
     // Task 40.1: graceful shutdown on SIGTERM / SIGINT.
-    // The accept loop runs until a signal arrives, then we abort it
-    // and wait for in-flight connections to drain (best-effort: we
-    // give them 5 s before hard-exiting).
     let shutdown = async {
         #[cfg(unix)]
         {

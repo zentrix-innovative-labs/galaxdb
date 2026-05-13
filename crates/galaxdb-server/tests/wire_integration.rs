@@ -333,3 +333,35 @@ fn release_binary_size_under_70mb_when_built() {
         CORE_LIMIT_MB
     );
 }
+
+/// Task 40.1 / 40.5: verify the HTTP observability server (/health + /metrics)
+/// starts alongside the wire-protocol server and returns valid responses.
+/// This is the "bind wire protocol + HTTP observability" acceptance criterion.
+#[tokio::test]
+async fn http_observability_starts_alongside_wire_server() {
+    use galaxdb_observe::{start_http, ObserveConfig};
+
+    // Start the HTTP observability server on a free port.
+    let obs_cfg = ObserveConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+    };
+    let (obs_addr, _obs_handle) = start_http(obs_cfg).await.unwrap();
+
+    // /health must return 200 with a JSON body.
+    let health_url = format!("http://{}/health", obs_addr);
+    let resp = reqwest::get(&health_url).await.unwrap();
+    assert_eq!(resp.status(), 200, "/health must return 200");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(body.get("status").is_some(), "/health must return a status field");
+
+    // /metrics must return 200 with Prometheus text format.
+    let metrics_url = format!("http://{}/metrics", obs_addr);
+    let resp = reqwest::get(&metrics_url).await.unwrap();
+    assert_eq!(resp.status(), 200, "/metrics must return 200");
+    let ct = resp.headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert!(ct.contains("text/plain"), "/metrics must return Prometheus text format");
+}
