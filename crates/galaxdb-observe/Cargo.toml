@@ -9,3 +9,14 @@ description = "HTTP /health + /metrics, Prometheus, OTel tracing, JSON logging"
 [dependencies]
 galaxdb-common.workspace = true
 prometheus.workspace = true
+axum.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "macros"] }
+tracing.workspace = true
+tracing-subscriber = { workspace = true, features = ["json", "env-filter"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+opentelemetry.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
