@@ -40,10 +40,18 @@ pub const L0_FILE_COUNT_THRESHOLD: usize = 4;
 /// Default size ratio between adjacent levels for tiered compaction.
 pub const DEFAULT_SIZE_RATIO: u32 = 10;
 
-/// Default SST file size in bytes (64 MB for Month 1).
+/// Default target SST file size in bytes.
+///
+/// The default changed from 64 MB to 8 MB in task 39.1 to reduce
+/// write stalls caused by long flush + compaction tails: smaller
+/// SSTs let L0 drain faster and narrow the window during which the
+/// memtable can fill. The compaction target stays at 64 MB for the
+/// bottom level where steady-state space amplification matters more
+/// than latency — that's what `DEFAULT_SST_SIZE_BYTES` below
+/// captures for the compactor's with_sst_size upper bound.
 pub const DEFAULT_SST_SIZE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// Minimum SST file size in bytes (8 MB, configurable in Month 4).
+/// Minimum SST file size in bytes (8 MB, task 39.1 default).
 pub const MIN_SST_SIZE_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The bottom level index (leveled compaction).

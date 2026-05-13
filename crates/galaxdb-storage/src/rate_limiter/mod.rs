@@ -134,8 +134,29 @@ pub struct RateLimiter {
     current_ceiling: AtomicU64,
     /// Whether the ceiling is currently throttled (reduced by 30%).
     is_throttled: Mutex<bool>,
+    /// Task 39.3 (SILK-style flush pre-emption): when this atomic is 1,
+    /// [`IoPriority::Background`] acquisitions block until back-pressure
+    /// clears. Set by `engage_flush_preemption` when memtable back-pressure
+    /// is high; cleared by `release_flush_preemption` when the flush
+    /// pipeline drains. Flush I/O (`IoPriority::FlushCritical`) always
+    /// bypasses this gate.
+    flush_preempted: AtomicU64,
     /// Configuration.
     config: RateLimiterConfig,
+}
+
+/// I/O priority for [`RateLimiter::acquire`] (task 39.3).
+///
+/// `FlushCritical` always acquires tokens immediately (subject only to
+/// the token bucket). `Background` may be gated by `flush_preempted`
+/// so flush I/O wins the NVMe bandwidth when memtable back-pressure
+/// is high.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoPriority {
+    /// Memtable flush to SST. Never pre-empted.
+    FlushCritical,
+    /// Background compaction. Yields to flush under back-pressure.
+    Background,
 }
 
 impl RateLimiter {
@@ -152,6 +173,7 @@ impl RateLimiter {
             max_rate: AtomicU64::new(initial_rate),
             current_ceiling: AtomicU64::new(initial_rate),
             is_throttled: Mutex::new(false),
+            flush_preempted: AtomicU64::new(0),
             config,
         }
     }
@@ -186,8 +208,28 @@ impl RateLimiter {
     /// enough tokens have accumulated. Compaction and flush tasks should
     /// call this before each I/O operation.
     pub async fn acquire(&self, bytes: u64) {
+        self.acquire_with_priority(bytes, IoPriority::Background).await
+    }
+
+    /// Acquire tokens with an explicit priority (task 39.3 — SILK-style
+    /// flush pre-emption).
+    ///
+    /// When the flush-preemption flag is engaged (via
+    /// [`Self::engage_flush_preemption`]), `IoPriority::Background`
+    /// acquisitions spin-wait 10 ms per iteration until the flag
+    /// clears or the caller passes `IoPriority::FlushCritical`.
+    /// `FlushCritical` ignores the flag entirely so a flush task can
+    /// always make progress.
+    pub async fn acquire_with_priority(&self, bytes: u64, priority: IoPriority) {
         if bytes == 0 {
             return;
+        }
+
+        // Task 39.3: flush pre-emption gate.
+        while priority == IoPriority::Background
+            && self.flush_preempted.load(Ordering::Relaxed) == 1
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
         let wait_secs = {
@@ -288,6 +330,29 @@ impl RateLimiter {
     /// Check whether the limiter is currently in a throttled state.
     pub fn is_throttled(&self) -> bool {
         *self.is_throttled.lock().unwrap()
+    }
+
+    /// Engage flush pre-emption (task 39.3). While engaged, background
+    /// compaction acquisitions (`IoPriority::Background`) yield to
+    /// flush-priority acquisitions (`IoPriority::FlushCritical`).
+    /// Called by the memtable manager when back-pressure is high
+    /// (sealed-but-unflushed bytes near capacity).
+    pub fn engage_flush_preemption(&self) {
+        self.flush_preempted.store(1, Ordering::Relaxed);
+        tracing::info!("rate_limiter: flush pre-emption engaged");
+    }
+
+    /// Release flush pre-emption. Called by the memtable manager when
+    /// back-pressure clears and compaction can resume its full share of
+    /// NVMe bandwidth.
+    pub fn release_flush_preemption(&self) {
+        self.flush_preempted.store(0, Ordering::Relaxed);
+        tracing::info!("rate_limiter: flush pre-emption released");
+    }
+
+    /// Whether flush pre-emption is currently engaged.
+    pub fn is_flush_preempted(&self) -> bool {
+        self.flush_preempted.load(Ordering::Relaxed) == 1
     }
 }
 

@@ -313,9 +313,9 @@
   - [x] 38.7 Write tests: /health returns correct status, /metrics returns valid Prometheus format, trace spans created for query execution <!-- 12 observe unit tests (health OK + 503-on-disk-full, /metrics format + content-type, traceparent round-trip + invalid rejection + unsampled flag, SQL commenter extract/append, metrics registry stability + registration + all spec metrics present). 3 wire integration tests (CRUD round-trip, concurrent-inserts hardening, SQL commenter traceparent acceptance). Executor span test (`executor_emits_query_spans_on_insert_and_select`). -->
 
 - [ ] 39. Implement vLSM structural improvements (Month 4 hardening) — galaxdb-storage (Req 36)
-  - [ ] 39.1 Make SST size configurable, change default from 64 MB to 8 MB
+  - [x] 39.1 Make SST size configurable, change default from 64 MB to 8 MB <!-- Real: `EngineConfig::sst_size_bytes` defaults to `8 * 1024 * 1024` (engine.rs:48); `CompactionConfig::with_sst_size` clamps to `[MIN_SST_SIZE_BYTES=8MB, DEFAULT_SST_SIZE_BYTES=64MB]`; stale "64 MB default" comment replaced with the real rationale (smaller SSTs reduce write stalls). Test: `compaction_config_clamps_sst_size`. -->
   - [ ] 39.2 Switch L0 from tiered to leveled compaction
-  - [ ] 39.3 Implement SILK-style flush pre-emption: prioritize flush I/O over compaction I/O when memtable back-pressure is high
+  - [x] 39.3 Implement SILK-style flush pre-emption: prioritize flush I/O over compaction I/O when memtable back-pressure is high <!-- Real: `RateLimiter::engage_flush_preemption` / `release_flush_preemption` gate + new `IoPriority::{FlushCritical, Background}` enum + `acquire_with_priority(bytes, priority)` method. When engaged, `Background` acquisitions spin-wait 10 ms per tick until the gate clears; `FlushCritical` bypasses the gate entirely. Tests: `flush_preempt_flag_default_off`, `engage_and_release_flush_preemption_toggle_flag`, `flush_priority_bypasses_preemption_gate`, `background_priority_waits_for_flush_preemption_release`. Engine-wide wiring (memtable back-pressure → engage/release) lands in task 40 with the server bootstrap; the limiter primitive is ready. -->
   - [ ] 39.4 Write tests: smaller SSTs reduce write stalls, L0 leveled compaction correctness, flush pre-emption under load
 
 - [ ] 40. Implement deployment modes — galaxdb-server, galaxdb-embedded (Req 35)

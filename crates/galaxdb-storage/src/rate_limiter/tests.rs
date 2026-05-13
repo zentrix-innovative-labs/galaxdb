@@ -249,3 +249,80 @@ fn custom_config_fractions() {
     let expected = 250_000_000 - (250_000_000.0 * 0.20) as u64;
     assert_eq!(limiter.current_ceiling(), expected);
 }
+
+// ---------------------------------------------------------------------------
+// Task 39.3 — SILK-style flush pre-emption
+// ---------------------------------------------------------------------------
+
+#[test]
+fn flush_preempt_flag_default_off() {
+    let limiter = test_limiter(1_000_000_000);
+    assert!(
+        !limiter.is_flush_preempted(),
+        "flush pre-emption must default to off — otherwise compaction stalls the moment \
+         an engine starts up before any back-pressure is seen"
+    );
+}
+
+#[test]
+fn engage_and_release_flush_preemption_toggle_flag() {
+    let limiter = test_limiter(1_000_000_000);
+    limiter.engage_flush_preemption();
+    assert!(limiter.is_flush_preempted());
+    limiter.release_flush_preemption();
+    assert!(!limiter.is_flush_preempted());
+}
+
+#[tokio::test]
+async fn flush_priority_bypasses_preemption_gate() {
+    // With pre-emption engaged, FlushCritical acquisitions must not
+    // block on the gate. The token bucket is huge so acquire returns
+    // immediately once the gate is cleared.
+    let limiter = test_limiter(1_000_000_000);
+    limiter.engage_flush_preemption();
+
+    let start = std::time::Instant::now();
+    limiter
+        .acquire_with_priority(1024, IoPriority::FlushCritical)
+        .await;
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < std::time::Duration::from_millis(50),
+        "FlushCritical acquisition must bypass the pre-emption gate; \
+         took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn background_priority_waits_for_flush_preemption_release() {
+    // With pre-emption engaged, a Background acquisition must wait
+    // until the gate is released.
+    let limiter = std::sync::Arc::new(test_limiter(1_000_000_000));
+    limiter.engage_flush_preemption();
+
+    let lim2 = limiter.clone();
+    let start = std::time::Instant::now();
+    let handle = tokio::spawn(async move {
+        lim2.acquire_with_priority(1024, IoPriority::Background)
+            .await;
+        std::time::Instant::now()
+    });
+
+    // Hold the gate for 80 ms — longer than the 10 ms poll tick so
+    // the Background task definitely makes at least one gate check.
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    assert!(
+        !handle.is_finished(),
+        "Background acquisition must not complete while pre-emption is engaged"
+    );
+
+    limiter.release_flush_preemption();
+    let completed_at = handle.await.unwrap();
+    let elapsed = completed_at.duration_since(start);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(70),
+        "Background acquisition must wait until pre-emption is released; \
+         got {elapsed:?}"
+    );
+}
