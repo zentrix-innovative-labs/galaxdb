@@ -890,21 +890,20 @@ impl Database {
     ///    deterministic: `<db>/training_exports/<tag>_<version_ts>/`
     ///    so repeat exports of the same tag overwrite the same
     ///    directory rather than racing for different names.
-    /// 7. Record a lineage row through [`InMemoryLineageSink`]. The
-    ///    persistent `_galaxdb_training_exports` table is tracked
-    ///    under Req 38 / task 36; wiring it up is a follow-up — until
-    ///    then the sink keeps the shape correct so callers can read
-    ///    the number of exports without having to run through a SQL
-    ///    system-table scan.
+    /// 7. Record a lineage row in the real `_galaxdb_training_exports`
+    ///    system table (Req 38 / task 36). The table is created on
+    ///    first export (idempotent) and every subsequent export
+    ///    appends one row. UPDATE and DELETE against the table are
+    ///    rejected by the executor so the audit trail is permanent.
     ///
     /// The returned path points at the on-disk Lance dataset. Python
     /// callers wrap it with `lance.dataset(path).to_pytorch()` to get
     /// an `IterableDataset` — that glue lives in the Python package,
     /// not in this Rust method, because PyTorch is a Python-only
     /// dependency (Rule 5: no vendor lock-in in the engine core).
-    pub fn training_dataset(&self, tag: &str) -> GalaxResult<PathBuf> {
+    pub fn training_dataset(&mut self, tag: &str) -> GalaxResult<PathBuf> {
         use galaxdb_versioning::{
-            InMemoryLineageSink, LanceExporter, TrainingExportLineageSink, TrainingPrecision,
+            LanceExporter, TrainingExportLineageSink, TrainingPrecision,
         };
 
         // 1. Resolve the tag and clone the bits we need out of the
@@ -995,8 +994,21 @@ impl Database {
         // 8. Build the exporter and drive it. Lance writers are async;
         // the embedded database API is sync. Spin a dedicated current-
         // thread runtime so we don't assume the caller already has one.
-        let sink: Arc<dyn TrainingExportLineageSink> =
-            Arc::new(InMemoryLineageSink::new());
+        //
+        // Task 36.3: every successful export must also land one row in
+        // the real `_galaxdb_training_exports` system table. We can't
+        // call `Engine::put_sync` from inside the exporter's async
+        // context because `put_sync` blocks on WAL group-commit via
+        // `oneshot::blocking_recv`, which is forbidden inside a tokio
+        // worker. Instead we buffer the lineage record through the
+        // in-memory sink, run the async export, then flush the
+        // recorded entries through the real engine AFTER `block_on`
+        // returns (we're back on the caller's thread at that point).
+        // Same pattern the Phase I wire server uses for the blocking
+        // storage primitives.
+        let buffer = Arc::new(galaxdb_versioning::InMemoryLineageSink::new());
+        let sink: Arc<dyn TrainingExportLineageSink> = buffer.clone();
+        self.ensure_training_exports_table()?;
         let exporter = LanceExporter::new(
             &output_path,
             schema,
@@ -1019,6 +1031,18 @@ impl Database {
         rt.block_on(exporter.export())
             .map_err(|e| GalaxError::Internal(format!("Lance export failed: {e}")))?;
 
+        // Flush the buffered lineage records to `_galaxdb_training_exports`.
+        // Runs on the caller's thread, so `Engine::put_sync` is safe.
+        let engine_sink = EngineBackedLineageSink {
+            engine: self.engine.clone(),
+        };
+        for entry in buffer.entries() {
+            use galaxdb_versioning::TrainingExportLineageSink as _;
+            engine_sink
+                .record(entry)
+                .map_err(|e| GalaxError::Internal(format!("lineage flush failed: {e}")))?;
+        }
+
         Ok(output_path)
     }
 
@@ -1029,9 +1053,19 @@ impl Database {
     fn pick_training_table(
         &self,
     ) -> GalaxResult<(String, galaxdb_sql::executor::TableEntry)> {
+        // Skip append-only system tables (e.g.
+        // `_galaxdb_training_exports`) — those are lineage sinks and
+        // the user never wants them as the export source. The
+        // `append_only` flag on `TableEntry` is our canonical signal.
         let names: Vec<String> = self
             .catalog
             .table_names()
+            .filter(|n| {
+                self.catalog
+                    .get_table(n)
+                    .map(|e| !e.append_only)
+                    .unwrap_or(false)
+            })
             .map(|n| n.to_string())
             .collect();
         match names.len() {
@@ -1055,6 +1089,48 @@ impl Database {
             ))),
         }
     }
+
+    /// Idempotent: create the `_galaxdb_training_exports` system table
+    /// if it doesn't already exist. Called on the first `training_dataset`
+    /// export per database so callers never see a missing table error
+    /// for lineage SELECTs.
+    ///
+    /// The schema matches the one defined on
+    /// [`galaxdb_versioning::TrainingExportLineage`] and required by
+    /// task 36.1:
+    ///
+    ///   lineage_id (PK), exported_at, tag_name, filter_expr,
+    ///   precision, dedup, curriculum, row_count, content_hash
+    ///
+    /// `lineage_id` is a process-monotonic counter so two exports in
+    /// the same wall-clock second still land as distinct rows;
+    /// `exported_at` carries the wall-clock timestamp on the row.
+    /// `append_only = true` is set by the executor's
+    /// `is_system_append_only_table` check keyed on the table name,
+    /// so DELETE and UPDATE against this table return
+    /// `GalaxError::AppendOnlyTable` without any extra config here.
+    fn ensure_training_exports_table(&mut self) -> GalaxResult<()> {
+        use galaxdb_sql::executor::TRAINING_EXPORTS_TABLE;
+        if self.catalog.table_exists(TRAINING_EXPORTS_TABLE) {
+            return Ok(());
+        }
+        let sql = format!(
+            "CREATE TABLE {table} (\
+                 lineage_id BIGINT PRIMARY KEY, \
+                 exported_at BIGINT, \
+                 tag_name TEXT, \
+                 filter_expr TEXT, \
+                 precision TEXT, \
+                 dedup TEXT, \
+                 curriculum TEXT, \
+                 row_count BIGINT, \
+                 content_hash TEXT\
+             )",
+            table = TRAINING_EXPORTS_TABLE
+        );
+        self.execute(&sql)?;
+        Ok(())
+    }
 }
 
 impl Drop for Database {
@@ -1075,6 +1151,117 @@ struct EmbeddedVectorBackend {
     /// `on_row_deleted` can append a `DELTA_TOMBSTONE` WAL record
     /// durably before the in-memory delta buffer is tombstoned.
     engine: Arc<Engine>,
+}
+
+// ---------------------------------------------------------------------------
+// EngineBackedLineageSink — writes every training-export lineage row into
+// the real `_galaxdb_training_exports` system table (task 36).
+// ---------------------------------------------------------------------------
+
+/// Persists [`galaxdb_versioning::TrainingExportLineage`] records as
+/// rows in the `_galaxdb_training_exports` system table.
+///
+/// The sink is called from inside
+/// [`galaxdb_versioning::LanceExporter::export`] after a successful
+/// Lance write; here we bypass the SQL executor and write directly
+/// through [`Engine::put_sync`] so the sink does not need a mutable
+/// reference to `Database`. The row bytes are constructed through the
+/// same [`galaxdb_sql::row_codec`] text codec the executor uses, so a
+/// subsequent `SELECT * FROM _galaxdb_training_exports` through the
+/// normal path decodes the same values back.
+///
+/// Append-only enforcement (task 36.2) is done at the executor level —
+/// this sink doesn't need to be defensive about DELETE / UPDATE.
+///
+/// The primary key is a process-monotonic `lineage_id` allocated
+/// from a single `AtomicU64` so two exports that happen in the same
+/// wall-clock second still land as two distinct rows. `exported_at`
+/// stays as the wall-clock timestamp on the row, not as the PK.
+struct EngineBackedLineageSink {
+    engine: Arc<Engine>,
+}
+
+/// Process-wide monotonic counter used by [`EngineBackedLineageSink`]
+/// to allocate a unique primary key per lineage row. `AtomicU64`
+/// starting at 1 so the zero-value sentinel isn't a valid row id.
+static LINEAGE_ROW_ID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+impl galaxdb_versioning::TrainingExportLineageSink for EngineBackedLineageSink {
+    fn record(
+        &self,
+        lineage: galaxdb_versioning::TrainingExportLineage,
+    ) -> galaxdb_versioning::ExportResult<()> {
+        use galaxdb_sql::executor::TRAINING_EXPORTS_TABLE;
+        use galaxdb_sql::planner::Value;
+        use galaxdb_sql::row_codec;
+
+        // The catalog column order declared in
+        // `Database::ensure_training_exports_table`:
+        //   lineage_id (PK), exported_at, tag_name, filter_expr,
+        //   precision, dedup, curriculum, row_count, content_hash
+        // `lineage_id` is a process-monotonic counter that guarantees
+        // two exports in the same wall-clock second still produce two
+        // distinct rows (MVCC would otherwise collapse them).
+        let lineage_id =
+            LINEAGE_ROW_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ordered = vec![
+            (
+                "lineage_id".to_string(),
+                Value::Integer(lineage_id as i64),
+            ),
+            (
+                "exported_at".to_string(),
+                Value::Integer(lineage.exported_at as i64),
+            ),
+            ("tag_name".to_string(), Value::Text(lineage.tag_name.clone())),
+            (
+                "filter_expr".to_string(),
+                match lineage.filter_expr.as_ref() {
+                    Some(s) => Value::Text(s.clone()),
+                    None => Value::Null,
+                },
+            ),
+            (
+                "precision".to_string(),
+                Value::Text(lineage.precision.clone()),
+            ),
+            ("dedup".to_string(), Value::Bool(lineage.dedup)),
+            (
+                // Curriculum mode is reserved by task 36.1 but the
+                // `TrainingExportLineage` struct does not yet carry a
+                // curriculum field — landing that requires Req-scope
+                // work on the exporter. The column exists so the
+                // schema matches the spec; it's always NULL today and
+                // becomes non-NULL once curriculum lands without
+                // needing an ALTER TABLE.
+                "curriculum".to_string(),
+                Value::Null,
+            ),
+            (
+                "row_count".to_string(),
+                Value::Integer(lineage.row_count as i64),
+            ),
+            (
+                "content_hash".to_string(),
+                Value::Text(lineage.content_hash.clone()),
+            ),
+        ];
+
+        // The primary key for each lineage row is `lineage_id`
+        // (monotonic u64). `TRAINING_EXPORTS_TABLE:<lineage_id>` is
+        // the storage key shape used by every other table's row codec.
+        let primary_key =
+            format!("{}:{}", TRAINING_EXPORTS_TABLE, lineage_id).into_bytes();
+        let row_bytes = row_codec::encode_row(&ordered);
+
+        self.engine.put_sync(primary_key, row_bytes).map_err(|e| {
+            galaxdb_versioning::ExportError::Arrow(format!(
+                "failed to append training-export lineage row: {e}"
+            ))
+        })?;
+        Ok(())
+    }
 }
 
 impl VectorSearchBackend for EmbeddedVectorBackend {
@@ -2481,5 +2668,167 @@ mod tests {
             .collect();
         ids.sort();
         assert_eq!(ids, vec!["2".to_string(), "3".to_string(), "4".to_string()]);
+    }
+
+    // -----------------------------------------------------------------
+    // Task 36 — training-data lineage (`_galaxdb_training_exports`)
+    // -----------------------------------------------------------------
+
+    /// Helper: CREATE TABLE + INSERT rows + register a FOR TRAINING tag
+    /// pinned at the current commit ts, then drive `training_dataset`.
+    /// Mirrors the Phase M fixture so the lineage tests stay readable.
+    fn training_export_fixture(tag: &str) -> Database {
+        use galaxdb_versioning::{MerkleRoot, TrainingTagMetadata};
+        let mut db = test_db();
+        db.execute("CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)")
+            .unwrap();
+        for i in 1..=3 {
+            db.execute(&format!(
+                "INSERT INTO docs (id, body) VALUES ({i}, 'row-{i}')"
+            ))
+            .unwrap();
+        }
+        let tag_ts = db.engine.next_ts_for_tests();
+        {
+            let mut tc = db.tag_catalog.lock().unwrap();
+            tc.create_tag(
+                tag.to_string(),
+                tag_ts,
+                MerkleRoot { hash: 0xC0DE },
+                tag_ts,
+                vec![],
+                true,
+                Some(TrainingTagMetadata {
+                    precision: "float32".to_string(),
+                    seed: Some(42),
+                    deterministic_order: true,
+                }),
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    /// After a successful `training_dataset` call the
+    /// `_galaxdb_training_exports` system table exists and contains
+    /// exactly one row carrying the tag name, precision, dedup flag,
+    /// row count, and content hash.
+    #[test]
+    fn training_export_lineage_row_lands_in_system_table() {
+        let mut db = training_export_fixture("train-v1");
+        let _path = db.training_dataset("train-v1").expect("export");
+
+        assert!(
+            db.table_exists("_galaxdb_training_exports"),
+            "training_dataset must create the system table on first use"
+        );
+        let rows = match db
+            .execute("SELECT tag_name, precision, row_count, content_hash FROM _galaxdb_training_exports")
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected Rows, got {:?}", other),
+        };
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one lineage row per successful export; got {:?}",
+            rows
+        );
+        let row = &rows[0].values;
+        let get = |k: &str| -> String {
+            row.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap()
+        };
+        assert_eq!(get("tag_name"), "train-v1");
+        assert_eq!(get("precision"), "float32");
+        assert_eq!(get("row_count"), "3");
+        let hash = get("content_hash");
+        assert_eq!(
+            hash.len(),
+            32,
+            "content_hash is a lower-case hex encoding of the 16-byte \
+             XXH3-128 over the canonical row encoding; got {hash:?}"
+        );
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// UPDATE against the system table is rejected with
+    /// `GalaxError::AppendOnlyTable`.
+    #[test]
+    fn training_exports_table_rejects_update() {
+        let mut db = training_export_fixture("train-v1");
+        db.training_dataset("train-v1").unwrap();
+        let err = db
+            .execute(
+                "UPDATE _galaxdb_training_exports SET tag_name = 'hacked' WHERE row_count = 3",
+            )
+            .expect_err("UPDATE against append-only table must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("append-only")
+                && msg.contains("UPDATE")
+                && msg.contains("_galaxdb_training_exports"),
+            "expected append-only UPDATE rejection, got: {msg}"
+        );
+    }
+
+    /// DELETE against the system table is rejected.
+    #[test]
+    fn training_exports_table_rejects_delete() {
+        let mut db = training_export_fixture("train-v1");
+        db.training_dataset("train-v1").unwrap();
+        let err = db
+            .execute("DELETE FROM _galaxdb_training_exports")
+            .expect_err("DELETE against append-only table must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("append-only") && msg.contains("DELETE"),
+            "expected append-only DELETE rejection, got: {msg}"
+        );
+    }
+
+    /// Exporting the same tag twice produces two lineage rows. The
+    /// content hash is stable across exports of the same data
+    /// (determinism test: both rows carry the exact same hex hash).
+    #[test]
+    fn training_export_content_hash_is_stable_across_repeats() {
+        let mut db = training_export_fixture("train-v1");
+        db.training_dataset("train-v1").unwrap();
+        // Two exports of the same tag ⇒ two rows.
+        db.training_dataset("train-v1").unwrap();
+
+        let rows = match db
+            .execute("SELECT content_hash FROM _galaxdb_training_exports")
+            .unwrap()
+        {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected Rows, got {:?}", other),
+        };
+        assert_eq!(rows.len(), 2);
+        let hashes: Vec<String> = rows
+            .iter()
+            .map(|r| r.values[0].1.clone())
+            .collect();
+        assert_eq!(
+            hashes[0], hashes[1],
+            "the same tag with the same rows must hash to the same content_hash; got {hashes:?}"
+        );
+    }
+
+    /// INSERT against the system table works — the append-only guard
+    /// only blocks UPDATE and DELETE, not further inserts. This keeps
+    /// the sink itself working (otherwise we'd need a privileged write
+    /// path). Users manually inserting into the system table is
+    /// unusual but not forbidden by the design.
+    #[test]
+    fn training_exports_table_allows_insert() {
+        let mut db = training_export_fixture("train-v1");
+        db.training_dataset("train-v1").unwrap();
+        let res = db.execute(
+            "INSERT INTO _galaxdb_training_exports \
+             (lineage_id, exported_at, tag_name, filter_expr, precision, dedup, curriculum, row_count, content_hash) \
+             VALUES (9999, 999, 'manual', NULL, 'float32', false, NULL, 1, 'aa')",
+        );
+        assert!(res.is_ok(), "INSERT against append-only table should be allowed, got {res:?}");
     }
 }

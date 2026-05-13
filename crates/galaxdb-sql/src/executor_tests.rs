@@ -46,6 +46,7 @@ fn users_entry() -> TableEntry {
             },
         ],
         has_embedding: false,
+            append_only: false,
     }
 }
 
@@ -77,6 +78,7 @@ fn embedding_entry() -> TableEntry {
             },
         ],
         has_embedding: true,
+            append_only: false,
     }
 }
 
@@ -100,6 +102,7 @@ fn docs_body_entry() -> TableEntry {
             },
         ],
         has_embedding: false,
+            append_only: false,
     }
 }
 
@@ -992,6 +995,7 @@ fn minhash_policy_skips_non_text_columns() {
             },
         ],
         has_embedding: false,
+            append_only: false,
     };
     ctx.catalog.create_table("nums".to_string(), entry).unwrap();
 
@@ -1053,6 +1057,7 @@ fn minhash_policy_handles_multiple_text_columns() {
             },
         ],
         has_embedding: false,
+            append_only: false,
     };
     ctx.catalog.create_table("docs".to_string(), entry).unwrap();
 
@@ -1165,6 +1170,7 @@ fn ctx_with_dedup_docs() -> ExecutorContext {
             },
         ],
         has_embedding: false,
+            append_only: false,
     };
     ctx.catalog.create_table("docs".to_string(), entry).unwrap();
     ctx

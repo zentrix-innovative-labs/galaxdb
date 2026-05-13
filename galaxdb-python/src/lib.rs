@@ -91,7 +91,7 @@ impl Database {
     ///
     /// The path lives under `<database>/training_exports/<tag>_<ts>/`
     /// and is overwritten on repeat calls with the same tag.
-    fn training_dataset(&self, tag: &str) -> PyResult<String> {
+    fn training_dataset(&mut self, tag: &str) -> PyResult<String> {
         let path = self
             .inner
             .training_dataset(tag)

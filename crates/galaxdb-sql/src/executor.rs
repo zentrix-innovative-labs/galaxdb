@@ -141,6 +141,23 @@ pub struct TableEntry {
     pub name: String,
     pub columns: Vec<CatalogColumn>,
     pub has_embedding: bool,
+    /// Append-only tables reject UPDATE and DELETE (task 36.2). Used
+    /// for system lineage tables like `_galaxdb_training_exports` that
+    /// must remain auditable.
+    pub append_only: bool,
+}
+
+/// Canonical name of the training-export lineage system table
+/// (Req 38 / task 36). Every successful `LanceExporter::export` lands
+/// one row here; DELETE and UPDATE against this table are rejected at
+/// the executor.
+pub const TRAINING_EXPORTS_TABLE: &str = "_galaxdb_training_exports";
+
+/// Is `name` the fixed name of an append-only system table? Today
+/// `_galaxdb_training_exports` is the only one; future system tables
+/// that want the same treatment extend this list.
+pub fn is_system_append_only_table(name: &str) -> bool {
+    name == TRAINING_EXPORTS_TABLE
 }
 
 /// Column metadata in the catalog.
@@ -507,6 +524,7 @@ fn exec_create_table(
         name: stmt.table_name.clone(),
         columns,
         has_embedding,
+        append_only: is_system_append_only_table(&stmt.table_name),
     };
 
     ctx.catalog.create_table(stmt.table_name.clone(), entry)?;
@@ -610,6 +628,17 @@ fn exec_update(
         .cloned()
         .ok_or_else(|| GalaxError::TableNotFound(table.to_string()))?;
 
+    // Task 36.2: append-only system tables reject UPDATE. The lineage
+    // record in `_galaxdb_training_exports` is a permanent audit trail;
+    // allowing an in-place mutation would silently break
+    // reproducibility of past training exports.
+    if table_entry.append_only {
+        return Err(GalaxError::AppendOnlyTable {
+            table: table.to_string(),
+            operation: "UPDATE",
+        });
+    }
+
     // Req 15.5: cannot UPDATE an embedding-source column.
     for (col_name, _) in assignments {
         if let Some(col) = table_entry.columns.iter().find(|c| &c.name == col_name) {
@@ -667,6 +696,15 @@ fn exec_delete(
     let Some(table_entry) = ctx.catalog.get_table(table).cloned() else {
         return Err(GalaxError::TableNotFound(table.to_string()));
     };
+
+    // Task 36.2: append-only system tables reject DELETE for the same
+    // audit-trail reasons as UPDATE. See `exec_update` above.
+    if table_entry.append_only {
+        return Err(GalaxError::AppendOnlyTable {
+            table: table.to_string(),
+            operation: "DELETE",
+        });
+    }
 
     // Collect the keys first so we don't mutate storage while scanning.
     let mut doomed: Vec<Vec<u8>> = Vec::new();
@@ -1552,6 +1590,7 @@ pub fn execute_legacy(plan: &QueryPlan, catalog: &mut Catalog) -> ExecuteResult 
                 name: stmt.table_name.clone(),
                 columns,
                 has_embedding,
+                append_only: is_system_append_only_table(&stmt.table_name),
             };
             match catalog.create_table(stmt.table_name.clone(), entry) {
                 Ok(()) => ExecuteResult::Ok(format!("CREATE TABLE {}", stmt.table_name)),

@@ -314,6 +314,7 @@ mod tests {
                 },
             ],
             has_embedding: false,
+            append_only: false,
         }
     }
 
@@ -392,6 +393,7 @@ mod tests {
                 is_embedding_source: false,
             }],
             has_embedding: false,
+            append_only: false,
         };
         let ordered = vec![("msg".to_string(), Value::Text("hello".into()))];
         let key = build_primary_key("events", &entry, &ordered).unwrap();

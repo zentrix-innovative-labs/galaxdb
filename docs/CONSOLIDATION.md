@@ -641,3 +641,29 @@ Verification (actually run on macOS):
 - `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
 
 **Pragmatic note on wheel rebuilds**: the pytest test needed a refreshed `galaxdb` Python wheel. A debug `maturin develop` (no `--release`) rebuilt the wheel in roughly the same time as the first release build — Lance's debug tree is the bottleneck for both. Going forward, incremental rebuilds (changing only `galaxdb-sql` and `galaxdb-embedded`) are much faster because Lance is cached. Do not rebuild in `--release` unless the tests need release-mode behaviour (they don't for correctness; they do for the server integration tests that demand the `--release` binary at `target/release/galaxdb-server`).
+
+### Phase P — Task 36 (`_galaxdb_training_exports` system table, append-only)
+
+Every training export now lands a persistent audit row. Task 36's four subtasks closed together.
+
+Files touched in Phase P:
+- `crates/galaxdb-common/src/error.rs` — new `GalaxError::AppendOnlyTable { table, operation }` variant. Typed error, no silent fake-ok.
+- `crates/galaxdb-sql/src/executor.rs` — `TableEntry::append_only: bool` field; `TRAINING_EXPORTS_TABLE` const; `is_system_append_only_table` helper; `exec_create_table` sets the flag on system tables; `exec_update` + `exec_delete` return `AppendOnlyTable` when targeting a flagged table.
+- `crates/galaxdb-sql/src/row_codec.rs`, `crates/galaxdb-sql/src/executor_tests.rs` — constructor sites for `TableEntry` updated with the new field.
+- `crates/galaxdb-embedded/src/lib.rs`:
+  - New `EngineBackedLineageSink` (implements `TrainingExportLineageSink`) that writes lineage rows through `Engine::put_sync`. Uses a process-monotonic `AtomicU64` for `lineage_id` so two exports in the same wall-clock second produce two distinct rows.
+  - New `Database::ensure_training_exports_table` (idempotent DDL via `Database::execute`).
+  - `Database::training_dataset` now `&mut self`, runs the exporter with `InMemoryLineageSink` inside `block_on`, then flushes buffered entries through the engine-backed sink on the caller's thread (blocking primitives are forbidden inside a tokio worker — Phase I pattern).
+  - `Database::pick_training_table` skips tables with `append_only = true` so the lineage table itself isn't mistaken for the export source.
+  - 5 new tests exercising real system-table creation, UPDATE/DELETE rejection, stable content-hash on repeat exports, and that direct INSERT still works.
+- `galaxdb-python/src/lib.rs` — `training_dataset` takes `&mut self` through the PyO3 method signature to mirror the Rust API change.
+
+Verification (actually run on macOS):
+- `cargo test --workspace --exclude galaxdb-python --lib` → **716 passed / 0 failed** (was 711 at Phase O; +5 from task 36).
+- `bash scripts/grep-for-mocks.sh` + `bash scripts/check-tasks-no-stub-ticks.sh` → both OK.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+
+**Scope notes**:
+- `curriculum` column exists and is always `NULL` today. `TrainingExportLineage` doesn't carry a curriculum field yet; wiring it in when curriculum mode lands is additive and does not require an ALTER TABLE.
+- Direct user INSERTs against `_galaxdb_training_exports` are allowed (append-only blocks only UPDATE/DELETE). This is deliberate: the sink itself writes through an INSERT path, so a blanket INSERT ban would need a privileged write channel.
+- Python wheel rebuild not triggered in this phase — task 36 changes live below the FFI boundary and the existing pytest suite doesn't exercise the lineage table directly. The next phase that adds a Python-facing lineage API will drive the maturin rebuild.

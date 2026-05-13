@@ -62,6 +62,16 @@ pub enum GalaxError {
     #[error("cannot update embedding source column '{column}'; use DELETE + INSERT instead")]
     EmbeddingSourceUpdate { column: String },
 
+    /// A DELETE or UPDATE targeted an append-only system table. Append-
+    /// only tables (e.g. `_galaxdb_training_exports`, Req 38 / task 36)
+    /// reject any mutation beyond INSERT so the lineage they record
+    /// remains auditable.
+    #[error("table '{table}' is append-only and does not support {operation}")]
+    AppendOnlyTable {
+        table: String,
+        operation: &'static str,
+    },
+
     /// Write-write conflict under snapshot isolation.
     #[error("write-write conflict on key; transaction aborted")]
     WriteConflict,
