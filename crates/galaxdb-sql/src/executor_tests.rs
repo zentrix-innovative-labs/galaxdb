@@ -541,35 +541,59 @@ fn context_analyze_returns_row_count() {
 }
 
 #[test]
-fn context_backup_returns_not_yet_available() {
+fn context_backup_copies_files_to_target() {
+    // Task 37: BACKUP TO really flushes the memtable (no rows here so
+    // the flush is a no-op) and copies every `sst_*.pax` + `wal.log`
+    // from the engine data dir to the target dir. With an empty
+    // engine there are no SSTs, but the target directory must still
+    // exist and the command must succeed.
     let mut ctx = test_ctx();
-    let err = execute_with_context(
+    let target = tempfile::tempdir().expect("target tempdir");
+    let target_path = target.path().join("backup");
+    let result = execute_with_context(
         &QueryPlan::Backup {
-            path: "/tmp/x".to_string(),
+            path: target_path.to_string_lossy().into_owned(),
         },
         &mut ctx,
     )
-    .unwrap_err();
-    match err {
-        GalaxError::NotYetAvailable { task, .. } => assert_eq!(task, "37"),
-        other => panic!("expected NotYetAvailable, got {:?}", other),
-    }
+    .expect("BACKUP must succeed on an open engine");
+    let msg = match result {
+        ExecuteResult::Ok(m) => m,
+        other => panic!("expected Ok, got {other:?}"),
+    };
+    assert!(
+        msg.contains("BACKUP TO") && msg.contains("files copied"),
+        "expected a real BACKUP status message, got {msg}"
+    );
+    assert!(
+        target_path.exists() && target_path.is_dir(),
+        "BACKUP must create the target directory"
+    );
 }
 
 #[test]
-fn context_restore_returns_not_yet_available() {
+fn context_restore_validates_and_copies() {
+    // Task 37: RESTORE FROM validates every SST block checksum in
+    // the source dir before touching the live engine. An empty
+    // source dir passes validation trivially (zero SSTs, zero
+    // blocks) and RESTORE succeeds with "0 files copied".
     let mut ctx = test_ctx();
-    let err = execute_with_context(
+    let source = tempfile::tempdir().expect("source tempdir");
+    let result = execute_with_context(
         &QueryPlan::Restore {
-            path: "/tmp/x".to_string(),
+            path: source.path().to_string_lossy().into_owned(),
         },
         &mut ctx,
     )
-    .unwrap_err();
-    match err {
-        GalaxError::NotYetAvailable { task, .. } => assert_eq!(task, "37"),
-        other => panic!("expected NotYetAvailable, got {:?}", other),
-    }
+    .expect("RESTORE must succeed when the source has no corrupted files");
+    let msg = match result {
+        ExecuteResult::Ok(m) => m,
+        other => panic!("expected Ok, got {other:?}"),
+    };
+    assert!(
+        msg.contains("RESTORE FROM") && msg.contains("validated"),
+        "expected a real RESTORE status message, got {msg}"
+    );
 }
 
 #[test]

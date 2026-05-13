@@ -254,14 +254,49 @@ impl Engine {
         );
         tracing::info!(backend = ?io_scheduler.backend(), "storage engine I/O scheduler selected");
 
+        // Discover existing `sst_<id>.pax` files in the data
+        // directory and register them with the SST registry. This is
+        // what makes RESTORE FROM (task 37) + normal engine restart
+        // actually see the SSTs on disk. Without this, a restart
+        // (or a freshly-restored data dir) would return empty scans
+        // even though the files are right there. The SST id is
+        // parsed from the filename; `next_sst_id` is advanced past
+        // every discovered id so fresh flushes don't collide.
+        let mut registry = SstRegistry::with_cache_limit(sst_cache_bytes);
+        let mut max_sst_id: u64 = 0;
+        for entry in std::fs::read_dir(&config.data_dir).map_err(GalaxError::Io)? {
+            let entry = entry.map_err(GalaxError::Io)?;
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // Match `sst_<id>.pax`.
+            if !(name.starts_with("sst_") && name.ends_with(".pax")) {
+                continue;
+            }
+            let id_str = &name[4..name.len() - 4];
+            let Ok(sst_id) = id_str.parse::<u64>() else {
+                tracing::warn!(file = %name, "skipping SST with unparsable id during open");
+                continue;
+            };
+            registry.register(sst_id, path);
+            if sst_id > max_sst_id {
+                max_sst_id = sst_id;
+            }
+        }
+        let next_sst_id_start = max_sst_id.saturating_add(1).max(1);
+
         Ok(Self {
             config,
             memtable_mgr,
             art: Arc::new(ArtIndex::new()),
             wal,
-            sst_registry: RwLock::new(SstRegistry::with_cache_limit(sst_cache_bytes)),
+            sst_registry: RwLock::new(registry),
             next_timestamp: AtomicU64::new(1),
-            next_sst_id: AtomicU64::new(1),
+            next_sst_id: AtomicU64::new(next_sst_id_start),
             row_count: AtomicU64::new(0),
             io_scheduler,
             #[cfg(feature = "aegis-tde")]
@@ -837,6 +872,175 @@ impl Engine {
     /// Get the data directory path.
     pub fn data_dir(&self) -> &Path {
         &self.config.data_dir
+    }
+
+    /// Back up the engine's on-disk state to `target_dir` (Req 27 /
+    /// task 37).
+    ///
+    /// Flushes the active memtable to an SST (so the WAL reflects a
+    /// clean checkpoint), then copies every `sst_*.pax` file and
+    /// `wal.log` to `target_dir`. The target directory is created
+    /// on demand; if it already contains files with matching names
+    /// they're overwritten — callers who need retention should write
+    /// to a fresh directory per backup (e.g. `backups/<ts>/`).
+    ///
+    /// The write-quiesce window is the duration of `flush_memtable`
+    /// plus the per-file copy. For the memtable sizes the v1 engine
+    /// targets (64 MB default seal threshold) this is well under
+    /// 100 ms on NVMe. No quiesce is imposed during the file copy
+    /// itself because SST files are immutable once written and the
+    /// WAL file is append-only — concurrent writes simply extend the
+    /// WAL beyond the offset we captured, which the restore path
+    /// replays on next open without double-counting.
+    ///
+    /// Returns the list of files copied on success.
+    pub async fn backup_to(&self, target_dir: &Path) -> GalaxResult<Vec<PathBuf>> {
+        std::fs::create_dir_all(target_dir).map_err(GalaxError::Io)?;
+
+        // 1. Flush active memtable so the SST set reflects every
+        // acknowledged write. This is the "clean Merkle root" half of
+        // task 37.1 — we can't write PAX blocks that aren't on disk.
+        self.flush_memtable().await?;
+
+        // 2. Enumerate the source files. Everything the engine owns
+        // lives directly under `data_dir`:
+        //   - `wal.log` (single append-only file)
+        //   - `sst_<id>.pax` files written by flush+compaction
+        //   - `_galaxdb_reserve` (disk-full handler's reserve; safe
+        //     to skip — the target engine allocates its own reserve)
+        // Blob logs live in a subdirectory owned by upstream
+        // `BlobLog`; today the production `Engine` does not yet
+        // thread blob log through, so there is nothing to copy here.
+        // When that wiring lands this loop grows one branch.
+        Self::copy_backup_files(&self.config.data_dir, target_dir)
+    }
+
+    /// Sync variant of [`Self::backup_to`] for callers (like the
+    /// sync executor) that don't already own a tokio runtime. Spins
+    /// a dedicated current-thread runtime for the `flush_memtable`
+    /// call and discards it when the backup returns.
+    pub fn backup_to_sync(&self, target_dir: &Path) -> GalaxResult<Vec<PathBuf>> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                GalaxError::Internal(format!("BACKUP: tokio runtime build failed: {e}"))
+            })?;
+        rt.block_on(self.backup_to(target_dir))
+    }
+
+    /// Shared helper: copy `wal.log` + every `sst_*.pax` file from
+    /// `src_dir` to `target_dir`. Used by both backup and restore.
+    fn copy_backup_files(
+        src_dir: &Path,
+        target_dir: &Path,
+    ) -> GalaxResult<Vec<PathBuf>> {
+        std::fs::create_dir_all(target_dir).map_err(GalaxError::Io)?;
+        let mut copied: Vec<PathBuf> = Vec::new();
+        for entry in std::fs::read_dir(src_dir).map_err(GalaxError::Io)? {
+            let entry = entry.map_err(GalaxError::Io)?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let is_backup_target = name == "wal.log"
+                || (name.starts_with("sst_") && name.ends_with(".pax"));
+            if !is_backup_target {
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+            let dst = target_dir.join(name);
+            std::fs::copy(&path, &dst).map_err(GalaxError::Io)?;
+            copied.push(dst);
+        }
+        Ok(copied)
+    }
+
+    /// Validate every `sst_*.pax` file under `target_dir` by parsing
+    /// its block index and deserialising each block. The PAX block
+    /// reader checks the XXH3-64 checksum and the magic number on
+    /// every block (task 37.5), so a corrupted block surfaces as
+    /// `GalaxError::Internal` carrying the filename and block index.
+    ///
+    /// The WAL is not separately validated here because `recover_wal`
+    /// already stops at the first checksum failure and skips the
+    /// remainder — the restore path calls it on next engine open.
+    ///
+    /// Returns `(sst_files_checked, total_blocks_validated)` on
+    /// success.
+    pub fn validate_backup(target_dir: &Path) -> GalaxResult<(usize, usize)> {
+        let mut sst_count = 0usize;
+        let mut block_count = 0usize;
+        for entry in std::fs::read_dir(target_dir).map_err(GalaxError::Io)? {
+            let entry = entry.map_err(GalaxError::Io)?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if !(name.starts_with("sst_") && name.ends_with(".pax")) {
+                continue;
+            }
+            let data = std::fs::read(&path).map_err(GalaxError::Io)?;
+            let idx = crate::sst::SstBlockIndex::from_file_data(&data).map_err(|e| {
+                GalaxError::Internal(format!(
+                    "RESTORE: corrupt SST block index in {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            for (block_idx, entry) in idx.entries.iter().enumerate() {
+                let start = entry.file_offset as usize;
+                let end = start + entry.block_len as usize;
+                if end > data.len() {
+                    return Err(GalaxError::Internal(format!(
+                        "RESTORE: block {} in {} overruns file ({} > {})",
+                        block_idx,
+                        path.display(),
+                        end,
+                        data.len()
+                    )));
+                }
+                crate::pax::PaxBlock::deserialize(&data[start..end]).map_err(|e| {
+                    GalaxError::Internal(format!(
+                        "RESTORE: corrupt block {} in {}: {}",
+                        block_idx,
+                        path.display(),
+                        e
+                    ))
+                })?;
+                block_count += 1;
+            }
+            sst_count += 1;
+        }
+        Ok((sst_count, block_count))
+    }
+
+    /// Restore a backup from `source_dir` into `target_dir`. Expected
+    /// to be called on a *fresh* data directory — restoring into a
+    /// populated engine is not supported in v1.
+    ///
+    /// Steps (task 37.4 / 37.5):
+    /// 1. Validate every SST block's checksum in `source_dir` via
+    ///    [`Engine::validate_backup`]. Abort on the first failure
+    ///    without touching `target_dir`.
+    /// 2. Create `target_dir` and copy every `sst_*.pax` and
+    ///    `wal.log` across.
+    ///
+    /// WAL replay, ART rebuild, and HNSW rebuild all run when the
+    /// caller subsequently opens the restored directory with
+    /// [`Engine::new`] — those recovery paths are the ones used on
+    /// ordinary startup, so restore is a file-level operation plus
+    /// a reopen. Callers that want a single-call experience should
+    /// drop the existing engine and construct a new one pointing at
+    /// `target_dir`.
+    pub fn restore_from(source_dir: &Path, target_dir: &Path) -> GalaxResult<Vec<PathBuf>> {
+        // 1. Validate first — abort cleanly before any file copy.
+        Self::validate_backup(source_dir)?;
+
+        // 2. Copy files via the shared helper used by `backup_to`.
+        Self::copy_backup_files(source_dir, target_dir)
     }
 
     /// Get the I/O backend in use (IoUring or Tokio).

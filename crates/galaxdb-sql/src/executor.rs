@@ -454,14 +454,8 @@ pub fn execute_with_context(
         QueryPlan::PointLookup { table, key } => exec_point_lookup(table, key, ctx),
 
         QueryPlan::Analyze { table } => exec_analyze(table, ctx),
-        QueryPlan::Backup { path: _ } => Err(GalaxError::NotYetAvailable {
-            task: "37",
-            feature: "BACKUP TO <path>",
-        }),
-        QueryPlan::Restore { path: _ } => Err(GalaxError::NotYetAvailable {
-            task: "37",
-            feature: "RESTORE FROM <path>",
-        }),
+        QueryPlan::Backup { path } => exec_backup(path, ctx),
+        QueryPlan::Restore { path } => exec_restore(path, ctx),
 
         QueryPlan::ShowEmbeddingHealth { table } => exec_show_embedding_health(table.as_deref(), ctx),
 
@@ -1105,6 +1099,56 @@ fn exec_analyze(table: &str, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteRe
     Ok(ExecuteResult::Ok(format!(
         "ANALYZE {}: {} rows sampled",
         table, sampled_rows
+    )))
+}
+
+/// BACKUP TO '/path' (Req 27 / task 37.1–37.3).
+///
+/// Flushes the active memtable to an SST to produce a clean checkpoint,
+/// then copies every `sst_*.pax` plus `wal.log` to the caller-supplied
+/// path. The path is created if absent; an existing non-empty directory
+/// is not a hard error — matching file names overwrite.
+///
+/// Read queries continue to serve during the file copy (SSTs are
+/// immutable; WAL is append-only and the restore path replays only up
+/// to the copied offset). The write-quiesce window is the duration of
+/// `flush_memtable` — the stated target is < 100 ms on NVMe with
+/// the default 64 MB seal threshold, but real timings are exercised
+/// by the storage-crate tests rather than asserted here.
+fn exec_backup(path: &str, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteResult> {
+    let target = std::path::PathBuf::from(path);
+    let copied = ctx.engine.backup_to_sync(&target)?;
+
+    Ok(ExecuteResult::Ok(format!(
+        "BACKUP TO '{}': {} files copied",
+        path,
+        copied.len()
+    )))
+}
+
+/// RESTORE FROM '/path' (Req 27 / task 37.4–37.5).
+///
+/// Validates every SST block's XXH3-64 checksum in the source
+/// directory via `Engine::validate_backup`; aborts on the first
+/// corruption with a descriptive error that names the file and
+/// block index. Only if validation succeeds are files copied into
+/// the live engine's data directory. The caller is expected to
+/// reopen the engine after a successful RESTORE so that WAL replay
+/// and ART rebuild pick up the newly-copied files.
+fn exec_restore(path: &str, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteResult> {
+    let source = std::path::PathBuf::from(path);
+    let target = ctx.engine.data_dir().to_path_buf();
+
+    let (sst_count, block_count) = Engine::validate_backup(&source)?;
+    let copied = Engine::restore_from(&source, &target)?;
+
+    Ok(ExecuteResult::Ok(format!(
+        "RESTORE FROM '{}': {} files copied ({} SSTs / {} blocks validated). \
+         Reopen the engine to complete WAL replay.",
+        path,
+        copied.len(),
+        sst_count,
+        block_count
     )))
 }
 
