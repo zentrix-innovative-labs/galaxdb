@@ -13,6 +13,7 @@ members = [
     "crates/galaxdb-observe",
     "crates/galaxdb-server",
     "crates/galaxdb-embedded",
+    "galaxdb-python",
     "benchmarks",
     "tests/chaos",
 ]
@@ -47,6 +48,7 @@ memmap2 = "0.9"
 
 # Encryption
 aes-gcm = "0.10"
+aegis = "0.9"
 
 # AWS KMS
 aws-sdk-kms = "1"
@@ -69,14 +71,22 @@ half = "2"
 # Random number generation
 rand = "0.8"
 
+# Parallel computation
+rayon = "1.10"
+
+# Fast synchronization primitives
+parking_lot = "0.12"
+
 # Benchmarking
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # Testing utilities
 tempfile = "3"
 
-# Python FFI
-pyo3 = { version = "0.22", features = ["extension-module"] }
+# Python FFI. Bumped from 0.22 → 0.24 to close RUSTSEC-2025-0020
+# (PyString::from_object overread). Phase H advisories gate fails
+# on anything < 0.24.1.
+pyo3 = { version = "0.24", features = ["extension-module"] }
 
 # SQL parsing
 sqlparser = { version = "0.50", features = ["visitor"] }
@@ -91,7 +101,7 @@ axum = "0.7"
 # ort = "2"
 
 # io_uring (Linux only)
-# io-uring = "0.7"
+io-uring = "0.7"
 
 # Internal crates
 galaxdb-common = { path = "crates/galaxdb-common" }
@@ -106,3 +116,14 @@ galaxdb-sidecar = { path = "crates/galaxdb-sidecar" }
 galaxdb-observe = { path = "crates/galaxdb-observe" }
 galaxdb-server = { path = "crates/galaxdb-server" }
 galaxdb-embedded = { path = "crates/galaxdb-embedded" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

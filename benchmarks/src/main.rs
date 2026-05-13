@@ -1,11 +1,17 @@
 //! GalaxDB Macro-Benchmark Suite
 //!
-//! Standalone binary that runs three production-pattern workloads:
+//! Standalone binary that runs production-pattern workloads:
 //! 1. OLTP Write + Point Read
 //! 2. OLAP Column Scan
 //! 3. Mixed OLTP + OLAP
+//! 4. Cold-Cache Read (50M rows)
+//! 5. Vector Search (HNSW + SEMANTIC_MATCH)
 //!
 //! Outputs structured JSON results to stdout.
+
+mod vector_bench;
+mod sift_bench;
+mod integration_test;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,6 +27,7 @@ use tokio::sync::Mutex;
 use galaxdb_common::{BlockId, ColumnType};
 use galaxdb_storage::art::{ArtIndex, RowLocation};
 use galaxdb_storage::buffer_pool::{AccessType, BufferPool, CachedBlock};
+use galaxdb_storage::engine::{Engine, EngineConfig};
 use galaxdb_storage::memtable::Memtable;
 use galaxdb_storage::pax::{ColumnData, PaxBlock};
 
@@ -31,7 +38,7 @@ use galaxdb_storage::pax::{ColumnData, PaxBlock};
 #[derive(Parser, Debug)]
 #[command(name = "galaxdb-benchmarks", about = "GalaxDB macro-benchmark suite")]
 struct Cli {
-    /// Workload to run: oltp, olap, mixed, or all
+    /// Workload to run: oltp, olap, mixed, all, or coldcache
     #[arg(long, default_value = "all")]
     workload: String,
 
@@ -278,7 +285,7 @@ async fn run_oltp(
         sst_size_bytes: 64 * 1024 * 1024,
         max_rows_per_block: 100_000,
     };
-    let _ = galaxdb_storage::flush::flush_memtable(&flush_memtable, &flush_config, 1).await;
+    let _ = galaxdb_storage::flush::flush_memtable(&flush_memtable, &flush_config, 1, &galaxdb_io::TokioScheduler::new()).await;
 
     // Update ART entries for flushed rows to point to SST
     for i in 0..flush_count {
@@ -858,6 +865,182 @@ async fn run_mixed(
 }
 
 // ---------------------------------------------------------------------------
+// Workload 4: Cold-Cache Read (larger-than-RAM dataset)
+// ---------------------------------------------------------------------------
+
+async fn run_coldcache(
+    num_rows: u64,
+    num_reads: u64,
+    data_dir: &Path,
+) {
+    eprintln!("[COLDCACHE] Writing {} rows to engine...", num_rows);
+    eprintln!("[COLDCACHE] Methodology: SST cache = 10 MB (forces NVMe reads),");
+    eprintln!("[COLDCACHE]   SST size = 8 MB (~13K rows/SST), periodic flush every 100K rows");
+
+    let config = EngineConfig {
+        data_dir: data_dir.to_path_buf(),
+        memtable_size_bytes: 64 * 1024 * 1024,
+        back_pressure_bytes: 256 * 1024 * 1024,
+        wal_group_commit_ms: 1,
+        // Cold-cache settings: minimal SST cache forces NVMe reads.
+        sst_cache_bytes: 10 * 1024 * 1024, // 10 MB — forces cold reads
+        // 8 MB SSTs with 100-row blocks (~62KB each).
+        // A cold point read does a targeted pread of one ~62KB block
+        // from NVMe = ~18µs at 3.5 GB/s. The block index (in memory)
+        // maps block_offset → (file_offset, length) for O(1) lookup.
+        sst_size_bytes: 8 * 1024 * 1024,
+        max_rows_per_sst: 100, // ~62KB per block for fast point reads
+    };
+    let engine = Engine::new(config).unwrap();
+
+    // Write rows in batches, flushing to SST periodically to avoid OOM.
+    // With 50M rows × 600 bytes = 30GB, we can't hold everything in memory.
+    // Flush every 100K rows (~60MB) to keep memory usage under control
+    // and produce many small SST files for realistic cold-cache behavior.
+    let batch_size = 10_000u64;
+    let flush_interval = 100_000u64; // Flush to SST every 100K rows
+    let value_size = 600; // ~600 bytes per row → 50M rows = 30GB
+    let engine = Arc::new(engine);
+    let start = Instant::now();
+    let mut rows_since_flush = 0u64;
+    let mut total_flushed = 0u64;
+
+    for batch_start in (0..num_rows).step_by(batch_size as usize) {
+        let batch_end = (batch_start + batch_size).min(num_rows);
+        let eng = engine.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let mut batch: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity((batch_end - batch_start) as usize);
+            for i in batch_start..batch_end {
+                let key = format!("cc-key-{:012}", i).into_bytes();
+                let mut value = vec![0u8; value_size];
+                let seed = i.to_le_bytes();
+                for (j, byte) in value.iter_mut().enumerate() {
+                    *byte = seed[j % 8] ^ (j as u8);
+                }
+                batch.push((key, value));
+            }
+            eng.put_batch_sync(&batch).unwrap();
+        }).await.unwrap();
+
+        rows_since_flush += batch_end - batch_start;
+
+        // Flush to SST periodically to keep memory bounded
+        if rows_since_flush >= flush_interval {
+            let flushed = engine.flush_memtable().await.unwrap();
+            total_flushed += flushed;
+            rows_since_flush = 0;
+        }
+
+        if (batch_start / batch_size) % 500 == 0 {
+            let elapsed = start.elapsed().as_secs_f64();
+            let rows_done = batch_end;
+            let rate = rows_done as f64 / elapsed;
+            eprintln!(
+                "[COLDCACHE]   {}/{} rows ({:.0} rows/sec, {:.1}s elapsed, {} flushed to SST)",
+                rows_done, num_rows, rate, elapsed, total_flushed
+            );
+        }
+    }
+
+    let write_elapsed = start.elapsed();
+    let write_rate = num_rows as f64 / write_elapsed.as_secs_f64();
+    eprintln!(
+        "[COLDCACHE] Write complete: {} rows in {:.1}s ({:.0} rows/sec)",
+        num_rows, write_elapsed.as_secs_f64(), write_rate
+    );
+
+    // Final flush for any remaining rows in memtable
+    eprintln!("[COLDCACHE] Final flush of remaining memtable rows...");
+    let final_flushed = engine.flush_memtable().await.unwrap();
+    total_flushed += final_flushed;
+    eprintln!("[COLDCACHE] Total flushed to SST: {} rows across multiple SST files", total_flushed);
+
+    // Drop the OS page cache to ensure truly cold reads.
+    // On Linux, we can use sync + drop_caches.
+    #[cfg(target_os = "linux")]
+    {
+        eprintln!("[COLDCACHE] Dropping OS page cache for cold reads...");
+        // Sync all pending writes to disk
+        let _ = std::process::Command::new("sync").status();
+        // Drop page cache (requires root or appropriate permissions)
+        let drop_result = std::fs::write("/proc/sys/vm/drop_caches", "3");
+        if drop_result.is_err() {
+            eprintln!("[COLDCACHE] WARNING: Could not drop page cache (need sudo). Results may include OS cache hits.");
+        } else {
+            eprintln!("[COLDCACHE] Page cache dropped successfully.");
+        }
+    }
+
+    // Count SST files on disk
+    let sst_count = std::fs::read_dir(data_dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().map_or(false, |ext| ext == "pax"))
+                .count()
+        })
+        .unwrap_or(0);
+    eprintln!("[COLDCACHE] SST files on disk: {}", sst_count);
+
+    // Now read random keys and measure latency
+    eprintln!("[COLDCACHE] Reading {} random keys...", num_reads);
+    let mut rng = SmallRng::seed_from_u64(42);
+    let mut hist = Histogram::<u64>::new(3).unwrap();
+    let mut missing_count = 0u64;
+
+    for i in 0..num_reads {
+        let key_id = rng.gen_range(0..num_rows);
+        let key = format!("cc-key-{:012}", key_id).into_bytes();
+
+        let read_start = Instant::now();
+        let result = engine.get(&key);
+        let elapsed_us = read_start.elapsed().as_micros() as u64;
+
+        let _ = hist.record(elapsed_us.min(60_000_000));
+
+        if result.is_none() {
+            missing_count += 1;
+        }
+
+        if i > 0 && i % 10_000 == 0 {
+            eprintln!("[COLDCACHE]   {}/{} reads done (missing so far: {})", i, num_reads, missing_count);
+        }
+    }
+
+    let p50 = hist.value_at_quantile(0.50);
+    let p99 = hist.value_at_quantile(0.99);
+    let p999 = hist.value_at_quantile(0.999);
+
+    eprintln!("[COLDCACHE] Results:");
+    eprintln!("  Rows written: {}", num_rows);
+    eprintln!("  Rows flushed to SST: {}", total_flushed);
+    eprintln!("  SST files: {}", sst_count);
+    eprintln!("  Reads: {}", num_reads);
+    eprintln!("  Missing keys: {} ({:.1}%)", missing_count, missing_count as f64 / num_reads as f64 * 100.0);
+    eprintln!("  Read p50: {} µs", p50);
+    eprintln!("  Read p99: {} µs", p99);
+    eprintln!("  Read p999: {} µs", p999);
+
+    // Output as JSON
+    println!("{{");
+    println!("  \"coldcache\": {{");
+    println!("    \"rows\": {},", num_rows);
+    println!("    \"rows_flushed\": {},", total_flushed);
+    println!("    \"sst_files\": {},", sst_count);
+    println!("    \"reads\": {},", num_reads);
+    println!("    \"missing_keys\": {},", missing_count);
+    println!("    \"read_p50_us\": {},", p50);
+    println!("    \"read_p99_us\": {},", p99);
+    println!("    \"read_p999_us\": {},", p999);
+    println!("    \"write_rate_rows_per_sec\": {:.0}", write_rate);
+    println!("  }}");
+    println!("}}");
+
+    engine.shutdown();
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -923,6 +1106,46 @@ async fn main() {
             )
             .await,
         );
+    }
+
+    if workload == "coldcache" {
+        // Cold-cache benchmark: NOT included in "all" because it takes 10+ minutes
+        // Usage: --workload coldcache --rows 50000000
+        run_coldcache(cli.rows, 100_000, &data_dir).await;
+        return;
+    }
+
+    if workload == "vector" || workload == "vector1m" {
+        // Vector search benchmark: 1M vectors, 128-dim
+        // Usage: --workload vector1m
+        vector_bench::run_vector_benchmark(1_000_000, 128, 500);
+        return;
+    }
+
+    if workload == "vector100k" {
+        // Quick vector benchmark: 100K vectors for fast iteration
+        vector_bench::run_vector_benchmark(100_000, 128, 100);
+        return;
+    }
+
+    if workload == "sift" || workload == "sift1m" {
+        // SIFT1M — the standard ANN benchmark dataset
+        let sift_dir = std::env::var("SIFT_DIR").unwrap_or_else(|_| "/home/ubuntu/sift".to_string());
+        sift_bench::run_sift_benchmark(&sift_dir);
+        return;
+    }
+
+    if workload == "integration" || workload == "e2e" {
+        // Full end-to-end integration test: Storage → SQL → HNSW → Delta → SEMANTIC_MATCH
+        integration_test::run_integration_test();
+        return;
+    }
+
+    if workload == "vector10m" {
+        // Vector search benchmark: 10M vectors, 128-dim
+        // Usage: --workload vector10m
+        vector_bench::run_vector_benchmark(10_000_000, 128, 200);
+        return;
     }
 
     let results = BenchmarkResults {

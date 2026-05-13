@@ -6,15 +6,22 @@ license.workspace = true
 rust-version.workspace = true
 description = "LSM, PAX, WAL, Memtable, ART, Bloom, Buffer Pool, Blob Log, Compactor"
 
+[features]
+default = ["aegis-tde"]
+aegis-tde = ["dep:galaxdb-crypto"]
+
 [dependencies]
 galaxdb-common.workspace = true
 galaxdb-io = { path = "../galaxdb-io" }
+galaxdb-crypto = { path = "../galaxdb-crypto", optional = true }
+galaxdb-observe = { path = "../galaxdb-observe" }
 crossbeam-skiplist.workspace = true
 xxhash-rust.workspace = true
 lz4_flex.workspace = true
 zstd.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+prometheus.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

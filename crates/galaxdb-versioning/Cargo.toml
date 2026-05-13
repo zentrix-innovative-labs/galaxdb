@@ -8,3 +8,28 @@ description = "Merkle DAG, Version Tags, Lance Exporter, MinHash Dedup"
 
 [dependencies]
 galaxdb-common.workspace = true
+# Sq8Quantizer / RabitqQuantizer for training-precision conversion during
+# Lance export (task 34.3). galaxdb-vector has no dependency on this crate,
+# so there is no cycle.
+galaxdb-vector.workspace = true
+xxhash-rust.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Lance 4.0.1 internally depends on arrow 57.0 — the user-facing
+# arrow dep MUST match Lance's internal version, otherwise Arrow
+# types from the user crate are incompatible with Lance's trait
+# bounds (RecordBatchReader, Schema, etc.).
+#
+# We explicitly disable Lance's default features (aws, azure, gcp, oss,
+# huggingface, tencent, geo) so no cloud-vendor SDK is pulled in
+# transitively. GalaxDB's training-export path only needs local
+# filesystem Lance datasets for v1; cloud-backed exports route through
+# ExternalCommandKeyProvider + object_store's filesystem backend, not
+# via Lance's built-in AWS / GCP / Azure clients. This is enforced by
+# the Phase H cargo-deny gate in `deny.toml`.
+lance = { version = "4.0", default-features = false }
+arrow = "57"
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

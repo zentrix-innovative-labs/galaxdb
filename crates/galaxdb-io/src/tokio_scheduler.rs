@@ -92,6 +92,7 @@ impl IoScheduler for TokioScheduler {
 
             f.seek(std::io::SeekFrom::Start(offset)).await?;
             f.write_all(data).await?;
+            f.flush().await?;
 
             let elapsed_us = start.elapsed().as_micros() as u64;
             self.latency.record(priority, elapsed_us);

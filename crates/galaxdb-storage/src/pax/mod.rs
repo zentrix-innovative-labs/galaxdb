@@ -167,8 +167,33 @@ impl PaxBlock {
         commit_timestamp: Timestamp,
         columns: &[ColumnData],
     ) -> GalaxResult<Self> {
+        // Use default codec selection per column type
+        let codecs: Vec<CodecId> = columns.iter()
+            .map(|col| CodecId::for_column_type(&col.col_type))
+            .collect();
+        Self::write_with_codecs(block_id, commit_timestamp, columns, &codecs)
+    }
+
+    /// Write a PAX block with explicit codec selection per column.
+    ///
+    /// This allows the caller to override the default codec for specific columns.
+    /// For example, the KV storage flush path uses `CodecId::None` for the value
+    /// column to enable fast single-row point reads without decompressing the
+    /// entire column.
+    pub fn write_with_codecs(
+        block_id: BlockId,
+        commit_timestamp: Timestamp,
+        columns: &[ColumnData],
+        codecs: &[CodecId],
+    ) -> GalaxResult<Self> {
         if columns.is_empty() {
             return Err(GalaxError::Internal("PAX block must have at least one column".into()));
+        }
+        if codecs.len() != columns.len() {
+            return Err(GalaxError::Internal(format!(
+                "codec count ({}) must match column count ({})",
+                codecs.len(), columns.len()
+            )));
         }
 
         let row_count = columns[0].values.len();
@@ -184,8 +209,8 @@ impl PaxBlock {
         let mut column_descriptors = Vec::with_capacity(columns.len());
         let mut column_data = Vec::new();
 
-        for col in columns {
-            let codec = CodecId::for_column_type(&col.col_type);
+        for (col_idx, col) in columns.iter().enumerate() {
+            let codec = codecs[col_idx];
             let zone_map = extract_zone_map(&col.col_type, &col.values);
             let offset = column_data.len() as u64;
 
@@ -350,6 +375,205 @@ impl PaxBlock {
 
         let compressed = &self.column_data[start..end];
         codec::decompress(&desc.col_type, desc.codec, compressed, self.header.row_count)
+    }
+
+    /// Read a single row from a specific column.
+    ///
+    /// For uncompressed columns (CodecId::None), this scans length prefixes
+    /// to the target row without decompressing the entire column — much faster
+    /// for point lookups.
+    ///
+    /// For compressed columns (Zstd, FastPFor), falls back to decompressing
+    /// the entire column and extracting the target row.
+    pub fn read_column_row(&self, col_index: usize, row_offset: u32) -> GalaxResult<Vec<u8>> {
+        if col_index >= self.header.column_descriptors.len() {
+            return Err(GalaxError::Internal(format!(
+                "column index {} out of range (block has {} columns)",
+                col_index,
+                self.header.column_descriptors.len()
+            )));
+        }
+
+        if row_offset >= self.header.row_count {
+            return Err(GalaxError::Internal(format!(
+                "row offset {} out of range (block has {} rows)",
+                row_offset, self.header.row_count
+            )));
+        }
+
+        let desc = &self.header.column_descriptors[col_index];
+        let start = desc.offset as usize;
+        let end = start + desc.compressed_len as usize;
+
+        if end > self.column_data.len() {
+            return Err(GalaxError::Internal("column chunk extends beyond column data".into()));
+        }
+
+        let column_bytes = &self.column_data[start..end];
+
+        match desc.codec {
+            CodecId::None => {
+                // Fast path: scan length prefixes to target row
+                codec::decompress_none_single_row(column_bytes, row_offset)
+            }
+            _ => {
+                // Slow path: decompress entire column, extract target row
+                let values = codec::decompress(&desc.col_type, desc.codec, column_bytes, self.header.row_count)?;
+                values.into_iter().nth(row_offset as usize)
+                    .ok_or_else(|| GalaxError::Internal("row offset out of range after decompression".into()))
+            }
+        }
+    }
+}
+
+/// Zero-copy extraction of a single value from raw PAX block bytes.
+///
+/// This is the fast path for point reads. Instead of deserializing the entire
+/// PAX block into a `PaxBlock` struct (which allocates Vecs for column data,
+/// row offsets, zone maps, etc.), this function:
+///
+/// 1. Verifies the XXH3-64 checksum (~1.8µs for 62KB)
+/// 2. Parses just enough of the header to find the target column's offset and codec
+/// 3. Slices directly into the raw bytes (zero-copy) to get the column data
+/// 4. Scans length prefixes to the target row (for CodecId::None)
+/// 5. Copies only the target row's value bytes
+///
+/// This eliminates the ~62KB memcpy and multiple heap allocations that
+/// `PaxBlock::deserialize` + `read_column_row` would do.
+///
+/// Target: < 10µs for a single row extraction from a 62KB block.
+pub fn read_value_from_raw_block(
+    block_data: &[u8],
+    col_index: usize,
+    row_offset: u32,
+) -> GalaxResult<Vec<u8>> {
+    if block_data.len() < 8 {
+        return Err(GalaxError::Internal("block too small".into()));
+    }
+
+    // Step 1: Verify checksum
+    let checksum_offset = block_data.len() - 8;
+    let stored_checksum = u64::from_le_bytes(
+        block_data[checksum_offset..].try_into()
+            .map_err(|_| GalaxError::Internal("bad checksum bytes".into()))?
+    );
+    let computed_checksum = xxh3_64(&block_data[..checksum_offset]);
+    if computed_checksum != stored_checksum {
+        return Err(GalaxError::ChecksumMismatch {
+            expected: stored_checksum,
+            actual: computed_checksum,
+        });
+    }
+
+    let data = &block_data[..checksum_offset];
+
+    // Step 2: Parse minimal header — just enough to find the target column.
+    // Fixed header: magic(4) + version(1) + block_id(8) + row_count(4) + timestamp(8) + col_count(2) = 27 bytes
+    if data.len() < 27 {
+        return Err(GalaxError::Internal("block too small for header".into()));
+    }
+
+    // magic(4) + version(1) + block_id(8) = 13 bytes before row_count
+    let row_count = u32::from_le_bytes(data[13..17].try_into().unwrap());
+    // row_count(4) + timestamp(8) = 12 more bytes, then col_count at offset 25
+    let column_count = u16::from_le_bytes(data[25..27].try_into().unwrap()) as usize;
+
+    if col_index >= column_count {
+        return Err(GalaxError::Internal("column index out of range".into()));
+    }
+    if row_offset >= row_count {
+        return Err(GalaxError::Internal("row offset out of range".into()));
+    }
+
+    // Step 3: Skip through column descriptors to find the target column.
+    // Each descriptor: col_type(1) [+ embedding_dims(4)] + codec(1) + offset(8) + compressed_len(4) + zone_min_len(4) + zone_min + zone_max_len(4) + zone_max
+    let mut pos = 27; // after fixed header
+    let mut target_offset: u64 = 0;
+    let mut target_len: u32 = 0;
+    let mut target_codec: u8 = 0;
+    let mut header_end_pos: usize = 0;
+
+    for col in 0..column_count {
+        if pos >= data.len() {
+            return Err(GalaxError::Internal("header truncated".into()));
+        }
+
+        let col_type_byte = data[pos];
+        pos += 1;
+
+        // Embedding type has extra 4 bytes for dimensions
+        if col_type_byte == 14 {
+            pos += 4;
+        }
+
+        // codec: u8
+        let codec = data[pos];
+        pos += 1;
+
+        // offset: u64
+        let offset = u64::from_le_bytes(
+            data[pos..pos + 8].try_into()
+                .map_err(|_| GalaxError::Internal("bad column offset".into()))?
+        );
+        pos += 8;
+
+        // compressed_len: u32
+        let compressed_len = u32::from_le_bytes(
+            data[pos..pos + 4].try_into()
+                .map_err(|_| GalaxError::Internal("bad compressed_len".into()))?
+        );
+        pos += 4;
+
+        // zone_map_min: skip
+        let min_len = u32::from_le_bytes(
+            data[pos..pos + 4].try_into()
+                .map_err(|_| GalaxError::Internal("bad zone_min_len".into()))?
+        ) as usize;
+        pos += 4 + min_len;
+
+        // zone_map_max: skip
+        let max_len = u32::from_le_bytes(
+            data[pos..pos + 4].try_into()
+                .map_err(|_| GalaxError::Internal("bad zone_max_len".into()))?
+        ) as usize;
+        pos += 4 + max_len;
+
+        if col == col_index {
+            target_offset = offset;
+            target_len = compressed_len;
+            target_codec = codec;
+        }
+
+        // After the last column descriptor, pos is the start of column data
+        if col == column_count - 1 {
+            header_end_pos = pos;
+        }
+    }
+
+    // Step 4: Slice directly into the column data (zero-copy)
+    let col_data_start = header_end_pos + target_offset as usize;
+    let col_data_end = col_data_start + target_len as usize;
+
+    if col_data_end > data.len() {
+        return Err(GalaxError::Internal("column data extends beyond block".into()));
+    }
+
+    let column_bytes = &data[col_data_start..col_data_end];
+
+    // Step 5: Extract the target row
+    match CodecId::from_u8(target_codec) {
+        Some(CodecId::None) => {
+            // Fast path: scan length prefixes to target row (zero-copy until final copy)
+            codec::decompress_none_single_row(column_bytes, row_offset)
+        }
+        Some(codec_id) => {
+            // Slow path: decompress entire column
+            let col_type = ColumnType::Blob; // KV storage always uses Blob
+            let values = codec::decompress(&col_type, codec_id, column_bytes, row_count)?;
+            values.into_iter().nth(row_offset as usize)
+                .ok_or_else(|| GalaxError::Internal("row not found after decompression".into()))
+        }
+        None => Err(GalaxError::Internal(format!("unknown codec: {}", target_codec))),
     }
 }
 

@@ -14,16 +14,77 @@
 //!
 //! After an operator frees disk space, [`DiskFullHandler::recover`] re-creates
 //! the reserve file and unblocks writes.
+//!
+//! ## Metric
+//!
+//! The handler owns a process-wide `prometheus::IntGauge` named
+//! `galaxdb_disk_full`. It reads `1` while the engine is in disk-full mode
+//! and `0` while the engine is in normal operation. The gauge is registered
+//! with the default Prometheus registry exposed by `galaxdb-observe` so
+//! that the `/metrics` endpoint can scrape it.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use prometheus::{IntGauge, Registry};
 use tracing::{error, info, warn};
 
 use galaxdb_common::{GalaxError, GalaxResult};
 
 /// Default reserve file name.
 const RESERVE_FILE_NAME: &str = "_galaxdb_reserve";
+
+/// Metric name for the disk-full gauge.
+const DISK_FULL_METRIC_NAME: &str = "galaxdb_disk_full";
+
+/// Help string published alongside the `galaxdb_disk_full` metric.
+const DISK_FULL_METRIC_HELP: &str =
+    "Set to 1 while the storage engine is in disk-full recovery mode, 0 otherwise.";
+
+/// Process-wide instance of the `galaxdb_disk_full` gauge.
+///
+/// Registration with the Prometheus registry must be idempotent — a single
+/// process may construct multiple [`DiskFullHandler`] instances (one per
+/// `Engine`) and Prometheus rejects duplicate registration with `AlreadyReg`.
+/// The `OnceLock` guarantees a single registration attempt; every handler
+/// then clones the `IntGauge` (cheap, it is an `Arc` internally).
+static DISK_FULL_GAUGE: OnceLock<IntGauge> = OnceLock::new();
+
+/// Register the `galaxdb_disk_full` gauge with `registry` exactly once per
+/// process.
+///
+/// The `OnceLock` makes registration idempotent: the first caller creates the
+/// gauge and registers it with the provided Prometheus registry; every
+/// subsequent caller (other `DiskFullHandler` instances, other crates that
+/// want to read the same signal) receives a clone of the same `IntGauge`
+/// handle. Cloning an `IntGauge` is cheap — internally it is an `Arc` — and
+/// every clone observes the same counter value, so `/metrics` scrapes stay
+/// consistent across callers.
+///
+/// Any Prometheus error other than the `OnceLock`-guarded first registration
+/// is a hard failure. Surfacing it as a panic matches the engineering-
+/// principles rule that forbids silent fallbacks: if we cannot register the
+/// metric there is no correct fallback, and handing back a detached gauge
+/// that `/metrics` cannot see would be exactly the kind of silent fake
+/// behaviour the rule exists to prevent.
+fn get_or_register_disk_full_gauge(registry: &Registry) -> IntGauge {
+    DISK_FULL_GAUGE
+        .get_or_init(|| {
+            let gauge = IntGauge::new(DISK_FULL_METRIC_NAME, DISK_FULL_METRIC_HELP)
+                .expect("galaxdb_disk_full gauge construction must not fail");
+            registry
+                .register(Box::new(gauge.clone()))
+                .unwrap_or_else(|err| {
+                    panic!(
+                        "failed to register {DISK_FULL_METRIC_NAME} with the Prometheus \
+                         registry: {err}"
+                    )
+                });
+            gauge
+        })
+        .clone()
+}
 
 /// Handles disk-full detection and recovery for the storage engine.
 ///
@@ -39,6 +100,8 @@ pub struct DiskFullHandler {
     reserve_size: u64,
     /// `true` when the engine is in disk-full mode (writes blocked).
     disk_full: AtomicBool,
+    /// Prometheus gauge emitting `1` while in disk-full mode, `0` otherwise.
+    gauge: IntGauge,
 }
 
 impl DiskFullHandler {
@@ -65,10 +128,18 @@ impl DiskFullHandler {
             "pre-allocated disk-full reserve file"
         );
 
+        // Wire up the Prometheus gauge against the process-wide registry.
+        // Registration is idempotent — the `OnceLock` guarantees a single
+        // register call regardless of how many `DiskFullHandler` instances
+        // are created.
+        let gauge = get_or_register_disk_full_gauge(galaxdb_observe::default_registry());
+        gauge.set(0);
+
         Ok(Self {
             reserve_path,
             reserve_size,
             disk_full: AtomicBool::new(false),
+            gauge,
         })
     }
 
@@ -76,7 +147,7 @@ impl DiskFullHandler {
     ///
     /// 1. Deletes the reserve file to free space.
     /// 2. Sets the disk-full flag so that [`is_disk_full`] returns `true`.
-    /// 3. Logs an error and emits the `_disk_full` metric conceptually.
+    /// 3. Sets the `galaxdb_disk_full` gauge to `1` and logs an error.
     ///
     /// The caller is responsible for performing a clean checkpoint (flush
     /// memtable + write checkpoint record) after this method returns.
@@ -110,13 +181,10 @@ impl DiskFullHandler {
         // Step 2: Set the disk-full flag (blocks writes).
         self.disk_full.store(true, Ordering::SeqCst);
 
-        // Step 3: Log error and emit metric.
+        // Step 3: Publish the metric and log the error. Prometheus scrapers
+        // reading `/metrics` will now see `galaxdb_disk_full 1`.
+        self.gauge.set(1);
         error!("disk full detected — all writes are now blocked until space is freed");
-
-        // The `_disk_full` metric would be incremented here via the
-        // observability module. For now we rely on the tracing log line
-        // and the `is_disk_full()` flag which the metrics collector can
-        // poll.
 
         Ok(())
     }
@@ -148,6 +216,8 @@ impl DiskFullHandler {
 
         // Clear the flag — writes are unblocked.
         self.disk_full.store(false, Ordering::SeqCst);
+        // Publish the metric back to the healthy state.
+        self.gauge.set(0);
 
         info!(
             path = %self.reserve_path.display(),
@@ -166,6 +236,14 @@ impl DiskFullHandler {
     /// Returns the configured reserve file size in bytes.
     pub fn reserve_size(&self) -> u64 {
         self.reserve_size
+    }
+
+    /// Return the current value of the `galaxdb_disk_full` Prometheus gauge.
+    ///
+    /// Exposed so callers (and tests) can read the same metric that Prometheus
+    /// scrapers see without having to parse `/metrics` output.
+    pub fn disk_full_gauge(&self) -> i64 {
+        self.gauge.get()
     }
 
     // ------------------------------------------------------------------

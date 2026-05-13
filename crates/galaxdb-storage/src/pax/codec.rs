@@ -82,6 +82,44 @@ fn decompress_none(
     Ok(values)
 }
 
+/// Read a single row from uncompressed (CodecId::None) column data.
+///
+/// Scans through length-prefixed values to reach the target row.
+/// Much faster than decompressing the entire column when only one row is needed.
+pub fn decompress_none_single_row(
+    data: &[u8],
+    target_row: u32,
+) -> GalaxResult<Vec<u8>> {
+    let mut offset = 0;
+
+    for row in 0..=target_row {
+        if offset + 4 > data.len() {
+            return Err(GalaxError::Internal(
+                "unexpected end of uncompressed column data".into(),
+            ));
+        }
+        let len = u32::from_le_bytes(
+            data[offset..offset + 4]
+                .try_into()
+                .map_err(|_| GalaxError::Internal("failed to read value length".into()))?,
+        ) as usize;
+        offset += 4;
+
+        if offset + len > data.len() {
+            return Err(GalaxError::Internal(
+                "value extends beyond column data".into(),
+            ));
+        }
+
+        if row == target_row {
+            return Ok(data[offset..offset + len].to_vec());
+        }
+        offset += len;
+    }
+
+    Err(GalaxError::Internal("target row not reached".into()))
+}
+
 // --- FastPFOR: delta encoding + bit-packing (codec 1) ---
 
 /// Compress fixed-width integer values using delta encoding + bit-packing.

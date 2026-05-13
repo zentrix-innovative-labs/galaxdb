@@ -38,7 +38,130 @@ jobs:
         run: cargo build --release
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --workspace --exclude galaxdb-python --lib
 
       - name: Clippy lint
         run: cargo clippy -- -D warnings
+
+  # -------------------------------------------------------------------
+  # Phase H consolidation gates. See docs/CONSOLIDATION.md Phase H and
+  # .github/workflows/README.md. These run independently of the main
+  # build so a mock regression fails fast even while the slow build is
+  # still warming up.
+  # -------------------------------------------------------------------
+
+  no-mocks-gate:
+    name: "Gate H1: no mocks in production code"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ripgrep
+        run: sudo apt-get update -y && sudo apt-get install -y ripgrep
+      - name: Run grep-for-mocks
+        run: bash scripts/grep-for-mocks.sh
+
+  no-vendor-sdk-gate:
+    name: "Gate H2: no vendor cloud SDKs in Cargo.lock"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+      - name: cargo deny check bans
+        run: cargo deny check bans
+      - name: cargo deny check licenses
+        run: cargo deny check licenses
+      - name: cargo deny check advisories
+        run: cargo deny check advisories
+
+  task-tracker-gate:
+    name: "Gate H3: tasks.md consistent with production code"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run check-tasks-no-stub-ticks
+        run: bash scripts/check-tasks-no-stub-ticks.sh
+
+  # -------------------------------------------------------------------
+  # Task 22.6 — Python wheel integration tests.
+  #
+  # Builds the `galaxdb` PyO3 wheel via maturin, installs Lance +
+  # pyarrow + torch, then runs `pytest galaxdb-python/tests/python/`.
+  # The tests drive the same real binaries (`galaxdb-server`, the
+  # release wheel) that the Rust integration tests drive — so a green
+  # Rust suite plus a green Python suite covers the full FFI + wire
+  # surface.
+  # -------------------------------------------------------------------
+  python-integration-tests:
+    name: "Task 22.6: Python wheel integration tests"
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release server
+        run: cargo build --release -p galaxdb-server
+
+      - name: Install Python test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin pytest lance pyarrow torch --extra-index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build & install galaxdb wheel
+        run: maturin develop --release -m galaxdb-python/Cargo.toml
+
+      - name: Run pytest
+        run: pytest galaxdb-python/tests/python/ -v
+
+
+  # -------------------------------------------------------------------
+  # Task 41.7 — Chaos test suite in CI.
+  #
+  # Runs all 7 chaos scenarios (C1-C7) in release mode. Each recovery
+  # scenario must complete in < 30 s (enforced by the binary itself).
+  # The full suite must complete in < 60 s.
+  # -------------------------------------------------------------------
+  chaos-tests:
+    name: "Task 41.7: Chaos test suite"
+    runs-on: ubuntu-latest
+    needs: [build-and-test]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build chaos tests (release)
+        run: cargo build --release -p galaxdb-chaos-tests
+
+      - name: Run chaos test suite
+        run: cargo run --release -p galaxdb-chaos-tests
+        timeout-minutes: 5

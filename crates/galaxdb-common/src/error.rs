@@ -62,6 +62,16 @@ pub enum GalaxError {
     #[error("cannot update embedding source column '{column}'; use DELETE + INSERT instead")]
     EmbeddingSourceUpdate { column: String },
 
+    /// A DELETE or UPDATE targeted an append-only system table. Append-
+    /// only tables (e.g. `_galaxdb_training_exports`, Req 38 / task 36)
+    /// reject any mutation beyond INSERT so the lineage they record
+    /// remains auditable.
+    #[error("table '{table}' is append-only and does not support {operation}")]
+    AppendOnlyTable {
+        table: String,
+        operation: &'static str,
+    },
+
     /// Write-write conflict under snapshot isolation.
     #[error("write-write conflict on key; transaction aborted")]
     WriteConflict,
@@ -101,6 +111,20 @@ pub enum GalaxError {
     /// A backup or restore operation failed.
     #[error("backup/restore error: {0}")]
     BackupRestore(String),
+
+    // -- Execution paths that are scheduled for a later task --
+    /// The requested feature has not been implemented yet. Carries the
+    /// task ID from `.kiro/specs/galaxdb-v1-engine/tasks.md` that will
+    /// land it. This is deliberately a typed error rather than a fake
+    /// `Ok` return — see the engineering principles in
+    /// `.kiro/steering/engineering-principles.md`.
+    #[error("feature not yet available (tracked by task {task}): {feature}")]
+    NotYetAvailable {
+        /// The task identifier, e.g. `"37"` or `"40.3"`.
+        task: &'static str,
+        /// Human-readable description of what the caller asked for.
+        feature: &'static str,
+    },
 
     // -- Generic catch-all --
     /// An internal error that doesn't fit other categories.

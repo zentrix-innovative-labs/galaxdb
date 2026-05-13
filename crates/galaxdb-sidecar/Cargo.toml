@@ -4,7 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Embedding Sidecar binary (ort crate, Unix socket, backlog)"
+description = "Embedding Sidecar binary (Candle, Unix socket, backlog)"
+
+[features]
+# Enable tests that launch the real sidecar binary and download a
+# sentence-transformer model from HuggingFace Hub (~90 MB on first run).
+# Off by default so `cargo test -p galaxdb-sidecar` stays hermetic.
+online-tests = []
+
+[lib]
+name = "galaxdb_sidecar"
+path = "src/lib.rs"
 
 [[bin]]
 name = "galaxdb-sidecar"
@@ -12,3 +22,19 @@ path = "src/main.rs"
 
 [dependencies]
 galaxdb-common.workspace = true
+galaxdb-observe.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+candle-core = "0.10"
+candle-nn = "0.10"
+candle-transformers = "0.10"
+hf-hub = "0.4"
+tokenizers = "0.21"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

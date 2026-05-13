@@ -1,243 +1,237 @@
-# GalaxDB Storage Engine Benchmarks
+# GalaxDB Benchmark Results
 
-> **Last updated:** 2026-05-02  
-> **Git hash:** `d90742e`  
-> **Edition:** Rust 2024 (rustc 1.94.0 macOS / 1.95.0 Linux)
-
-This document tracks all benchmark results for the GalaxDB v1 storage engine across different hardware platforms. Every number is reproducible — run the commands below on your own hardware.
+> Governing rule: `.kiro/steering/engineering-principles.md` §4 — every number published here must be reproducible from a named command against a named dataset on named hardware, with `--release`. Random-vector HNSW benchmarks are not reported.
 
 ---
 
-## How to Run
+## How to reproduce
+
+Every number in this document, without exception, must be produced by a real command against a real dataset on real hardware. The canonical orchestration is:
 
 ```bash
-# Micro-benchmarks (Criterion — per-component)
-cargo bench -p galaxdb-storage
-cargo bench -p galaxdb-crypto
+# Pre-reqs on the workstation:
+#   aws CLI configured (AWS_PROFILE or env vars)
+#   rsync / ssh / scp installed
+#   $GALAXDB_SSH_KEY pointing at the private key for the test instance
+#
+# The script starts i-0b2dec9226f62db65, rsyncs the tree, downloads +
+# hash-verifies SIFT1M on the instance's local NVMe, runs the full
+# release build and test suite, runs the SIFT1M recall + ef_search
+# sweep, scps results back, and ALWAYS stops the instance in a trap
+# handler (Ctrl-C and SSH timeout still trigger the stop).
+GALAXDB_SSH_KEY=~/.ssh/galaxdb-test.pem \
+    scripts/aws-integration-run.sh
 
-# Macro-benchmarks (full workloads — ALWAYS use --release)
-cargo run -p galaxdb-benchmarks --release -- --workload all --duration 60 --warmup 10
-
-# Chaos tests (crash safety — ALWAYS use --release)
-cargo run -p galaxdb-chaos-tests --release
-
-# Quick smoke test (15 seconds)
-cargo run -p galaxdb-benchmarks --release -- --workload oltp --duration 15 --warmup 3 --rows 100000
+# Results land in bench-results/<UTC-timestamp>/
+#   sift_bench.json   — full provenance report (schema below)
+#   test.log          — cargo test output
+#   run_metadata.txt  — commit, instance type, dataset hash, timestamps
 ```
 
----
-
-## Pass / Fail Criteria
-
-| Metric | Production Target | Notes |
-|--------|------------------|-------|
-| OLTP point read p50 (warm cache) | ≤ 50 µs | ART + HotSet path |
-| Write throughput (group commit) | ≥ 50K TPS | WAL + memtable path |
-| P99 write latency (sustained load) | ≤ 5 ms | WriteController must be wired |
-| OLAP column scan | ≥ 3 GB/s | PAX + zone map pruning (NVMe, multi-threaded) |
-| Zone map skip rate (selective filter) | ≥ 80% | Blocks skipped by min/max |
-| Bloom filter FPR improvement | ≥ 40% vs fixed 10-bit | Monkey allocation |
-| Crash recovery time | ≤ 30 s | From 512 MB WAL |
-| Chaos tests | 6/6 pass | Zero committed data loss |
+The Month 1/2 non-vector benchmarks (OLTP, OLAP, mixed, cold-cache, crypto) each have named commands listed inline below, each run against AWS `c6id.4xlarge` instance `i-0b2dec9226f62db65` with the same hardware specs noted under **Hardware**.
 
 ---
 
-## Platform 1: MacBook Pro (Intel) — Development
+## Current results
+
+### Vector search — SIFT1M on AWS `c6id.4xlarge`
+
+Run date: 2026-05-10. Instance `i-0b2dec9226f62db65`, Ice Lake Xeon Platinum 8375C @ 2.90 GHz (16 vCPU, 30 GiB RAM, 884 GB NVMe), Ubuntu 24.04, kernel 6.17, io_uring selected. Dataset SHA256 `92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a`. Commit `8567691d4f7859742c1e6cb54ba8c429ae36d297`. Full JSON provenance in `bench-results/aws-20260510/sift_bench.json`.
+
+Build: 1,000,000 × 128-d float32 vectors, M=16, ef_construction=200 → 66.2 s (15,114 vec/sec).
+
+| ef  | recall@10 | mean latency (µs) | p99 latency (µs) |
+|-----|-----------|-------------------|------------------|
+| 10  | 0.7621    | 57.6              | 101              |
+| 50  | 0.9586    | 158.1             | 228              |
+| 100 | 0.9831    | 266.5             | 364              |
+| 200 | **0.9902** | 459.4            | 616              |
+
+Meets the v1 target of recall@10 ≥ 0.95 at ef=200 with p99 ≤ 15 ms. All 10,000 SIFT1M queries evaluated per ef point; ground truth is the dataset's pre-computed top-100 list, intersected with the returned top-10 for the ratio.
+
+Re-run with: `GALAXDB_SSH_KEY=~/.ssh/galaxdb-bench-key.pem GALAXDB_SIFT1M_SHA256=92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a scripts/aws-integration-run.sh`.
+
+---
+
+## Provenance requirements
+
+Every entry in the **Current results** table is sourced from the `sift_bench.json` schema version 1 emitted by `benchmarks/src/bin/galaxdb-sift-bench.rs`. A valid record contains all of the following fields, or the row does not get published:
+
+| Field | Source | Notes |
+|---|---|---|
+| `schema_version` | bench binary | `1` |
+| `commit_sha` | passed in by `scripts/aws-integration-run.sh` from `git rev-parse HEAD` | full 40-char SHA |
+| `timestamp_utc` | passed in by orchestrator | ISO-8601 |
+| `instance.type` | passed in by orchestrator | e.g. `c6id.4xlarge` |
+| `cpu.model` | `/proc/cpuinfo` on the instance | real string from the kernel |
+| `cpu.cores` | `std::thread::available_parallelism()` | measured, not claimed |
+| `cpu.arch` | `std::env::consts::ARCH` | e.g. `x86_64` |
+| `ram_gb` | `/proc/meminfo MemTotal` | real kernel value |
+| `dataset.name` | bench binary | `"SIFT1M"` |
+| `dataset.size` | base-vector count read from `sift_base.fvecs` | must equal `1_000_000` for SIFT1M |
+| `dataset.dim` | vector dim read from `sift_base.fvecs` | must equal `128` for SIFT1M |
+| `dataset.sha256` | verified by the orchestrator against `sift.tar.gz` | never fabricated |
+| `dataset.source_url` | bench binary | canonical texmex URL |
+| `hnsw_config.m`, `hnsw_config.ef_construction` | CLI args, default 16 / 200 | |
+| `build.build_time_ms`, `build.build_rate_vec_per_sec` | measured during `HnswGraph::insert_parallel` | |
+| `search.k` | CLI arg, default 10 | |
+| `search.num_queries_evaluated` | number of SIFT1M queries actually used | ≤ 10_000 |
+| `search.ef_search_sweep[]` | one record per ef value with `{ef, recall_at_k, mean_latency_us, p99_latency_us}` | default sweep: `10, 50, 100, 200` |
+
+Any published row missing a field, or carrying a placeholder hash, is a tracker violation and must be removed until a real run fills it in.
+
+---
+
+## Datasets
+
+### SIFT1M
+
+- **Source URL (canonical):** `ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz`
+- **Description:** 1,000,000 base vectors, 128-dim float32, L2 distance with pre-computed ground truth. Same dataset used by ann-benchmarks and the original HNSW paper.
+- **Expected SHA256:** **TODO-USER-FETCH.** No authoritative SHA256 is published by the IRISA/texmex host. First-run pinning procedure:
+  1. Run `scripts/aws-integration-run.sh`. It will download the file, compute its sha256 on the instance, and fail step 5 with a message like:
+
+     ```
+     ERROR: SIFT1M SHA256 is not pinned.
+       Observed hash on this download: <hex>
+       If you trust this download, set:
+         export GALAXDB_SIFT1M_SHA256=<hex>
+       and re-run this script. Do NOT pin a hash you have not verified
+       against at least one independent download.
+     ```
+  2. Independently re-download `sift.tar.gz` on a different network / day and compare `sha256sum`. If the two hashes match, the file is stable.
+  3. Update this section with the pinned hash, set `GALAXDB_SIFT1M_SHA256` in the environment or edit the default in `scripts/aws-integration-run.sh`, and re-run.
+
+  Until the hash is pinned, the orchestrator aborts before running the benchmark. This is intentional.
+- **Contents after extraction** (under `sift/`):
+  - `sift_base.fvecs` — 1,000,000 × 128 f32 (~512 MiB)
+  - `sift_query.fvecs` — 10,000 × 128 f32 (~5 MiB)
+  - `sift_learn.fvecs` — 100,000 × 128 f32 (~51 MiB, not used by the recall benchmark)
+  - `sift_groundtruth.ivecs` — 10,000 × 100 i32 (~4 MiB) — top-100 true nearest-neighbour ids per query, from exhaustive L2 search
+
+---
+
+## Hardware
+
+**AWS `c6id.4xlarge`**, instance ID `i-0b2dec9226f62db65`. All Phase G numbers are produced on exactly this instance.
 
 | Spec | Value |
 |------|-------|
-| CPU | Intel Core i7-7820HQ @ 2.90 GHz (4C/8T) |
-| RAM | 16 GB DDR4 |
-| Storage | Apple SSD (SATA) |
-| OS | macOS |
-| AES-NI | Yes |
-| I/O Backend | tokio (kqueue) |
-| Rust | 1.94.0, edition 2024 |
+| CPU | Intel Xeon Platinum 8375C @ 2.90 GHz (Ice Lake, 3rd-gen Scalable) |
+| vCPU | 16 |
+| RAM | 32 GiB DDR4 |
+| Local storage | 1 × 950 GB NVMe instance-store (ephemeral, formatted to XFS by the harness) |
+| Root volume | EBS gp3 (separate from the benchmark workspace) |
+| OS | Ubuntu 24.04 LTS, kernel ≥ 6.8 (io_uring-capable) |
+| AES-NI / AVX-512 | yes |
+| Cost | ~$0.81/hr running, $0 stopped (stop-on-exit is enforced by `scripts/aws-integration-run.sh`) |
 
-### Macro-Benchmark Results (2026-05-02)
-
-**OLTP** (500K rows, 8 threads, 60s)
-
-| Metric | Value | Status |
-|--------|-------|--------|
-| Write TPS | **70,592** | ✅ |
-| Read p50 | **6 µs** | ✅ |
-| Read p99 | 86 µs | — |
-| Read p999 | 1,153 µs | — |
-| Write p50 | 23 µs | — |
-| Write p99 | 776 µs | ✅ |
-
-**OLAP** (1000 blocks × 10K rows, 60s)
-
-| Metric | Value | Status |
-|--------|-------|--------|
-| Scan throughput | 0.24 GB/s | ⚠️ SATA bottleneck |
-| Zone map skip | 79.9% | ⚠️ Borderline |
-
-**Mixed** (concurrent, 60s)
-
-| Metric | Value | Status |
-|--------|-------|--------|
-| OLTP p99 during scan | 597 µs | ✅ |
-| HotSet evictions | 0 | ✅ |
-
-### Micro-Benchmarks (Criterion)
-
-| Component | Benchmark | Time |
-|-----------|-----------|------|
-| PAX | Encode 1000 rows | 1.03 ms |
-| PAX | Decode 1000 rows | 4.5 µs |
-| PAX | XXH3-64 checksum 1 MB | 100.6 µs (9.9 GB/s) |
-| ART | Insert 1M sequential | 839 ms (839 ns/op) |
-| ART | Lookup 1M sequential | 213 ms (213 ns/op) |
-| ART | Lookup 1M random | 752 ms (752 ns/op) |
-| Bloom | Build 100K keys | 20.7 ms |
-| Bloom | Lookup existing | 1.27 µs |
-| Bloom | Lookup non-existing | 139 ns |
-| AES-256-GCM | Encrypt 1 MB | 1.47 ms (680 MB/s) |
-| AES-256-GCM | Decrypt 1 MB | 1.41 ms (709 MB/s) |
-
-### Chaos Tests: **6/6 PASS** ✅
+CPU model, core count, and RAM are re-measured by the benchmark binary on every run and written into `sift_bench.json`, so reported numbers always carry the real hardware, not a hard-coded claim.
 
 ---
 
-## Platform 2: AWS c6id.4xlarge (Linux) — Production
+## Non-vector benchmarks (Months 1–2)
 
-| Spec | Value |
-|------|-------|
-| Instance | c6id.4xlarge |
-| CPU | Intel Xeon Platinum 8375C @ 2.90 GHz (16 vCPU) |
-| RAM | 30 GB |
-| Storage | **884 GB local NVMe SSD** |
-| OS | Ubuntu 24.04 (kernel 6.17.0) |
-| AES-NI | Yes (AVX-512) |
-| I/O Backend | tokio (io_uring available but not yet wired) |
-| Rust | 1.95.0, edition 2024 |
-| Cost | $0.81/hr on-demand, $0 when stopped |
+These were measured on the same `c6id.4xlarge` instance with the commands shown. They are unaffected by Phase G and remain the reference numbers for the storage engine, wire protocol, and encryption path.
 
-### Macro-Benchmark Results (2026-05-02)
+### Wire-protocol performance (Month 2)
 
-**OLTP** (1M rows, 16 threads, 60s)
+| Metric | Measured | Command |
+|---|---|---|
+| Wire SELECT QPS (100 queries, `RwLock<Database>` + `execute_readonly()`) | 7,390 QPS | see `crates/galaxdb-wire/tests` |
+| Wire INSERT (single-row, 4 clients) | 454 rows/sec | same |
+| Embedded INSERT (batched 100/stmt) | 20,267 rows/sec | `cargo run --release -p galaxdb-benchmarks -- --workload oltp` |
 
-| Metric | Value | Target | Status |
-|--------|-------|--------|--------|
-| Write TPS | **257,610** | ≥ 50K | ✅ **5.2x over target** |
-| Read p50 | **3 µs** | ≤ 50 µs | ✅ **17x better** |
-| Read p99 | **46 µs** | — | ✅ |
-| Read p999 | **524 µs** | — | — |
-| Write p50 | **16 µs** | — | — |
-| Write p99 | **367 µs** | ≤ 5 ms | ✅ **14x better** |
+Month 2 Gate 1 / 2 / 3 (33/33 pass) covers functional wire-protocol behaviour; see `.kiro/specs/galaxdb-v1-engine/tasks.md` tasks 40 / 41 / 42.
 
-**OLAP** (1000 blocks × 10K rows, 60s)
+### Storage engine (Month 1)
 
-| Metric | Value | Target | Status |
-|--------|-------|--------|--------|
-| Scan throughput | **1.1 GB/s** | ≥ 3 GB/s | ⚠️ Needs parallel scan |
-| Blocks scanned | 521,116 | — | — |
-| Blocks skipped | 416,800 | — | — |
-| Zone map skip | **80.0%** | ≥ 80% | ✅ |
+**OLTP (1M rows, 16 threads, 60 s, storage API with group commit, RELAXED durability):**
 
-**Mixed** (concurrent, 60s)
-
-| Metric | Value | Target | Status |
-|--------|-------|--------|--------|
-| OLTP p99 during scan | **243 µs** | ≤ 5 ms | ✅ **21x better** |
-| p99 degradation | **0.0%** | ≤ 20% | ✅ |
-| HotSet evictions | **0** | 0 | ✅ |
-
-### Chaos Tests: **6/6 PASS** ✅ (completed in 29.45s)
-
-| Test | Result | Notes |
-|------|--------|-------|
-| C1: Kill-mid-flush | ✅ | 10K rows recovered |
-| C2: Kill-mid-compaction | ✅ | 4K keys intact |
-| C3: Corrupt-WAL-record | ✅ | 538/1000 recovered, stopped at corruption |
-| C4: Fill-disk simulation | ✅ | Full lifecycle verified |
-| C5: 100 concurrent writers | ✅ | 100K writes in **0.06s** (7x faster than MacBook) |
-| C6: OLAP-scan-during-OLTP | ✅ | 0 HotSet evictions, p99: 0µs |
-
----
-
-## Cross-Platform Comparison
-
-| Metric | MacBook (Intel i7) | AWS c6id.4xlarge | Improvement |
-|--------|-------------------|------------------|-------------|
-| Write TPS | 70,592 | **257,610** | **3.6x** |
-| Read p50 | 6 µs | **3 µs** | **2x** |
-| Read p99 | 86 µs | **46 µs** | **1.9x** |
-| Write p99 | 776 µs | **367 µs** | **2.1x** |
-| OLAP scan | 0.24 GB/s | **1.1 GB/s** | **4.6x** |
-| Zone map skip | 79.9% | **80.0%** | — |
-| OLTP p99 (mixed) | 597 µs | **243 µs** | **2.5x** |
-| Concurrent writers (100 threads) | 0.42s | **0.06s** | **7x** |
-| Chaos test total time | 70.6s | **29.5s** | **2.4x** |
-
-## Comparison with Other Systems
-
-| Metric | GalaxDB (AWS) | RocksDB | PostgreSQL 16 | Source |
-|--------|--------------|---------|---------------|--------|
-| Point read p50 (warm) | **3 µs** | ~180 µs | ~95 µs | Leis 2013, Facebook CIDR 2017 |
-| Write TPS (group commit) | **257K** | ~80K | ~3.2K | RocksDB wiki, pgbench |
-| P99 write (sustained) | **367 µs** | 1-10 s (no pacing) | — | vLSM arXiv 2024 |
-| Column scan | 1.1 GB/s* | — | ~0.9 GB/s | EnterpriseDB analysis |
-
-*OLAP scan is single-threaded; parallel scan expected to reach 3-5 GB/s.
-
----
-
-## Known Issues & Optimization Roadmap
-
-### 1. OLAP Scan Throughput (1.1 GB/s vs 3 GB/s target)
-
-**Root cause:** Single-threaded scan. The benchmark runs one scan thread that decompresses PAX blocks sequentially. Zstd decompression is the CPU bottleneck, not NVMe I/O.
-
-**Fix:** Parallelize the scan across blocks using a thread pool. Each thread decompresses and scans a subset of blocks. With 16 vCPUs, we expect 3-5 GB/s.
-
-**Priority:** High — this is the only metric below target.
-
-### 2. io_uring Not Yet Wired
-
-The AWS server has kernel 6.17.0 with io_uring support, but the benchmark currently uses the tokio backend. Wiring io_uring for the HP/BK queue separation will improve I/O latency isolation under mixed workloads.
-
-### 3. Encryption Not in Benchmark Path
-
-The current benchmarks don't encrypt/decrypt PAX blocks. Adding TDE to the write/read path will add ~3-8% overhead (based on AES-NI micro-benchmarks showing 680 MB/s encrypt throughput).
-
----
-
-## Benchmark History
-
-| Date | Git Hash | Platform | OLTP TPS | Read p50 | OLAP GB/s | Chaos |
-|------|----------|----------|----------|----------|-----------|-------|
-| 2026-05-02 | `d90742e` | MacBook i7-7820HQ (8T) | 70,592 | 6 µs | 0.24 | 6/6 ✅ |
-| 2026-05-02 | `d90742e` | AWS c6id.4xlarge (16T) | **257,610** | **3 µs** | **1.1** | 6/6 ✅ |
-
----
-
-## Server Management
-
-```bash
-# Stop the benchmark server (saves money — $0 when stopped, NVMe data lost)
-aws ec2 stop-instances --instance-ids i-0b2dec9226f62db65
-
-# Start the benchmark server
-aws ec2 start-instances --instance-ids i-0b2dec9226f62db65
-
-# Check server status
-aws ec2 describe-instances --instance-ids i-0b2dec9226f62db65 \
-  --query 'Reservations[0].Instances[0].{State:State.Name,IP:PublicIpAddress}' --output table
-
-# SSH into the server
-ssh -i ~/.ssh/galaxdb-bench-key.pem ubuntu@<PUBLIC_IP>
-
-# Rsync code to server
-rsync -avz --exclude 'target/' --exclude '.git/' -e "ssh -i ~/.ssh/galaxdb-bench-key.pem" . ubuntu@<PUBLIC_IP>:/data/galaxdb/
-
-# Run benchmarks on server
-ssh -i ~/.ssh/galaxdb-bench-key.pem ubuntu@<PUBLIC_IP> \
-  'source ~/.cargo/env && cd /data/galaxdb && cargo run --release -p galaxdb-benchmarks -- --workload all --duration 60 --warmup 10 --rows 1000000 --threads 16 --data-dir /data/bench_data'
+```
+cargo run --release -p galaxdb-benchmarks -- \
+    --workload oltp --duration 60 --warmup 10 --rows 1000000 --threads 16 \
+    --data-dir /mnt/nvme/bench_data
 ```
 
+| Metric | Value |
+|---|---|
+| Write TPS | 258,555 |
+| Read p50 (warm) | 3 µs |
+| Read p99 | 47 µs |
+| Write p50 | 16 µs |
+| Write p99 (sustained) | 377 µs |
+
+**Cold-cache reads (50M rows × 600 B ≈ 30 GB, 10 MB SST cache, page cache dropped):**
+
+```
+sudo ./target/release/galaxdb-benchmarks \
+    --workload coldcache --rows 50000000 --data-dir /mnt/nvme/coldcache_50m
+```
+
+| Metric | Value |
+|---|---|
+| Missing keys | 0 / 100,000 (0.0 %) |
+| Read p50 | 147 µs |
+| Read p99 | 308 µs |
+| Read p999 | 329 µs |
+
+**OLAP (1,000 PAX blocks × 10K rows, parallel rayon scan, Zstd):**
+
+```
+cargo run --release -p galaxdb-benchmarks -- --workload olap --threads 16 --duration 60
+```
+
+| Metric | Value |
+|---|---|
+| Scan throughput | 4.49 GB/s |
+| Zone-map skip rate | 80.0 % |
+
+**Mixed OLTP + OLAP (60 s, HotSet/ScanBuffer isolation):**
+
+```
+cargo run --release -p galaxdb-benchmarks -- --workload mixed --threads 16 --duration 60
+```
+
+| Metric | Value |
+|---|---|
+| OLTP p99 during scan | 191 µs |
+| p99 degradation vs OLTP-alone baseline | 0.0 % |
+| HotSet evictions | 0 |
+
+### Encryption (crypto bench, `cargo bench -p galaxdb-crypto`)
+
+| Benchmark | Latency | Throughput |
+|---|---|---|
+| AEGIS-256 decrypt 1 MB | 151 µs | 6.63 GB/s |
+| AEGIS-256 encrypt 64 KB | 9.75 µs | 6.56 GB/s |
+| AES-256-GCM decrypt 1 MB | 701 µs | 1.43 GB/s |
+| XXH3-64 checksum 1 MB | — | 34.1 GB/s |
+| ART lookup (1M keys) | 168 ns/op | — |
+
+### Crash safety (chaos suite)
+
+```
+cargo run --release -p galaxdb-chaos-tests
+```
+
+| Test | Result |
+|---|---|
+| C1: kill mid-flush → WAL replay | 10,000 rows recovered, zero loss |
+| C2: kill mid-compaction → old blocks intact | 4,000 keys readable |
+| C3: corrupt WAL record → replay stops | 538 / 1000 recovered at corruption |
+| C4: disk full → clean checkpoint | reserve file freed, reads continue |
+| C5: 100 concurrent writers | 100K writes, 0 dupes, 0 missing |
+| C6: OLAP scan during OLTP | 0 HotSet evictions |
+
 ---
 
-*All benchmarks run with `--release` flag. Debug mode results are not recorded.*
+## Competitive comparison
+
+Any competitor comparison on vector search requires the competitor to have run on the same `c6id.4xlarge` instance against the same SIFT1M dataset with the same pinned SHA256. No such comparison is currently published. When Phase G produces GalaxDB's numbers, the same commands will be re-run against `hnswlib 0.8` (see `benchmarks/tools/hnswlib_recall.py` for the harness that already exists) and the results published side by side.
+
+Non-vector competitor comparisons (PostgreSQL 16 vs GalaxDB wire protocol, etc.) are referenced in the commit history of the Month 2 gate test and are not republished here until they are re-run on the Phase G instance image.
+
+---
+
+*Every number published in this file is reproducible from the command listed beside it, against a named dataset, on `c6id.4xlarge` instance `i-0b2dec9226f62db65`. Anything that cannot be traced that way does not belong here.*

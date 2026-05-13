@@ -8,3 +8,12 @@ description = "HNSW, Delta Buffer, Quantizer (SQ8/FP16/RaBitQ)"
 
 [dependencies]
 galaxdb-common.workspace = true
+rand = { version = "0.8", features = ["small_rng"] }
+memmap2.workspace = true
+half.workspace = true
+rayon.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+rand = { version = "0.8", features = ["small_rng"] }

@@ -4,16 +4,27 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "TDE (AES-256-GCM), TLS 1.3, pluggable key management"
+description = "TDE (AES-256-GCM), TLS 1.3, pluggable key management (local file, env var, external command, HashiCorp Vault)"
 
 [features]
+# No default features. Every key provider that requires an external
+# library (Vault) is opt-in so the core build stays lean.
 default = []
-aws-kms = []
+
+# Enable the HashiCorp Vault Transit key provider. Requires the
+# `vaultrs` crate and pulls in reqwest + rustls.
+vault = ["dep:vaultrs", "dep:base64", "dep:tokio"]
 
 [dependencies]
 galaxdb-common.workspace = true
 aes-gcm.workspace = true
+aegis.workspace = true
 rand.workspace = true
+
+# Optional — only compiled when the `vault` feature is enabled.
+vaultrs = { version = "0.8", optional = true }
+base64 = { version = "0.22", optional = true }
+tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

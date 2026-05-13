@@ -384,7 +384,10 @@ impl MemtableManager {
     /// permits equal to the sealed memtable's size are consumed from
     /// the semaphore by forgetting the acquired permit (so it stays
     /// consumed until flush releases it).
-    fn seal_active(&self) {
+    ///
+    /// This is public so the Engine can trigger a seal before flushing
+    /// the memtable to SST files.
+    pub fn seal_active(&self) {
         let mut active_guard = self.active.lock().expect("active lock poisoned");
         let mut sealed_guard = self.sealed_queue.lock().expect("sealed lock poisoned");
 

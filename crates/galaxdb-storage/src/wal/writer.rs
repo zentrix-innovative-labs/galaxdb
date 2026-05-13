@@ -83,8 +83,10 @@ pub struct WalWriter {
     next_seq_no: AtomicU64,
     /// Current WAL file size in bytes.
     current_size: AtomicU64,
-    /// The file handle for direct (STRICT mode) writes.
+    /// The file handle for async (STRICT mode) writes.
     file: TokioMutex<BufWriter<File>>,
+    /// The file handle for sync writes (embedded mode).
+    sync_file: std::sync::Mutex<BufWriter<File>>,
     /// Channel to send writes to the group commit background task.
     group_commit_tx: mpsc::UnboundedSender<GroupCommitRequest>,
     /// Last checkpoint info.
@@ -117,32 +119,49 @@ impl WalWriter {
             .append(true)
             .open(&config.wal_path)?;
 
+        let file_for_sync = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&config.wal_path)?;
+
         let running = Arc::new(AtomicBool::new(true));
         let flush_notify = Arc::new(Notify::new());
 
         let (tx, rx) = mpsc::unbounded_channel();
 
-        // Spawn the group commit background task
+        // Spawn the group commit background task on a dedicated OS thread
+        // with its own tokio runtime. This ensures the WAL works in both
+        // embedded mode (no external runtime) and server mode (existing runtime).
         let group_commit_interval = config.group_commit_interval;
         let running_clone = running.clone();
         let flush_notify_clone = flush_notify.clone();
 
-        tokio::spawn(async move {
-            group_commit_task(
-                file_for_group,
-                rx,
-                group_commit_interval,
-                running_clone,
-                flush_notify_clone,
-            )
-            .await;
-        });
+        std::thread::Builder::new()
+            .name("galaxdb-wal-group-commit".to_string())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_time()
+                    .build()
+                    .expect("failed to create WAL group commit runtime");
+                rt.block_on(async move {
+                    group_commit_task(
+                        file_for_group,
+                        rx,
+                        group_commit_interval,
+                        running_clone,
+                        flush_notify_clone,
+                    )
+                    .await;
+                });
+            })
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
         Ok(Self {
             config,
             next_seq_no: AtomicU64::new(1),
             current_size: AtomicU64::new(file_size),
             file: TokioMutex::new(BufWriter::new(file)),
+            sync_file: std::sync::Mutex::new(BufWriter::new(file_for_sync)),
             group_commit_tx: tx,
             last_checkpoint: TokioMutex::new(None),
             running,
@@ -193,6 +212,48 @@ impl WalWriter {
             }
         }
 
+        Ok(seq_no)
+    }
+
+    /// Append a record synchronously (no tokio runtime required).
+    ///
+    /// Sends the write to the group commit background thread and blocks
+    /// until the batch fsync completes. This gives group commit benefits
+    /// (batched fsyncs) without requiring a tokio runtime in the caller.
+    pub fn append_sync(
+        &self,
+        record_type: WalRecordType,
+        payload: Vec<u8>,
+    ) -> io::Result<u64> {
+        let start = std::time::Instant::now();
+        let seq_no = self.next_seq_no.fetch_add(1, Ordering::SeqCst);
+        let record = WalRecord::new(record_type, seq_no, payload);
+        let data = record.serialize();
+        let data_len = data.len() as u64;
+
+        // Send to group commit thread via channel
+        let (done_tx, done_rx) = oneshot::channel();
+        self.group_commit_tx
+            .send(GroupCommitRequest {
+                data,
+                done: done_tx,
+            })
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "group commit task stopped")
+            })?;
+
+        // Block-wait for the group commit to complete
+        // The group commit thread has its own tokio runtime, so this is safe
+        done_rx.blocking_recv().map_err(|_| {
+            io::Error::new(io::ErrorKind::BrokenPipe, "group commit response lost")
+        })??;
+
+        self.current_size.fetch_add(data_len, Ordering::SeqCst);
+        // Task 38.3: publish append-to-fsync latency in microseconds.
+        let elapsed_us = start.elapsed().as_micros() as i64;
+        galaxdb_observe::metrics()
+            .wal_write_latency_us
+            .set(elapsed_us);
         Ok(seq_no)
     }
 

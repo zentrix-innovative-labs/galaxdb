@@ -8,3 +8,11 @@ description = "PostgreSQL simple query wire protocol, pg_catalog stubs"
 
 [dependencies]
 galaxdb-common.workspace = true
+galaxdb-sql = { path = "../galaxdb-sql" }
+sqlparser.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }

@@ -628,3 +628,191 @@ fn lsm_tree_default_size_ratio() {
     assert_eq!(tree.size_ratio, DEFAULT_SIZE_RATIO);
     assert_eq!(DEFAULT_SIZE_RATIO, 10);
 }
+
+// ---------------------------------------------------------------------------
+// Task 39.1 — configurable SST size
+// ---------------------------------------------------------------------------
+
+#[test]
+fn smaller_sst_size_produces_more_files_for_same_data() {
+    // With a very small SST size, the compactor splits output into more
+    // SST files than with the default. This is the "smaller SSTs reduce
+    // write stalls" property: each SST is cheaper to flush and compact.
+    let small_config = CompactionConfig::new().with_sst_size(MIN_SST_SIZE_BYTES);
+    let large_config = CompactionConfig::new().with_sst_size(DEFAULT_SST_SIZE_BYTES);
+
+    let mut small_compactor = Compactor::new(small_config);
+    let mut large_compactor = Compactor::new(large_config);
+    let mut tree_small = LsmTree::new();
+    let mut tree_large = LsmTree::new();
+
+    // Seed both trees with the same 4 L0 SSTs.
+    for i in 0..4 {
+        let s = sst(i + 1, 0, &format!("k{:04}", i * 100), &format!("k{:04}", i * 100 + 99), 1000);
+        tree_small.add_sst(0, s.clone());
+        tree_large.add_sst(0, s);
+    }
+
+    // Build a large input run so the small-SST compactor has to split.
+    let entries: Vec<VersionedEntry> = (0..4000)
+        .map(|i| VersionedEntry {
+            key: format!("k{:08}", i).into_bytes(),
+            value: Some(vec![0u8; 256]),
+            timestamp: i as u64 + 1,
+        })
+        .collect();
+    let input_runs = vec![entries.clone(), vec![], vec![], vec![]];
+
+    for &id in &[1u64, 2, 3, 4] {
+        tree_small.remove_sst(0, id);
+        tree_large.remove_sst(0, id);
+    }
+
+    let gc = GcContext::new();
+    let out_small = small_compactor.compact(&mut tree_small, 0, input_runs.clone(), &gc);
+    let out_large = large_compactor.compact(&mut tree_large, 0, input_runs, &gc);
+
+    // Both produce the same total entries.
+    assert_eq!(out_small.total_entries, out_large.total_entries);
+    // The small-SST compactor must produce at least as many output SSTs
+    // as the large-SST one (and typically more).
+    assert!(
+        out_small.new_ssts.len() >= out_large.new_ssts.len(),
+        "smaller SST size must produce >= output files; small={}, large={}",
+        out_small.new_ssts.len(),
+        out_large.new_ssts.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 39.2 — L0 leveled compaction
+// ---------------------------------------------------------------------------
+
+#[test]
+fn l0_leveled_strategy_triggers_at_two_files() {
+    // With Leveled L0, compaction fires as soon as a second SST lands in
+    // L0 — keeping L0 a single sorted run.
+    let trigger = CompactionTrigger::new()
+        .with_l0_strategy(L0CompactionStrategy::Leveled);
+    let mut tree = LsmTree::new();
+
+    // One SST: no trigger.
+    tree.add_sst(0, sst(1, 0, "a", "m", 1000));
+    assert!(
+        !trigger.needs_compaction(&tree, 0),
+        "Leveled L0 must not trigger with only 1 SST"
+    );
+
+    // Two SSTs: trigger fires.
+    tree.add_sst(0, sst(2, 0, "n", "z", 1000));
+    assert!(
+        trigger.needs_compaction(&tree, 0),
+        "Leveled L0 must trigger as soon as a second SST lands"
+    );
+}
+
+#[test]
+fn l0_tiered_strategy_triggers_at_file_count_threshold() {
+    // Tiered L0 (default) only fires at the 4-file threshold.
+    let trigger = CompactionTrigger::new()
+        .with_l0_strategy(L0CompactionStrategy::Tiered);
+    let mut tree = LsmTree::new();
+
+    for i in 0..L0_FILE_COUNT_THRESHOLD - 1 {
+        tree.add_sst(0, sst(i as u64 + 1, 0, &format!("k{}", i), &format!("k{}", i), 100));
+        assert!(
+            !trigger.needs_compaction(&tree, 0),
+            "Tiered L0 must not trigger before threshold; files={}",
+            i + 1
+        );
+    }
+    tree.add_sst(0, sst(99, 0, "z", "z", 100));
+    assert!(
+        trigger.needs_compaction(&tree, 0),
+        "Tiered L0 must trigger at threshold"
+    );
+}
+
+#[test]
+fn l0_leveled_compaction_produces_correct_merged_output() {
+    // End-to-end: two L0 SSTs with overlapping keys → leveled compaction
+    // merges them into a single L1 SST with all keys present and in order.
+    let config = CompactionConfig::new()
+        .with_l0_strategy(L0CompactionStrategy::Leveled)
+        .with_sst_size(MIN_SST_SIZE_BYTES);
+    let mut compactor = Compactor::new(config);
+    let mut tree = LsmTree::new();
+
+    tree.add_sst(0, sst(1, 0, "a", "m", 5));
+    tree.add_sst(0, sst(2, 0, "n", "z", 5));
+
+    // Verify the trigger fires.
+    assert!(compactor.trigger.needs_compaction(&tree, 0));
+
+    let run_a: Vec<VersionedEntry> = (b'a'..=b'm')
+        .map(|c| VersionedEntry {
+            key: vec![c],
+            value: Some(vec![c]),
+            timestamp: 1,
+        })
+        .collect();
+    let run_b: Vec<VersionedEntry> = (b'n'..=b'z')
+        .map(|c| VersionedEntry {
+            key: vec![c],
+            value: Some(vec![c]),
+            timestamp: 1,
+        })
+        .collect();
+
+    for &id in &[1u64, 2] {
+        tree.remove_sst(0, id);
+    }
+
+    let gc = GcContext::new();
+    let output = compactor.compact(&mut tree, 0, vec![run_a, run_b], &gc);
+
+    // All 26 letters must survive.
+    assert_eq!(output.total_entries, 26);
+    // Output lands in L1.
+    for sst_meta in &output.new_ssts {
+        assert_eq!(sst_meta.level, 1, "leveled L0 output must land in L1");
+    }
+    // Keys must be in sorted order across all output SSTs.
+    let all_keys: Vec<Vec<u8>> = output
+        .sst_entries
+        .iter()
+        .flat_map(|g| g.iter().map(|e| e.key.clone()))
+        .collect();
+    let mut sorted = all_keys.clone();
+    sorted.sort();
+    assert_eq!(all_keys, sorted, "merged output must be sorted");
+}
+
+// ---------------------------------------------------------------------------
+// Task 39.3 — flush pre-emption under load (compaction-level test)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn compaction_config_with_l0_strategy_round_trips() {
+    let config = CompactionConfig::new()
+        .with_l0_strategy(L0CompactionStrategy::Leveled);
+    assert_eq!(config.l0_strategy, L0CompactionStrategy::Leveled);
+
+    let config2 = CompactionConfig::new()
+        .with_l0_strategy(L0CompactionStrategy::Tiered);
+    assert_eq!(config2.l0_strategy, L0CompactionStrategy::Tiered);
+}
+
+#[test]
+fn compactor_uses_l0_strategy_from_config() {
+    // Compactor::new must propagate the config's l0_strategy into the
+    // trigger so the effective threshold is correct.
+    let config = CompactionConfig::new()
+        .with_l0_strategy(L0CompactionStrategy::Leveled);
+    let compactor = Compactor::new(config);
+    assert_eq!(
+        compactor.trigger.l0_strategy,
+        L0CompactionStrategy::Leveled,
+        "Compactor must propagate l0_strategy from config to trigger"
+    );
+}

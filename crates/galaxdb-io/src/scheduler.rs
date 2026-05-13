@@ -69,6 +69,34 @@ pub trait IoScheduler: Send + Sync {
         file: &'a Path,
     ) -> Pin<Box<dyn Future<Output = GalaxResult<()>> + Send + 'a>>;
 
+    /// Synchronous read — for use from non-async contexts (embedded mode,
+    /// point lookups from Engine::get()).
+    ///
+    /// Reads `len` bytes from `file` starting at `offset`.
+    /// Default implementation uses std::fs pread-style access.
+    /// IoUringScheduler overrides this with io_uring submit+wait.
+    fn read_sync(
+        &self,
+        file: &Path,
+        offset: u64,
+        len: usize,
+        priority: IoPriority,
+    ) -> GalaxResult<Vec<u8>> {
+        let _ = priority;
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = std::fs::File::open(file)?;
+        f.seek(SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; len];
+        let mut total = 0;
+        while total < len {
+            let n = f.read(&mut buf[total..])?;
+            if n == 0 { break; }
+            total += n;
+        }
+        buf.truncate(total);
+        Ok(buf)
+    }
+
     /// Return the latest latency report for RateLimiter feedback.
     fn latency_report(&self) -> LatencyReport;
 
