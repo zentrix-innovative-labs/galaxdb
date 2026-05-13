@@ -122,8 +122,9 @@ BULK INSERT INTO docs (id, text) VALUES
 | Embedded mode | ✅ (like SQLite) | ❌ | ❌ | ❌ |
 | Self-hosted | ✅ | ✅ | ❌ | ✅ |
 
-**HNSW recall@10 on SIFT-1M:** 0.9902 at ef=200, p99 459 µs  
-*(measured on AWS c6id.4xlarge, NVMe, release build — see [BENCHMARKS.md](docs/BENCHMARKS.md))*
+**HNSW recall@10 on SIFT-1M:** 0.990 at ef=200, p99 616 µs  
+**740 Rust tests passing, 7 chaos scenarios in 10.9 s** — confirmed on AWS c6id.4xlarge release build.  
+*(see [BENCHMARKS.md](docs/BENCHMARKS.md) for full numbers)*
 
 ---
 
