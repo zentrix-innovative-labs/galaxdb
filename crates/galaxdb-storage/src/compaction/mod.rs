@@ -240,13 +240,49 @@ impl Default for LsmTree {
 // CompactionTrigger
 // ---------------------------------------------------------------------------
 
+/// Strategy for driving L0 compaction (task 39.2).
+///
+/// **Tiered** (v1 default): L0 accumulates up to `l0_file_count_threshold`
+/// sorted runs (each the direct output of one memtable flush) before
+/// compaction fires. Reads check every L0 run, so read amp grows with
+/// the threshold; write amp is low because flushes don't re-merge.
+///
+/// **Leveled**: L0 holds at most a single sorted run. Each memtable
+/// flush drains into L0 and, if another SST already sits in L0,
+/// compaction triggers immediately to merge L0 forward into L1. Read
+/// amp is minimal (at most one L0 file to consult); write amp rises
+/// because every flush rewrites the L0 footprint.
+///
+/// Switchable per-engine via `CompactionTrigger::with_l0_strategy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum L0CompactionStrategy {
+    /// Classic LevelDB/RocksDB L0: tiered sorted runs, fire when file
+    /// count crosses `l0_file_count_threshold`.
+    Tiered,
+    /// SILK-style leveled L0: fire as soon as L0 has more than one
+    /// SST, keeping L0 a single sorted run.
+    Leveled,
+}
+
+impl Default for L0CompactionStrategy {
+    fn default() -> Self {
+        Self::Tiered
+    }
+}
+
 /// Determines when compaction should be triggered.
 #[derive(Debug, Clone)]
 pub struct CompactionTrigger {
-    /// Maximum number of SST files in L0 before triggering compaction.
+    /// Maximum number of SST files in L0 before triggering compaction
+    /// in [`L0CompactionStrategy::Tiered`] mode. Ignored in
+    /// [`L0CompactionStrategy::Leveled`] mode, which always triggers
+    /// when L0 has > 1 SST.
     pub l0_file_count_threshold: usize,
     /// Size ratio threshold for level-based compaction triggers.
     pub size_ratio: u32,
+    /// L0 compaction strategy (task 39.2). Default is `Tiered` for
+    /// backward-compat; `Leveled` is the SILK-style fast-drain mode.
+    pub l0_strategy: L0CompactionStrategy,
 }
 
 impl CompactionTrigger {
@@ -255,6 +291,7 @@ impl CompactionTrigger {
         Self {
             l0_file_count_threshold: L0_FILE_COUNT_THRESHOLD,
             size_ratio: DEFAULT_SIZE_RATIO,
+            l0_strategy: L0CompactionStrategy::default(),
         }
     }
 
@@ -263,6 +300,24 @@ impl CompactionTrigger {
         Self {
             l0_file_count_threshold,
             size_ratio,
+            l0_strategy: L0CompactionStrategy::default(),
+        }
+    }
+
+    /// Select the L0 strategy (task 39.2).
+    pub fn with_l0_strategy(mut self, strategy: L0CompactionStrategy) -> Self {
+        self.l0_strategy = strategy;
+        self
+    }
+
+    /// Return the effective L0 trigger threshold: 2 files for
+    /// [`L0CompactionStrategy::Leveled`] (fire as soon as a second
+    /// SST lands), `l0_file_count_threshold` for
+    /// [`L0CompactionStrategy::Tiered`].
+    fn effective_l0_threshold(&self) -> usize {
+        match self.l0_strategy {
+            L0CompactionStrategy::Tiered => self.l0_file_count_threshold,
+            L0CompactionStrategy::Leveled => 2,
         }
     }
 
@@ -272,7 +327,7 @@ impl CompactionTrigger {
     /// or `None` if no compaction is needed.
     pub fn check(&self, tree: &LsmTree) -> Option<usize> {
         // Check L0 file count threshold first (highest priority).
-        if tree.level(0).file_count() >= self.l0_file_count_threshold {
+        if tree.level(0).file_count() >= self.effective_l0_threshold() {
             return Some(0);
         }
 
@@ -308,7 +363,7 @@ impl CompactionTrigger {
     /// Checks if a specific level needs compaction.
     pub fn needs_compaction(&self, tree: &LsmTree, level: usize) -> bool {
         if level == 0 {
-            return tree.level(0).file_count() >= self.l0_file_count_threshold;
+            return tree.level(0).file_count() >= self.effective_l0_threshold();
         }
 
         if level >= BOTTOM_LEVEL {
@@ -631,6 +686,10 @@ pub struct CompactionConfig {
     pub bloom_bits_per_key: u32,
     /// LSM size ratio for Monkey allocation.
     pub size_ratio: u32,
+    /// L0 compaction strategy (task 39.2). Default is Tiered for
+    /// v1 compatibility; set to `Leveled` to keep L0 a single sorted
+    /// run and drain flushes faster.
+    pub l0_strategy: L0CompactionStrategy,
 }
 
 impl CompactionConfig {
@@ -640,7 +699,14 @@ impl CompactionConfig {
             sst_size_bytes: DEFAULT_SST_SIZE_BYTES,
             bloom_bits_per_key: 10,
             size_ratio: DEFAULT_SIZE_RATIO,
+            l0_strategy: L0CompactionStrategy::default(),
         }
+    }
+
+    /// Switch the L0 compaction strategy (task 39.2).
+    pub fn with_l0_strategy(mut self, strategy: L0CompactionStrategy) -> Self {
+        self.l0_strategy = strategy;
+        self
     }
 
     /// Creates a config with a custom SST size.
@@ -705,7 +771,8 @@ impl Compactor {
             trigger: CompactionTrigger::with_thresholds(
                 L0_FILE_COUNT_THRESHOLD,
                 config.size_ratio,
-            ),
+            )
+            .with_l0_strategy(config.l0_strategy),
             config,
             next_sst_id: 1,
         }
