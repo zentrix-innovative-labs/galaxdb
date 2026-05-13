@@ -2,9 +2,6 @@
 /target/
 **/target/
 
-# Cargo lock is committed for binary crates, but ignore for library-only workspaces
-# We keep Cargo.lock since we have binary crates (galaxdb-server, galaxdb-sidecar)
-
 # IDE / editor files
 .idea/
 .vscode/
@@ -36,3 +33,25 @@ _galaxdb_reserve
 .env
 .env.local
 __pycache__/
+
+# Kiro specs — internal design docs, not for public repo
+.kiro/
+
+# Internal consolidation docs
+docs/CONSOLIDATION.md
+docs/architecture/
+docs/archive/
+
+# Internal evidence/analysis docs
+Evidence*.md
+
+# Stale/internal docs
+docs/architecture.md
+docs/archive/
+docs/business/
+docs/getting-started.md
+docs/storage-engine.md
+docs/vector-search.md
+
+# Bench results — raw data, not for public repo
+bench-results/

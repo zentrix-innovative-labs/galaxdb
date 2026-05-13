@@ -1,9 +1,0 @@
-[2m2026-05-10T22:48:32.788212Z[0m [32m INFO[0m [2mgalaxdb_server[0m[2m:[0m GalaxDB server started [3maddr[0m[2m=[0m0.0.0.0:5433 [3mdata_dir[0m[2m=[0m/mnt/nvme/galaxdb/server_db
-GalaxDB server listening on 0.0.0.0:5433
-[2m2026-05-10T22:48:32.788363Z[0m [32m INFO[0m [2mgalaxdb_io[0m[2m:[0m selected I/O backend [3mbackend[0m[2m=[0mIoUring
-[2m2026-05-10T22:48:32.788479Z[0m [32m INFO[0m [2mgalaxdb_io::uring_scheduler[0m[2m:[0m IoUringScheduler created with HP and BK queues [3mqueue_depth[0m[2m=[0m256
-[2m2026-05-10T22:48:32.788489Z[0m [32m INFO[0m [2mgalaxdb_storage::engine[0m[2m:[0m storage engine I/O scheduler selected [3mbackend[0m[2m=[0mIoUring
-
-thread 'tokio-rt-worker' (36199) panicked at crates/galaxdb-storage/src/wal/writer.rs:246:17:
-Cannot block the current thread from within a runtime. This happens because a function attempted to block the current thread while the thread is being used to drive asynchronous tasks.
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
