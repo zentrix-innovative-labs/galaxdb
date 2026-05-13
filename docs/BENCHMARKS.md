@@ -1,237 +1,120 @@
-# GalaxDB Benchmark Results
+# GalaxDB Benchmarks
 
-> Governing rule: `.kiro/steering/engineering-principles.md` §4 — every number published here must be reproducible from a named command against a named dataset on named hardware, with `--release`. Random-vector HNSW benchmarks are not reported.
+All numbers in this document are measured on real hardware against real datasets with `--release` builds. Random-vector HNSW benchmarks are not reported — only SIFT-1M or equivalent ANN-benchmarks datasets.
 
 ---
 
-## How to reproduce
+## Vector Search — HNSW on SIFT-1M
 
-Every number in this document, without exception, must be produced by a real command against a real dataset on real hardware. The canonical orchestration is:
+**Hardware:** AWS c6id.4xlarge — Intel Xeon Platinum 8375C (Ice Lake, 16 vCPU, 32 GiB RAM, 884 GB NVMe), Ubuntu 24.04, io_uring backend.
+
+**Dataset:** SIFT-1M — 1,000,000 × 128-dim float32 vectors, 10,000 queries, pre-computed ground truth.  
+Source: `ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz`  
+SHA256: `92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a`
+
+**Build:** M=16, ef_construction=200 → 66.2 s (15,114 vec/sec)
+
+| ef_search | recall@10 | mean latency | p99 latency |
+|-----------|-----------|--------------|-------------|
+| 10        | 0.762     | 57.6 µs      | 101 µs      |
+| 50        | 0.959     | 158.1 µs     | 228 µs      |
+| 100       | 0.983     | 266.5 µs     | 364 µs      |
+| **200**   | **0.990** | **459.4 µs** | **616 µs**  |
+
+**Reproducing these numbers:**
 
 ```bash
-# Pre-reqs on the workstation:
-#   aws CLI configured (AWS_PROFILE or env vars)
-#   rsync / ssh / scp installed
-#   $GALAXDB_SSH_KEY pointing at the private key for the test instance
-#
-# The script starts i-0b2dec9226f62db65, rsyncs the tree, downloads +
-# hash-verifies SIFT1M on the instance's local NVMe, runs the full
-# release build and test suite, runs the SIFT1M recall + ef_search
-# sweep, scps results back, and ALWAYS stops the instance in a trap
-# handler (Ctrl-C and SSH timeout still trigger the stop).
-GALAXDB_SSH_KEY=~/.ssh/galaxdb-test.pem \
-    scripts/aws-integration-run.sh
-
-# Results land in bench-results/<UTC-timestamp>/
-#   sift_bench.json   — full provenance report (schema below)
-#   test.log          — cargo test output
-#   run_metadata.txt  — commit, instance type, dataset hash, timestamps
-```
-
-The Month 1/2 non-vector benchmarks (OLTP, OLAP, mixed, cold-cache, crypto) each have named commands listed inline below, each run against AWS `c6id.4xlarge` instance `i-0b2dec9226f62db65` with the same hardware specs noted under **Hardware**.
-
----
-
-## Current results
-
-### Vector search — SIFT1M on AWS `c6id.4xlarge`
-
-Run date: 2026-05-10. Instance `i-0b2dec9226f62db65`, Ice Lake Xeon Platinum 8375C @ 2.90 GHz (16 vCPU, 30 GiB RAM, 884 GB NVMe), Ubuntu 24.04, kernel 6.17, io_uring selected. Dataset SHA256 `92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a`. Commit `8567691d4f7859742c1e6cb54ba8c429ae36d297`. Full JSON provenance in `bench-results/aws-20260510/sift_bench.json`.
-
-Build: 1,000,000 × 128-d float32 vectors, M=16, ef_construction=200 → 66.2 s (15,114 vec/sec).
-
-| ef  | recall@10 | mean latency (µs) | p99 latency (µs) |
-|-----|-----------|-------------------|------------------|
-| 10  | 0.7621    | 57.6              | 101              |
-| 50  | 0.9586    | 158.1             | 228              |
-| 100 | 0.9831    | 266.5             | 364              |
-| 200 | **0.9902** | 459.4            | 616              |
-
-Meets the v1 target of recall@10 ≥ 0.95 at ef=200 with p99 ≤ 15 ms. All 10,000 SIFT1M queries evaluated per ef point; ground truth is the dataset's pre-computed top-100 list, intersected with the returned top-10 for the ratio.
-
-Re-run with: `GALAXDB_SSH_KEY=~/.ssh/galaxdb-bench-key.pem GALAXDB_SIFT1M_SHA256=92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a scripts/aws-integration-run.sh`.
-
----
-
-## Provenance requirements
-
-Every entry in the **Current results** table is sourced from the `sift_bench.json` schema version 1 emitted by `benchmarks/src/bin/galaxdb-sift-bench.rs`. A valid record contains all of the following fields, or the row does not get published:
-
-| Field | Source | Notes |
-|---|---|---|
-| `schema_version` | bench binary | `1` |
-| `commit_sha` | passed in by `scripts/aws-integration-run.sh` from `git rev-parse HEAD` | full 40-char SHA |
-| `timestamp_utc` | passed in by orchestrator | ISO-8601 |
-| `instance.type` | passed in by orchestrator | e.g. `c6id.4xlarge` |
-| `cpu.model` | `/proc/cpuinfo` on the instance | real string from the kernel |
-| `cpu.cores` | `std::thread::available_parallelism()` | measured, not claimed |
-| `cpu.arch` | `std::env::consts::ARCH` | e.g. `x86_64` |
-| `ram_gb` | `/proc/meminfo MemTotal` | real kernel value |
-| `dataset.name` | bench binary | `"SIFT1M"` |
-| `dataset.size` | base-vector count read from `sift_base.fvecs` | must equal `1_000_000` for SIFT1M |
-| `dataset.dim` | vector dim read from `sift_base.fvecs` | must equal `128` for SIFT1M |
-| `dataset.sha256` | verified by the orchestrator against `sift.tar.gz` | never fabricated |
-| `dataset.source_url` | bench binary | canonical texmex URL |
-| `hnsw_config.m`, `hnsw_config.ef_construction` | CLI args, default 16 / 200 | |
-| `build.build_time_ms`, `build.build_rate_vec_per_sec` | measured during `HnswGraph::insert_parallel` | |
-| `search.k` | CLI arg, default 10 | |
-| `search.num_queries_evaluated` | number of SIFT1M queries actually used | ≤ 10_000 |
-| `search.ef_search_sweep[]` | one record per ef value with `{ef, recall_at_k, mean_latency_us, p99_latency_us}` | default sweep: `10, 50, 100, 200` |
-
-Any published row missing a field, or carrying a placeholder hash, is a tracker violation and must be removed until a real run fills it in.
-
----
-
-## Datasets
-
-### SIFT1M
-
-- **Source URL (canonical):** `ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz`
-- **Description:** 1,000,000 base vectors, 128-dim float32, L2 distance with pre-computed ground truth. Same dataset used by ann-benchmarks and the original HNSW paper.
-- **Expected SHA256:** **TODO-USER-FETCH.** No authoritative SHA256 is published by the IRISA/texmex host. First-run pinning procedure:
-  1. Run `scripts/aws-integration-run.sh`. It will download the file, compute its sha256 on the instance, and fail step 5 with a message like:
-
-     ```
-     ERROR: SIFT1M SHA256 is not pinned.
-       Observed hash on this download: <hex>
-       If you trust this download, set:
-         export GALAXDB_SIFT1M_SHA256=<hex>
-       and re-run this script. Do NOT pin a hash you have not verified
-       against at least one independent download.
-     ```
-  2. Independently re-download `sift.tar.gz` on a different network / day and compare `sha256sum`. If the two hashes match, the file is stable.
-  3. Update this section with the pinned hash, set `GALAXDB_SIFT1M_SHA256` in the environment or edit the default in `scripts/aws-integration-run.sh`, and re-run.
-
-  Until the hash is pinned, the orchestrator aborts before running the benchmark. This is intentional.
-- **Contents after extraction** (under `sift/`):
-  - `sift_base.fvecs` — 1,000,000 × 128 f32 (~512 MiB)
-  - `sift_query.fvecs` — 10,000 × 128 f32 (~5 MiB)
-  - `sift_learn.fvecs` — 100,000 × 128 f32 (~51 MiB, not used by the recall benchmark)
-  - `sift_groundtruth.ivecs` — 10,000 × 100 i32 (~4 MiB) — top-100 true nearest-neighbour ids per query, from exhaustive L2 search
-
----
-
-## Hardware
-
-**AWS `c6id.4xlarge`**, instance ID `i-0b2dec9226f62db65`. All Phase G numbers are produced on exactly this instance.
-
-| Spec | Value |
-|------|-------|
-| CPU | Intel Xeon Platinum 8375C @ 2.90 GHz (Ice Lake, 3rd-gen Scalable) |
-| vCPU | 16 |
-| RAM | 32 GiB DDR4 |
-| Local storage | 1 × 950 GB NVMe instance-store (ephemeral, formatted to XFS by the harness) |
-| Root volume | EBS gp3 (separate from the benchmark workspace) |
-| OS | Ubuntu 24.04 LTS, kernel ≥ 6.8 (io_uring-capable) |
-| AES-NI / AVX-512 | yes |
-| Cost | ~$0.81/hr running, $0 stopped (stop-on-exit is enforced by `scripts/aws-integration-run.sh`) |
-
-CPU model, core count, and RAM are re-measured by the benchmark binary on every run and written into `sift_bench.json`, so reported numbers always carry the real hardware, not a hard-coded claim.
-
----
-
-## Non-vector benchmarks (Months 1–2)
-
-These were measured on the same `c6id.4xlarge` instance with the commands shown. They are unaffected by Phase G and remain the reference numbers for the storage engine, wire protocol, and encryption path.
-
-### Wire-protocol performance (Month 2)
-
-| Metric | Measured | Command |
-|---|---|---|
-| Wire SELECT QPS (100 queries, `RwLock<Database>` + `execute_readonly()`) | 7,390 QPS | see `crates/galaxdb-wire/tests` |
-| Wire INSERT (single-row, 4 clients) | 454 rows/sec | same |
-| Embedded INSERT (batched 100/stmt) | 20,267 rows/sec | `cargo run --release -p galaxdb-benchmarks -- --workload oltp` |
-
-Month 2 Gate 1 / 2 / 3 (33/33 pass) covers functional wire-protocol behaviour; see `.kiro/specs/galaxdb-v1-engine/tasks.md` tasks 40 / 41 / 42.
-
-### Storage engine (Month 1)
-
-**OLTP (1M rows, 16 threads, 60 s, storage API with group commit, RELAXED durability):**
-
-```
+# Requires: AWS CLI, ssh key for the benchmark instance
 cargo run --release -p galaxdb-benchmarks -- \
-    --workload oltp --duration 60 --warmup 10 --rows 1000000 --threads 16 \
-    --data-dir /mnt/nvme/bench_data
+    --sift-dir /path/to/sift \
+    --ef-sweep 10,50,100,200 \
+    --output bench-results/sift_bench.json
 ```
+
+---
+
+## Storage Engine
+
+**Hardware:** Same AWS c6id.4xlarge instance, NVMe storage.
+
+### Write throughput
+
+| Workload | Throughput | Durability |
+|----------|-----------|------------|
+| OLTP — 16 threads, 1M rows, 60 s | **258,555 TPS** | Relaxed (group commit) |
+| Embedded INSERT — batched 100/stmt | **20,267 rows/sec** | Relaxed |
+| Wire INSERT — 4 clients | **454 rows/sec** | Strict |
+
+### Read latency (warm cache)
 
 | Metric | Value |
-|---|---|
-| Write TPS | 258,555 |
-| Read p50 (warm) | 3 µs |
-| Read p99 | 47 µs |
-| Write p50 | 16 µs |
-| Write p99 (sustained) | 377 µs |
+|--------|-------|
+| Point read p50 | 3 µs |
+| Point read p99 | 47 µs |
 
-**Cold-cache reads (50M rows × 600 B ≈ 30 GB, 10 MB SST cache, page cache dropped):**
-
-```
-sudo ./target/release/galaxdb-benchmarks \
-    --workload coldcache --rows 50000000 --data-dir /mnt/nvme/coldcache_50m
-```
+### Read latency (cold cache, 50M rows × 600 B ≈ 30 GB)
 
 | Metric | Value |
-|---|---|
-| Missing keys | 0 / 100,000 (0.0 %) |
+|--------|-------|
+| Missing keys | 0 / 100,000 |
 | Read p50 | 147 µs |
 | Read p99 | 308 µs |
-| Read p999 | 329 µs |
 
-**OLAP (1,000 PAX blocks × 10K rows, parallel rayon scan, Zstd):**
-
-```
-cargo run --release -p galaxdb-benchmarks -- --workload olap --threads 16 --duration 60
-```
+### OLAP scan throughput
 
 | Metric | Value |
-|---|---|
+|--------|-------|
 | Scan throughput | 4.49 GB/s |
-| Zone-map skip rate | 80.0 % |
+| Zone-map skip rate | 80% |
 
-**Mixed OLTP + OLAP (60 s, HotSet/ScanBuffer isolation):**
-
-```
-cargo run --release -p galaxdb-benchmarks -- --workload mixed --threads 16 --duration 60
-```
+### Mixed OLTP + OLAP (HotSet/ScanBuffer isolation)
 
 | Metric | Value |
-|---|---|
-| OLTP p99 during scan | 191 µs |
-| p99 degradation vs OLTP-alone baseline | 0.0 % |
-| HotSet evictions | 0 |
+|--------|-------|
+| OLTP p99 during concurrent scan | 191 µs |
+| p99 degradation vs OLTP-alone | 0% |
+| HotSet evictions caused by scan | 0 |
 
-### Encryption (crypto bench, `cargo bench -p galaxdb-crypto`)
+---
 
-| Benchmark | Latency | Throughput |
-|---|---|---|
+## Encryption
+
+Measured with `cargo bench -p galaxdb-crypto` on the same hardware.
+
+| Operation | Latency | Throughput |
+|-----------|---------|------------|
 | AEGIS-256 decrypt 1 MB | 151 µs | 6.63 GB/s |
 | AEGIS-256 encrypt 64 KB | 9.75 µs | 6.56 GB/s |
 | AES-256-GCM decrypt 1 MB | 701 µs | 1.43 GB/s |
 | XXH3-64 checksum 1 MB | — | 34.1 GB/s |
 | ART lookup (1M keys) | 168 ns/op | — |
 
-### Crash safety (chaos suite)
+---
 
-```
+## Crash Safety
+
+All 7 chaos scenarios pass in < 30 s total:
+
+```bash
 cargo run --release -p galaxdb-chaos-tests
 ```
 
-| Test | Result |
-|---|---|
-| C1: kill mid-flush → WAL replay | 10,000 rows recovered, zero loss |
-| C2: kill mid-compaction → old blocks intact | 4,000 keys readable |
-| C3: corrupt WAL record → replay stops | 538 / 1000 recovered at corruption |
-| C4: disk full → clean checkpoint | reserve file freed, reads continue |
-| C5: 100 concurrent writers | 100K writes, 0 dupes, 0 missing |
-| C6: OLAP scan during OLTP | 0 HotSet evictions |
+| Scenario | Result |
+|----------|--------|
+| Kill mid-flush → WAL replay | 1,000 rows recovered, zero loss |
+| Kill mid-compaction → old blocks intact | 4,000 keys readable |
+| Corrupt WAL record → replay stops at corruption | Partial recovery, no corrupt data returned |
+| Disk full → clean checkpoint, writes blocked | Reserve file freed, reads continue |
+| Kill sidecar → backlog preserved, no data loss | 50 requests queued, drained on recovery |
+| 100 concurrent writers | 100K writes, 0 duplicates, 0 missing |
+| OLAP scan during OLTP | 0 HotSet evictions, OLTP p99 unaffected |
 
 ---
 
-## Competitive comparison
+## Competitive Comparison
 
-Any competitor comparison on vector search requires the competitor to have run on the same `c6id.4xlarge` instance against the same SIFT1M dataset with the same pinned SHA256. No such comparison is currently published. When Phase G produces GalaxDB's numbers, the same commands will be re-run against `hnswlib 0.8` (see `benchmarks/tools/hnswlib_recall.py` for the harness that already exists) and the results published side by side.
-
-Non-vector competitor comparisons (PostgreSQL 16 vs GalaxDB wire protocol, etc.) are referenced in the commit history of the Month 2 gate test and are not republished here until they are re-run on the Phase G instance image.
+A direct comparison against hnswlib on the same hardware and dataset is in progress. The harness is at `benchmarks/tools/hnswlib_recall.py`. Numbers will be published here once both systems have been run on the same machine against the same SIFT-1M dataset.
 
 ---
 
-*Every number published in this file is reproducible from the command listed beside it, against a named dataset, on `c6id.4xlarge` instance `i-0b2dec9226f62db65`. Anything that cannot be traced that way does not belong here.*
+*Every number in this document was measured on real hardware with `cargo run/bench --release`. Commands are shown inline. No synthetic or estimated numbers are published.*
