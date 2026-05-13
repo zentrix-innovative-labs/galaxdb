@@ -1130,3 +1130,215 @@ fn is_text_column_handles_varchar_and_char_sizes() {
     assert!(!is_text_column("BOOL"));
     assert!(!is_text_column("BLOB"));
 }
+
+// ---------------------------------------------------------------------------
+// `WHERE NOT DUPLICATE` — task 35.5
+// ---------------------------------------------------------------------------
+
+/// Build a `docs` table whose schema carries the near-duplicate
+/// grouping column populated by the Task 35.4 background job.
+fn ctx_with_dedup_docs() -> ExecutorContext {
+    let mut ctx = test_ctx();
+    let entry = TableEntry {
+        name: "docs".to_string(),
+        columns: vec![
+            CatalogColumn {
+                name: "id".to_string(),
+                data_type: "INT".to_string(),
+                nullable: false,
+                primary_key: true,
+                is_embedding_source: false,
+            },
+            CatalogColumn {
+                name: "body".to_string(),
+                data_type: "TEXT".to_string(),
+                nullable: true,
+                primary_key: false,
+                is_embedding_source: false,
+            },
+            CatalogColumn {
+                name: crate::planner::NEAR_DUPLICATE_GROUP_COLUMN.to_string(),
+                data_type: "BIGINT".to_string(),
+                nullable: true,
+                primary_key: false,
+                is_embedding_source: false,
+            },
+        ],
+        has_embedding: false,
+    };
+    ctx.catalog.create_table("docs".to_string(), entry).unwrap();
+    ctx
+}
+
+fn insert_dedup_row(
+    ctx: &mut ExecutorContext,
+    id: i64,
+    body: &str,
+    group: Option<i64>,
+) {
+    let plan = plan_insert(
+        "docs".to_string(),
+        vec![
+            "id".to_string(),
+            "body".to_string(),
+            crate::planner::NEAR_DUPLICATE_GROUP_COLUMN.to_string(),
+        ],
+        vec![
+            Value::Integer(id),
+            Value::Text(body.to_string()),
+            match group {
+                Some(g) => Value::Integer(g),
+                None => Value::Null,
+            },
+        ],
+    );
+    execute_with_context(&plan, ctx).expect("insert ok");
+}
+
+/// End-to-end: seed 6 rows — 3 share group 100, 2 share group 200,
+/// 1 has no group. `WHERE NOT DUPLICATE` keeps one representative per
+/// group plus the ungrouped row.
+#[test]
+fn where_not_duplicate_keeps_one_representative_per_group() {
+    let mut ctx = ctx_with_dedup_docs();
+    // Group 100: ids 3, 1, 4 → representative is id=1 (lowest pk bytes
+    // under the `docs:` prefix since row_codec::build_primary_key
+    // serialises the integer pk as its decimal display — '1' < '3' < '4').
+    insert_dedup_row(&mut ctx, 3, "hello world", Some(100));
+    insert_dedup_row(&mut ctx, 1, "hello world!", Some(100));
+    insert_dedup_row(&mut ctx, 4, "hello world.", Some(100));
+    // Group 200: ids 5, 2 → representative is id=2.
+    insert_dedup_row(&mut ctx, 5, "quick brown fox", Some(200));
+    insert_dedup_row(&mut ctx, 2, "quick brown fox!", Some(200));
+    // Ungrouped.
+    insert_dedup_row(&mut ctx, 6, "unique text", None);
+
+    let plan = plan_select(
+        "docs".to_string(),
+        vec!["id".to_string()],
+        Some(FilterExpr::NotDuplicate),
+    );
+    let result = execute_with_context(&plan, &mut ctx).expect("select ok");
+    let ExecuteResult::Rows { rows, .. } = result else {
+        panic!("expected Rows");
+    };
+
+    let mut ids: Vec<i64> = rows
+        .into_iter()
+        .map(|r| match r.columns[0].1 {
+            Value::Integer(n) => n,
+            ref other => panic!("expected Integer, got {:?}", other),
+        })
+        .collect();
+    ids.sort();
+    // One representative per group plus the ungrouped row.
+    assert_eq!(ids, vec![1, 2, 6]);
+}
+
+/// Composition with a conventional WHERE predicate: `price > 4 AND
+/// NOT DUPLICATE` must first narrow by price, then collapse
+/// duplicates. The dedup pass runs on the filtered candidate set —
+/// confirming that the group-level predicate composes correctly with
+/// per-row filters.
+#[test]
+fn where_not_duplicate_composes_with_and() {
+    let mut ctx = ctx_with_dedup_docs();
+    insert_dedup_row(&mut ctx, 1, "a", Some(100));
+    insert_dedup_row(&mut ctx, 2, "b", Some(100));
+    insert_dedup_row(&mut ctx, 3, "c", Some(200));
+    insert_dedup_row(&mut ctx, 4, "d", None);
+
+    // id > 1: drops id=1 — group 100's candidate set is now {2}; the
+    // representative is therefore id=2 even though id=1 would have
+    // been the representative over the full set. The dedup pass must
+    // run AFTER the per-row filter for this to work.
+    let filter = FilterExpr::And(
+        Box::new(FilterExpr::Gt {
+            column: "id".to_string(),
+            value: Value::Integer(1),
+        }),
+        Box::new(FilterExpr::NotDuplicate),
+    );
+    let plan = plan_select("docs".to_string(), vec!["id".to_string()], Some(filter));
+    let result = execute_with_context(&plan, &mut ctx).expect("select ok");
+    let ExecuteResult::Rows { rows, .. } = result else {
+        panic!("expected Rows");
+    };
+
+    let mut ids: Vec<i64> = rows
+        .into_iter()
+        .map(|r| match r.columns[0].1 {
+            Value::Integer(n) => n,
+            ref other => panic!("expected Integer, got {:?}", other),
+        })
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec![2, 3, 4]);
+}
+
+/// A table with no `_near_duplicate_group` column at all: every row
+/// passes `WHERE NOT DUPLICATE`. This is the steady-state for any
+/// table the Task 35.4 background job hasn't touched yet.
+#[test]
+fn where_not_duplicate_passes_rows_without_group_column() {
+    let mut ctx = ctx_with_docs_body();
+    for (id, body) in &[(1, "alpha"), (2, "beta"), (3, "gamma")] {
+        let plan = plan_insert(
+            "docs".to_string(),
+            vec!["id".to_string(), "body".to_string()],
+            vec![Value::Integer(*id), Value::Text(body.to_string())],
+        );
+        execute_with_context(&plan, &mut ctx).expect("insert ok");
+    }
+    let plan = plan_select(
+        "docs".to_string(),
+        vec!["id".to_string()],
+        Some(FilterExpr::NotDuplicate),
+    );
+    let result = execute_with_context(&plan, &mut ctx).expect("select ok");
+    let ExecuteResult::Rows { rows, .. } = result else {
+        panic!("expected Rows");
+    };
+    assert_eq!(rows.len(), 3);
+}
+
+/// `filter_has_not_duplicate` walks composed trees so the executor
+/// knows whether to run the group-level pass.
+#[test]
+fn filter_has_not_duplicate_walks_tree() {
+    assert!(filter_has_not_duplicate(&FilterExpr::NotDuplicate));
+    assert!(!filter_has_not_duplicate(&FilterExpr::Eq {
+        column: "id".into(),
+        value: Value::Integer(1)
+    }));
+    // AND
+    assert!(filter_has_not_duplicate(&FilterExpr::And(
+        Box::new(FilterExpr::Gt {
+            column: "price".into(),
+            value: Value::Float(4.0),
+        }),
+        Box::new(FilterExpr::NotDuplicate),
+    )));
+    // OR (right branch)
+    assert!(filter_has_not_duplicate(&FilterExpr::Or(
+        Box::new(FilterExpr::Eq {
+            column: "id".into(),
+            value: Value::Integer(1)
+        }),
+        Box::new(FilterExpr::NotDuplicate),
+    )));
+    // Nested deep
+    assert!(filter_has_not_duplicate(&FilterExpr::And(
+        Box::new(FilterExpr::Gt {
+            column: "a".into(),
+            value: Value::Integer(0),
+        }),
+        Box::new(FilterExpr::Or(
+            Box::new(FilterExpr::Eq {
+                column: "b".into(),
+                value: Value::Integer(0),
+            }),
+            Box::new(FilterExpr::NotDuplicate),
+        )),
+    )));
+}

@@ -239,3 +239,52 @@ fn planner_stats_cardinality_estimation() {
     };
     assert_eq!(stats.estimated_cardinality(), 100);
 }
+
+// ---------------------------------------------------------------------------
+// `WHERE NOT DUPLICATE` plan carrying — task 35.5
+// ---------------------------------------------------------------------------
+
+#[test]
+fn plan_select_carries_not_duplicate_predicate() {
+    let plan = plan_select(
+        "docs".to_string(),
+        vec!["id".to_string()],
+        Some(FilterExpr::NotDuplicate),
+    );
+    match plan {
+        QueryPlan::FullScan {
+            table,
+            columns,
+            filter,
+        } => {
+            assert_eq!(table, "docs");
+            assert_eq!(columns, vec!["id"]);
+            assert_eq!(filter, Some(FilterExpr::NotDuplicate));
+        }
+        other => panic!("expected FullScan, got {:?}", other),
+    }
+}
+
+#[test]
+fn plan_select_carries_composed_not_duplicate_predicate() {
+    let composed = FilterExpr::And(
+        Box::new(FilterExpr::Gt {
+            column: "price".to_string(),
+            value: Value::Float(4.0),
+        }),
+        Box::new(FilterExpr::NotDuplicate),
+    );
+    let plan = plan_select("docs".to_string(), Vec::new(), Some(composed.clone()));
+    let QueryPlan::FullScan { filter, .. } = plan else {
+        panic!("expected FullScan");
+    };
+    assert_eq!(filter, Some(composed));
+}
+
+#[test]
+fn near_duplicate_group_column_name_is_stable() {
+    // The canonical column name is part of the public contract —
+    // any change must be deliberate and coordinated with the Task 35.4
+    // background job, the executor, and the Lance exporter.
+    assert_eq!(NEAR_DUPLICATE_GROUP_COLUMN, "_near_duplicate_group");
+}

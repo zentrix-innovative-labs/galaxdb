@@ -759,7 +759,14 @@ fn exec_full_scan(
     // comes back.
     let prefix = format!("{}:", table);
     let prefix_bytes = prefix.as_bytes();
-    let mut rows: Vec<Row> = Vec::new();
+
+    // `WHERE NOT DUPLICATE` is a group-level predicate: we have to see
+    // every row that passes the per-row filter before we can pick the
+    // representative for each `_near_duplicate_group`. So we buffer
+    // `(primary_key, decoded_row)` rather than projecting as we go,
+    // run the dedup pass if needed, then project at the end. Task 35.5.
+    let dedup = filter.map(filter_has_not_duplicate).unwrap_or(false);
+    let mut buffered: Vec<(Vec<u8>, Vec<(String, Value)>)> = Vec::new();
 
     for (key, value_bytes) in ctx.engine.scan_all_with_prefix(Some(prefix_bytes)) {
         if !key.starts_with(prefix_bytes) {
@@ -771,24 +778,115 @@ fn exec_full_scan(
                 continue;
             }
         }
-        let projected: Vec<(String, Value)> = project
-            .iter()
-            .map(|name| {
-                let v = cols
-                    .iter()
-                    .find(|(k, _)| k == name)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or(Value::Null);
-                (name.clone(), v)
-            })
-            .collect();
-        rows.push(Row { columns: projected });
+        buffered.push((key, cols));
     }
+
+    if dedup {
+        apply_not_duplicate_pass(&mut buffered);
+    }
+
+    let rows: Vec<Row> = buffered
+        .into_iter()
+        .map(|(_, cols)| Row {
+            columns: project
+                .iter()
+                .map(|name| {
+                    let v = cols
+                        .iter()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null);
+                    (name.clone(), v)
+                })
+                .collect(),
+        })
+        .collect();
 
     Ok(ExecuteResult::Rows {
         columns: project,
         rows,
     })
+}
+
+/// Collapse rows sharing a `_near_duplicate_group` to a single
+/// representative — the row with the lexicographically smallest
+/// primary key in each group. Rows with NULL / missing
+/// `_near_duplicate_group` always survive (no duplicate info ⇒ not a
+/// duplicate). Mirrors the contract used by
+/// [`galaxdb_versioning::export::apply_dedup_filter`] so `WHERE NOT
+/// DUPLICATE` queries and `CREATE VERSION TAG … FOR TRAINING` exports
+/// pick the same representative per group.
+fn apply_not_duplicate_pass(buffered: &mut Vec<(Vec<u8>, Vec<(String, Value)>)>) {
+    use std::collections::HashMap;
+
+    // Pass 1: for each group ID, remember the smallest primary key.
+    let mut representative: HashMap<i64, Vec<u8>> = HashMap::new();
+    for (key, row) in buffered.iter() {
+        let group = row_group_id(row);
+        if let Some(g) = group {
+            representative
+                .entry(g)
+                .and_modify(|best| {
+                    if key.as_slice() < best.as_slice() {
+                        *best = key.clone();
+                    }
+                })
+                .or_insert_with(|| key.clone());
+        }
+    }
+
+    if representative.is_empty() {
+        return;
+    }
+
+    // Pass 2: keep every row whose group is None, or whose primary key
+    // matches the representative for its group.
+    buffered.retain(|(key, row)| {
+        match row_group_id(row) {
+            None => true,
+            Some(g) => representative
+                .get(&g)
+                .map(|best| key.as_slice() == best.as_slice())
+                .unwrap_or(true),
+        }
+    });
+}
+
+/// Read the `_near_duplicate_group` column off a decoded row. Accepts
+/// [`Value::Integer`] (encoded group id) and [`Value::Text`] (stringified
+/// group id) — `row_codec::value_from_str` round-trips unsigned 64-bit
+/// group ids through `i64::parse`, which negates values whose MSB is
+/// set, so we cast and compare as raw bits to stay injective. A NULL,
+/// absent column, or unparseable text value returns `None`: the row is
+/// not known to be a duplicate and always survives `WHERE NOT
+/// DUPLICATE`.
+fn row_group_id(row: &[(String, Value)]) -> Option<i64> {
+    let v = row
+        .iter()
+        .find(|(n, _)| n == crate::planner::NEAR_DUPLICATE_GROUP_COLUMN)
+        .map(|(_, v)| v)?;
+    match v {
+        Value::Integer(n) => Some(*n),
+        Value::Text(s) => {
+            if s == "NULL" {
+                return None;
+            }
+            // Accept both signed and unsigned decimal spellings — the
+            // group-id generator is `xxh3_64` which fills the full
+            // 64-bit range; `row_codec::value_from_str` decodes
+            // unsigned values whose MSB is set as strings rather than
+            // integers.
+            if let Ok(n) = s.parse::<i64>() {
+                return Some(n);
+            }
+            if let Ok(u) = s.parse::<u64>() {
+                return Some(u as i64);
+            }
+            None
+        }
+        Value::Null => None,
+        _ => None,
+    }
 }
 
 /// Execute a `SELECT … AT VERSION <ref> [CONSISTENCY <mode>]` plan.
@@ -858,7 +956,8 @@ fn exec_full_scan_at_version(
     };
 
     let prefix = format!("{}:", table);
-    let mut rows: Vec<Row> = Vec::new();
+    let dedup = filter.map(filter_has_not_duplicate).unwrap_or(false);
+    let mut buffered: Vec<(Vec<u8>, Vec<(String, Value)>)> = Vec::new();
 
     for (key, value_bytes, _row_ts) in ctx.engine.scan_all_at(read_ts) {
         if !String::from_utf8_lossy(&key).starts_with(&prefix) {
@@ -870,19 +969,29 @@ fn exec_full_scan_at_version(
                 continue;
             }
         }
-        let projected: Vec<(String, Value)> = project
-            .iter()
-            .map(|name| {
-                let v = cols
-                    .iter()
-                    .find(|(k, _)| k == name)
-                    .map(|(_, v)| v.clone())
-                    .unwrap_or(Value::Null);
-                (name.clone(), v)
-            })
-            .collect();
-        rows.push(Row { columns: projected });
+        buffered.push((key, cols));
     }
+
+    if dedup {
+        apply_not_duplicate_pass(&mut buffered);
+    }
+
+    let rows: Vec<Row> = buffered
+        .into_iter()
+        .map(|(_, cols)| Row {
+            columns: project
+                .iter()
+                .map(|name| {
+                    let v = cols
+                        .iter()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null);
+                    (name.clone(), v)
+                })
+                .collect(),
+        })
+        .collect();
 
     Ok(ExecuteResult::Rows {
         columns: project,

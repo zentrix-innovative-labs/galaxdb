@@ -616,3 +616,28 @@ Verification (actually run on macOS):
 - `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
 
 **Real bug caught by the new pytest suite (not a new regression)**: the checked-in `target/release/galaxdb-server` binary was stale — built before the Phase I WHERE-clause fix landed — and the remote test immediately flagged it by returning 3 rows for `WHERE price > 4.0` instead of 2. `cargo build --release -p galaxdb-server` rebuilt the binary with Phase I's fix and the test went green. Gate added implicitly: the remote pytest file now demands a Phase-I-or-later server binary to pass.
+
+### Phase O — Task 35.5 + 35.6 (`WHERE NOT DUPLICATE` query filter)
+
+`WHERE NOT DUPLICATE` is now a real group-level predicate end-to-end. Task 35's remaining children closed together because 35.6's test coverage is what proves 35.5 correct.
+
+Files touched in Phase O:
+- `crates/galaxdb-sql/src/planner.rs` — new `FilterExpr::NotDuplicate` variant, `NEAR_DUPLICATE_GROUP_COLUMN` const, `filter_has_not_duplicate` tree walker.
+- `crates/galaxdb-sql/src/parser.rs` — recognises `NOT DUPLICATE` as a WHERE term (sqlparser represents it as `UnaryOp { Not, Identifier("DUPLICATE") }`).
+- `crates/galaxdb-sql/src/row_codec.rs` — `filter_matches` documents the group-level contract and returns `true` for `NotDuplicate` so per-row evaluation composes with `And`/`Or`; the scan-level dedup pass enforces the actual representative selection.
+- `crates/galaxdb-sql/src/executor.rs` — `exec_full_scan` now checks `filter_has_not_duplicate`, runs per-row filtering on the candidate set, then collapses each non-null `_near_duplicate_group` to its lowest-primary-key representative. Matches `galaxdb-versioning::export::apply_dedup_filter` so SQL `WHERE NOT DUPLICATE` and Lance training exports agree per-group.
+- `crates/galaxdb-embedded/src/lib.rs::filter_from_expr` — translates the sqlparser `UnaryOp` shape into `FilterExpr::NotDuplicate`, wiring the predicate through the embedded path.
+- New tests:
+  - `galaxdb-sql/src/tests.rs` — parser: bare `NOT DUPLICATE` and `AND NOT DUPLICATE` composition.
+  - `galaxdb-sql/src/planner_tests.rs` — planner carries the predicate through `plan_select`.
+  - `galaxdb-sql/src/executor_tests.rs` — three executor tests: representative-per-group, composition with `AND`, rows without the group column all pass. Plus `filter_has_not_duplicate_walks_tree`.
+  - `galaxdb-embedded/src/lib.rs` — two SQL-level tests driving `Database::execute` with real engine state.
+  - `galaxdb-python/tests/python/test_embedded_crud.py` — pytest that INSERTs duplicates and asserts `SELECT ... WHERE NOT DUPLICATE` keeps one representative per group plus ungrouped rows.
+
+Verification (actually run on macOS):
+- `cargo test --workspace --exclude galaxdb-python --lib` → **711 passed / 0 failed** (was 700 at Phase N; +11 from 35.5/35.6).
+- `python -m pytest galaxdb-python/tests/python/ -v` → **16 passed / 0 failed** (was 15 at Phase N; +1 from 35.5 pytest).
+- `bash scripts/grep-for-mocks.sh` + `bash scripts/check-tasks-no-stub-ticks.sh` → both OK.
+- `cargo deny check` → `advisories ok, bans ok, licenses ok, sources ok`.
+
+**Pragmatic note on wheel rebuilds**: the pytest test needed a refreshed `galaxdb` Python wheel. A debug `maturin develop` (no `--release`) rebuilt the wheel in roughly the same time as the first release build — Lance's debug tree is the bottleneck for both. Going forward, incremental rebuilds (changing only `galaxdb-sql` and `galaxdb-embedded`) are much faster because Lance is cached. Do not rebuild in `--release` unless the tests need release-mode behaviour (they don't for correctness; they do for the server integration tests that demand the `--release` binary at `target/release/galaxdb-server`).

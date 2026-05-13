@@ -1369,6 +1369,10 @@ fn column_name_from_expr(expr: &sqlparser::ast::Expr) -> Option<String> {
 /// - `col = literal`, `col != literal`, `col <> literal`
 /// - `col < literal`, `col > literal`, `col <= literal`, `col >= literal`
 /// - `expr AND expr`, `expr OR expr`
+/// - `NOT DUPLICATE` — the AuroraSQL group-level dedup predicate
+///   (task 35.5). sqlparser parses it as `UnaryOp { op: Not, expr:
+///   Identifier("DUPLICATE") }`; we recognise that exact shape and
+///   translate it to [`FilterExpr::NotDuplicate`].
 ///
 /// The left side must be a column reference and the right side a
 /// literal value. Anything else returns `None` (treated by the planner
@@ -1376,8 +1380,23 @@ fn column_name_from_expr(expr: &sqlparser::ast::Expr) -> Option<String> {
 /// asks for — callers should prefer a parse error for that case, but
 /// at the embedded layer today we only forward supported filters).
 fn filter_from_expr(expr: &sqlparser::ast::Expr) -> Option<FilterExpr> {
-    use sqlparser::ast::{BinaryOperator, Expr};
+    use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
     match expr {
+        // `NOT DUPLICATE` — AuroraSQL extension (task 35.5). Parses as
+        // `UnaryOp { op: Not, expr: Identifier("DUPLICATE") }` in
+        // sqlparser; case-insensitive match keeps the user-facing SQL
+        // tolerant of quoting and casing.
+        Expr::UnaryOp {
+            op: UnaryOperator::Not,
+            expr: inner,
+        } => {
+            if let Expr::Identifier(id) = inner.as_ref() {
+                if id.value.eq_ignore_ascii_case("DUPLICATE") {
+                    return Some(FilterExpr::NotDuplicate);
+                }
+            }
+            None
+        }
         Expr::BinaryOp { left, op, right } => match op {
             BinaryOperator::And => Some(FilterExpr::And(
                 Box::new(filter_from_expr(left)?),
@@ -2358,5 +2377,109 @@ mod tests {
             msg.contains("unknown version tag") || msg.contains("does-not-exist"),
             "expected 'unknown version tag' error, got: {msg}"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // WHERE NOT DUPLICATE (task 35.5) — embedded end-to-end
+    // -----------------------------------------------------------------
+
+    /// End-to-end: create a table with the near-duplicate group column,
+    /// seed rows that share group ids, run `SELECT … WHERE NOT
+    /// DUPLICATE` through the full embedded SQL pipeline (parser →
+    /// filter_from_expr → planner → executor), and assert only the
+    /// deterministic representatives come back. Requirement 26 + task 35.5.
+    #[test]
+    fn where_not_duplicate_keeps_one_per_group_over_sql() {
+        let mut db = test_db();
+        db.execute(
+            "CREATE TABLE docs (\
+                id INT PRIMARY KEY, \
+                body TEXT, \
+                _near_duplicate_group BIGINT\
+             )",
+        )
+        .unwrap();
+        // Group 100: ids 3, 1, 4 → representative is id=1.
+        db.execute("INSERT INTO docs (id, body, _near_duplicate_group) VALUES (3, 'hello world', 100)")
+            .unwrap();
+        db.execute("INSERT INTO docs (id, body, _near_duplicate_group) VALUES (1, 'hello world!', 100)")
+            .unwrap();
+        db.execute("INSERT INTO docs (id, body, _near_duplicate_group) VALUES (4, 'hello world.', 100)")
+            .unwrap();
+        // Group 200: ids 5, 2 → representative is id=2.
+        db.execute("INSERT INTO docs (id, body, _near_duplicate_group) VALUES (5, 'quick fox', 200)")
+            .unwrap();
+        db.execute("INSERT INTO docs (id, body, _near_duplicate_group) VALUES (2, 'quick fox!', 200)")
+            .unwrap();
+        // Ungrouped.
+        db.execute("INSERT INTO docs (id, body, _near_duplicate_group) VALUES (6, 'unique', NULL)")
+            .unwrap();
+
+        let r = db
+            .execute("SELECT id FROM docs WHERE NOT DUPLICATE")
+            .unwrap();
+        let QueryResult::Rows(rows) = r else {
+            panic!("expected Rows");
+        };
+        let mut ids: Vec<String> = rows
+            .into_iter()
+            .map(|r| {
+                r.values
+                    .into_iter()
+                    .find(|(k, _)| k == "id")
+                    .map(|(_, v)| v)
+                    .expect("id column present")
+            })
+            .collect();
+        ids.sort();
+        // Representatives are id=1 (group 100) and id=2 (group 200),
+        // plus the ungrouped id=6. Values render through
+        // `row_codec::value_display`, so integers come back as decimal
+        // strings.
+        assert_eq!(ids, vec!["1".to_string(), "2".to_string(), "6".to_string()]);
+    }
+
+    /// Composition with a conventional WHERE must still dedup on the
+    /// narrowed candidate set. `WHERE id > 1 AND NOT DUPLICATE` drops
+    /// id=1 first — so group 100's representative shifts from id=1 to
+    /// id=2, proving the dedup pass runs after per-row filtering.
+    #[test]
+    fn where_not_duplicate_composes_with_and_over_sql() {
+        let mut db = test_db();
+        db.execute(
+            "CREATE TABLE docs (\
+                id INT PRIMARY KEY, \
+                body TEXT, \
+                _near_duplicate_group BIGINT\
+             )",
+        )
+        .unwrap();
+        db.execute("INSERT INTO docs (id, body, _near_duplicate_group) VALUES (1, 'a', 100)")
+            .unwrap();
+        db.execute("INSERT INTO docs (id, body, _near_duplicate_group) VALUES (2, 'b', 100)")
+            .unwrap();
+        db.execute("INSERT INTO docs (id, body, _near_duplicate_group) VALUES (3, 'c', 200)")
+            .unwrap();
+        db.execute("INSERT INTO docs (id, body, _near_duplicate_group) VALUES (4, 'd', NULL)")
+            .unwrap();
+
+        let r = db
+            .execute("SELECT id FROM docs WHERE id > 1 AND NOT DUPLICATE")
+            .unwrap();
+        let QueryResult::Rows(rows) = r else {
+            panic!("expected Rows");
+        };
+        let mut ids: Vec<String> = rows
+            .into_iter()
+            .map(|r| {
+                r.values
+                    .into_iter()
+                    .find(|(k, _)| k == "id")
+                    .map(|(_, v)| v)
+                    .unwrap()
+            })
+            .collect();
+        ids.sort();
+        assert_eq!(ids, vec!["2".to_string(), "3".to_string(), "4".to_string()]);
     }
 }

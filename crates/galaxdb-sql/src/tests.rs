@@ -378,3 +378,72 @@ fn multiple_statements() {
     let stmts = parse("SELECT 1; SELECT 2").unwrap();
     assert_eq!(stmts.len(), 2);
 }
+
+// ── WHERE NOT DUPLICATE (AuroraSQL extension — task 35.5) ──────────
+
+/// `WHERE NOT DUPLICATE` parses to a `UnaryOp { Not, Identifier("DUPLICATE") }`
+/// with sqlparser — that's the AST shape the executor's filter
+/// conversion anchors on to produce `FilterExpr::NotDuplicate`. This
+/// test pins the shape so a sqlparser upgrade that changes it fails
+/// loudly instead of silently breaking the group-level dedup pass.
+#[test]
+fn parse_where_not_duplicate_bare() {
+    use sqlparser::ast::{Expr, SetExpr, Statement, UnaryOperator};
+
+    let stmts = parse("SELECT * FROM docs WHERE NOT DUPLICATE").unwrap();
+    assert_eq!(stmts.len(), 1);
+    let AuroraStatement::Standard(boxed) = &stmts[0] else {
+        panic!("expected Standard(Query)");
+    };
+    let Statement::Query(q) = boxed.as_ref() else {
+        panic!("expected Query");
+    };
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        panic!("expected Select body");
+    };
+    let selection = s.selection.as_ref().expect("WHERE clause present");
+    let Expr::UnaryOp { op, expr } = selection else {
+        panic!("expected UnaryOp, got {:?}", selection);
+    };
+    assert!(matches!(op, UnaryOperator::Not));
+    let Expr::Identifier(id) = expr.as_ref() else {
+        panic!("expected Identifier under Not, got {:?}", expr);
+    };
+    assert!(id.value.eq_ignore_ascii_case("DUPLICATE"));
+}
+
+/// `WHERE price > 4 AND NOT DUPLICATE` — composition with an ordinary
+/// comparison predicate must survive, because the executor's dedup
+/// pass walks the filter tree for the NOT DUPLICATE marker.
+#[test]
+fn parse_where_not_duplicate_composed_with_and() {
+    use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement, UnaryOperator};
+
+    let stmts = parse("SELECT * FROM docs WHERE price > 4 AND NOT DUPLICATE").unwrap();
+    let AuroraStatement::Standard(boxed) = &stmts[0] else {
+        panic!("expected Standard(Query)");
+    };
+    let Statement::Query(q) = boxed.as_ref() else {
+        panic!("expected Query");
+    };
+    let SetExpr::Select(s) = q.body.as_ref() else {
+        panic!("expected Select body");
+    };
+    let selection = s.selection.as_ref().expect("WHERE clause present");
+    let Expr::BinaryOp { op, right, .. } = selection else {
+        panic!("expected BinaryOp at top, got {:?}", selection);
+    };
+    assert!(matches!(op, BinaryOperator::And));
+    let Expr::UnaryOp {
+        op: uop,
+        expr: inner,
+    } = right.as_ref()
+    else {
+        panic!("expected UnaryOp on RHS, got {:?}", right);
+    };
+    assert!(matches!(uop, UnaryOperator::Not));
+    let Expr::Identifier(id) = inner.as_ref() else {
+        panic!("expected Identifier under Not, got {:?}", inner);
+    };
+    assert!(id.value.eq_ignore_ascii_case("DUPLICATE"));
+}

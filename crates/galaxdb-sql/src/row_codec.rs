@@ -227,6 +227,15 @@ pub fn value_from_str(s: &str) -> Value {
 /// Evaluate a [`FilterExpr`] against a decoded row. Unknown columns
 /// never match; comparisons between incompatible value types return
 /// `false` rather than an error (SQL semantics for NULL comparisons).
+///
+/// [`FilterExpr::NotDuplicate`] is a **group-level** predicate: by the
+/// time the row-level evaluator sees a row, the per-scan dedup pass
+/// has already dropped any non-representatives, so this function
+/// returns `true` for every row and lets the caller enforce the group
+/// filter out of band. The executor's `exec_full_scan` applies
+/// [`crate::planner::extract_not_duplicate`] + a representative-per-
+/// group pass before per-row filter matching, which mirrors the
+/// [`galaxdb_versioning::export::apply_dedup_filter`] contract.
 pub fn filter_matches(row: &[(String, Value)], filter: &FilterExpr) -> bool {
     match filter {
         FilterExpr::Eq { column, value } => compare(row, column, value, |a, b| a == b),
@@ -237,6 +246,12 @@ pub fn filter_matches(row: &[(String, Value)], filter: &FilterExpr) -> bool {
         FilterExpr::Ge { column, value } => cmp_order(row, column, value, |a, b| a >= b),
         FilterExpr::And(a, b) => filter_matches(row, a) && filter_matches(row, b),
         FilterExpr::Or(a, b) => filter_matches(row, a) || filter_matches(row, b),
+        // Group-level predicate, enforced outside the per-row loop —
+        // see the doc comment above. Returning `true` here keeps
+        // composed filters like `price > 4 AND NOT DUPLICATE` working:
+        // the price comparison narrows the per-row candidates, then
+        // the scan-level dedup pass collapses each group.
+        FilterExpr::NotDuplicate => true,
     }
 }
 

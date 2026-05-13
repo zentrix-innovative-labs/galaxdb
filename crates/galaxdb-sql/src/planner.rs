@@ -118,6 +118,28 @@ pub enum SearchStrategy {
     BruteForceFiltered,
 }
 
+/// Canonical name of the system column populated by MinHash's
+/// near-duplicate grouping job (task 35.4). A non-NULL value is the
+/// group ID that row shares with its near-duplicate peers; a NULL or
+/// missing value means "not known to be a duplicate" and the row
+/// always passes `WHERE NOT DUPLICATE`.
+pub const NEAR_DUPLICATE_GROUP_COLUMN: &str = "_near_duplicate_group";
+
+/// Does `filter` contain a `NotDuplicate` predicate anywhere?
+///
+/// Walks the expression tree including `And` / `Or` children. This
+/// decides whether the executor needs to buffer the row set and run
+/// the group-level dedup pass in addition to per-row filtering.
+pub fn filter_has_not_duplicate(filter: &FilterExpr) -> bool {
+    match filter {
+        FilterExpr::NotDuplicate => true,
+        FilterExpr::And(a, b) | FilterExpr::Or(a, b) => {
+            filter_has_not_duplicate(a) || filter_has_not_duplicate(b)
+        }
+        _ => false,
+    }
+}
+
 /// A simple filter expression for WHERE clauses.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterExpr {
@@ -137,6 +159,21 @@ pub enum FilterExpr {
     And(Box<FilterExpr>, Box<FilterExpr>),
     /// expr OR expr
     Or(Box<FilterExpr>, Box<FilterExpr>),
+    /// `WHERE NOT DUPLICATE` — exclude rows in near-duplicate groups,
+    /// keeping one deterministic representative per group (Req 26,
+    /// task 35.5). Rows with a non-NULL `_near_duplicate_group` column
+    /// collapse to the row with the lexicographically smallest primary
+    /// key in their group; rows with NULL / missing group pass through
+    /// (no duplicate info ⇒ not a duplicate).
+    ///
+    /// The filter is a group-level predicate: it cannot be evaluated
+    /// per-row without knowing every other row's group. The executor
+    /// buffers the full row set for a scan once before applying the
+    /// dedup pass — this matches the contract used by the Lance
+    /// training exporter's `apply_dedup_filter` so `SELECT … WHERE NOT
+    /// DUPLICATE` and `CREATE VERSION TAG … FOR TRAINING` export agree
+    /// on which row represents each near-duplicate cluster.
+    NotDuplicate,
 }
 
 /// A typed value in a query plan.

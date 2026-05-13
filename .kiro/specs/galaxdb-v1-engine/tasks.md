@@ -281,13 +281,13 @@
   - [x] 34.5 Implement lineage recording: insert record into `_galaxdb_training_exports` on each export (Req 38)
   - [x] 34.6 Write tests: Lance export produces valid dataset, precision conversion correctness, dedup filtering, lineage record created
 
-- [ ] 35. Implement MinHash near-duplicate detection — galaxdb-versioning (Req 26)
+- [x] 35. Implement MinHash near-duplicate detection — galaxdb-versioning (Req 26)
   - [x] 35.1 Implement `MinHashDedup`: 128 independent hash functions over character n-grams, 512-byte signature per row
   - [x] 35.2 Integrate into write path: compute MinHash signature on INSERT for TEXT columns, store as `_minhash_signature` system column
   - [x] 35.3 Implement Jaccard similarity estimation from signatures
   - [x] 35.4 Implement background refresh job: group rows with Jaccard > 0.8, populate `_near_duplicate_group` column
-  - [ ] 35.5 Implement `WHERE NOT DUPLICATE` query filter: exclude rows in near-duplicate groups (keep one representative)
-  - [ ] 35.6 Write tests: signature computation, Jaccard estimation accuracy, duplicate grouping, WHERE NOT DUPLICATE filtering
+  - [x] 35.5 Implement `WHERE NOT DUPLICATE` query filter: exclude rows in near-duplicate groups (keep one representative) <!-- Real implementation: `FilterExpr::NotDuplicate` variant + `filter_has_not_duplicate` helper in `galaxdb-sql/src/planner.rs`; parser recognises `NOT DUPLICATE` as a UnaryOp(Not, Identifier("DUPLICATE")) in `galaxdb-sql/src/parser.rs` and `galaxdb-embedded/src/lib.rs::filter_from_expr`; `exec_full_scan` in `galaxdb-sql/src/executor.rs` runs a scan-level dedup pass that keeps one representative (lowest primary key) per non-null `_near_duplicate_group` — matches the contract in `galaxdb-versioning::export::apply_dedup_filter` so SQL and training-export exports agree per-group. Composes with per-row predicates via `FilterExpr::And/Or` (dedup runs AFTER per-row filtering on the narrowed set). -->
+  - [x] 35.6 Write tests: signature computation, Jaccard estimation accuracy, duplicate grouping, WHERE NOT DUPLICATE filtering <!-- Real tests: `galaxdb-sql/src/tests.rs::parse_where_not_duplicate_{bare,composed_with_and}`, `galaxdb-sql/src/planner_tests.rs::plan_select_carries_{,composed_}not_duplicate_predicate`, `galaxdb-sql/src/executor_tests.rs::where_not_duplicate_{keeps_one_representative_per_group,composes_with_and,passes_rows_without_group_column}` + `filter_has_not_duplicate_walks_tree`, `galaxdb-embedded/src/lib.rs::where_not_duplicate_{keeps_one_per_group_over_sql,composes_with_and_over_sql}`, `galaxdb-python/tests/python/test_embedded_crud.py::test_where_not_duplicate_keeps_one_representative_per_group`. 711 workspace lib tests + 16 pytest tests green. -->
 
 - [ ] 36. Implement training data lineage — galaxdb-versioning (Req 38)
   - [ ] 36.1 Create `_galaxdb_training_exports` system table: tag_name, filter_expr, precision, dedup, curriculum, row_count, exported_at, content_hash

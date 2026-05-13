@@ -116,3 +116,75 @@ def test_unknown_table_raises(temp_db_dir: Path) -> None:
     assert "does_not_exist" in str(excinfo.value).lower() or "not found" in str(
         excinfo.value
     ).lower()
+
+
+def test_where_not_duplicate_keeps_one_representative_per_group(
+    temp_db_dir: Path,
+) -> None:
+    """`WHERE NOT DUPLICATE` must collapse near-duplicate groups to a
+    single representative (task 35.5 / Req 26). Seeds `docs` with two
+    groups plus one ungrouped row and asserts the survivors.
+
+    The `_near_duplicate_group` system column is what the Task 35.4
+    background refresh job populates; here we write it directly via
+    INSERT since we're testing the query-time filter, not the grouping
+    job. Representative selection is "lowest primary key in each
+    group", which matches what the Lance exporter's
+    `apply_dedup_filter` uses so `WHERE NOT DUPLICATE` and `CREATE
+    VERSION TAG ... FOR TRAINING` exports agree per-group.
+    """
+    db = galaxdb.Database(str(temp_db_dir))
+    db.execute(
+        "CREATE TABLE docs ("
+        "id INT PRIMARY KEY, body TEXT, _near_duplicate_group BIGINT"
+        ")"
+    )
+    # Group 100: ids 3, 1, 4 → representative is id=1.
+    db.execute(
+        "INSERT INTO docs (id, body, _near_duplicate_group)"
+        " VALUES (3, 'hello world', 100)"
+    )
+    db.execute(
+        "INSERT INTO docs (id, body, _near_duplicate_group)"
+        " VALUES (1, 'hello world!', 100)"
+    )
+    db.execute(
+        "INSERT INTO docs (id, body, _near_duplicate_group)"
+        " VALUES (4, 'hello world.', 100)"
+    )
+    # Group 200: ids 5, 2 → representative is id=2.
+    db.execute(
+        "INSERT INTO docs (id, body, _near_duplicate_group)"
+        " VALUES (5, 'quick fox', 200)"
+    )
+    db.execute(
+        "INSERT INTO docs (id, body, _near_duplicate_group)"
+        " VALUES (2, 'quick fox!', 200)"
+    )
+    # Ungrouped.
+    db.execute(
+        "INSERT INTO docs (id, body, _near_duplicate_group)"
+        " VALUES (6, 'unique', NULL)"
+    )
+
+    rows = db.execute("SELECT id FROM docs WHERE NOT DUPLICATE")
+    assert isinstance(rows, list)
+    # Exactly three survivors: one representative per group plus the
+    # ungrouped row.
+    assert len(rows) == 3
+    ids = sorted(int(r["id"]) for r in rows)
+    assert ids == [1, 2, 6]
+
+    # Composed with a per-row predicate: `id > 1 AND NOT DUPLICATE`
+    # first drops id=1, then applies the dedup pass on the narrowed
+    # candidate set:
+    #   Group 100 survivors {3, 4} → representative id=3 (pk "docs:3" < "docs:4")
+    #   Group 200 survivors {5, 2} → representative id=2 (pk "docs:2" < "docs:5")
+    #   Ungrouped: id=6 survives
+    # Final answer: [2, 3, 6]. This proves the dedup pass runs AFTER
+    # the per-row filter, not before.
+    rows = db.execute(
+        "SELECT id FROM docs WHERE id > 1 AND NOT DUPLICATE"
+    )
+    ids = sorted(int(r["id"]) for r in rows)
+    assert ids == [2, 3, 6]
