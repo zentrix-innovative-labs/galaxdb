@@ -485,6 +485,8 @@ impl Engine {
             return Ok(0);
         }
 
+        let flush_start = std::time::Instant::now();
+
         let sst_id = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
         let flush_config = FlushConfig {
             data_dir: self.config.data_dir.clone(),
@@ -577,6 +579,12 @@ impl Engine {
         // because Memtable::put() rejects writes to sealed memtables.
         self.memtable_mgr.seal_active();
         self.memtable_mgr.on_flush_complete(active.size());
+
+        // Task 38.3: publish flush (a.k.a. checkpoint) duration in ms.
+        let elapsed_ms = flush_start.elapsed().as_millis() as i64;
+        galaxdb_observe::metrics()
+            .checkpoint_last_duration_ms
+            .set(elapsed_ms);
 
         Ok(result.rows_flushed as u64)
     }

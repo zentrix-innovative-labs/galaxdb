@@ -416,10 +416,45 @@ impl MinHashPolicy {
 /// * SELECT, `SHOW EMBEDDING HEALTH`, `SEMANTIC_MATCH` → `Ok(ExecuteResult::Rows{..})`
 /// * Unsupported or missing-prerequisite → `Err(GalaxError::NotYetAvailable { task })`
 /// * Runtime failures (I/O, catalog conflict, checksum, etc.) → `Err(GalaxError)`
+/// Human-readable label for a [`QueryPlan`] variant, used as the
+/// `plan` field on the `query.execute` span (task 38.5).
+fn plan_kind_str(plan: &QueryPlan) -> &'static str {
+    match plan {
+        QueryPlan::CreateTable(_) => "create_table",
+        QueryPlan::DropTable { .. } => "drop_table",
+        QueryPlan::Insert { .. } => "insert",
+        QueryPlan::Update { .. } => "update",
+        QueryPlan::Delete { .. } => "delete",
+        QueryPlan::FullScan { .. } => "full_scan",
+        QueryPlan::FullScanAtVersion { .. } => "full_scan_at_version",
+        QueryPlan::PointLookup { .. } => "point_lookup",
+        QueryPlan::SemanticSearch { .. } => "semantic_search",
+        QueryPlan::HybridSearch { .. } => "hybrid_search",
+        QueryPlan::HybridSearchAtVersion { .. } => "hybrid_search_at_version",
+        QueryPlan::BulkInsert { .. } => "bulk_insert",
+        QueryPlan::CreateVersionTag(_) => "create_version_tag",
+        QueryPlan::Analyze { .. } => "analyze",
+        QueryPlan::Backup { .. } => "backup",
+        QueryPlan::Restore { .. } => "restore",
+        QueryPlan::ShowEmbeddingHealth { .. } => "show_embedding_health",
+    }
+}
+
 pub fn execute_with_context(
     plan: &QueryPlan,
     ctx: &mut ExecutorContext,
 ) -> GalaxResult<ExecuteResult> {
+    // Task 38.5: every plan dispatch lives inside a `query.execute`
+    // span so tracing backends get a root span per SQL statement.
+    // Child spans at `exec_insert`, `exec_full_scan`, and
+    // `exec_semantic_search` below form the rest of the hot-path
+    // span tree. The span is entered explicitly via `_entered` so
+    // any synchronous child calls inherit it without needing to be
+    // instrumented manually.
+    let plan_kind = plan_kind_str(plan);
+    let span = tracing::info_span!("query.execute", plan = plan_kind);
+    let _entered = span.enter();
+
     match plan {
         QueryPlan::CreateTable(stmt) => exec_create_table(stmt, ctx),
         QueryPlan::DropTable { name, if_exists } => exec_drop_table(name, *if_exists, ctx),
@@ -770,6 +805,9 @@ fn exec_full_scan(
     filter: Option<&FilterExpr>,
     ctx: &mut ExecutorContext,
 ) -> GalaxResult<ExecuteResult> {
+    // Task 38.5: PAX-read span covers every block the scan touches.
+    let _span = tracing::info_span!("executor.full_scan", table = %table).entered();
+
     let table_entry = ctx
         .catalog
         .get_table(table)
@@ -1396,6 +1434,17 @@ fn exec_semantic_search(
     strategy: SearchStrategy,
     ctx: &mut ExecutorContext,
 ) -> GalaxResult<ExecuteResult> {
+    // Task 38.5: sidecar-call / HNSW-search span. The backend impl
+    // issues the sidecar embed + HNSW graph search under this span;
+    // a downstream OTel exporter sees the full path from query root
+    // through the vector backend.
+    let _span = tracing::info_span!(
+        "executor.semantic_search",
+        table = %table,
+        strategy = ?strategy,
+    )
+    .entered();
+
     if !ctx.catalog.table_exists(table) {
         return Err(GalaxError::TableNotFound(table.to_string()));
     }

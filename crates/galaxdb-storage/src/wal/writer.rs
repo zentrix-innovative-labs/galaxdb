@@ -225,6 +225,7 @@ impl WalWriter {
         record_type: WalRecordType,
         payload: Vec<u8>,
     ) -> io::Result<u64> {
+        let start = std::time::Instant::now();
         let seq_no = self.next_seq_no.fetch_add(1, Ordering::SeqCst);
         let record = WalRecord::new(record_type, seq_no, payload);
         let data = record.serialize();
@@ -248,6 +249,11 @@ impl WalWriter {
         })??;
 
         self.current_size.fetch_add(data_len, Ordering::SeqCst);
+        // Task 38.3: publish append-to-fsync latency in microseconds.
+        let elapsed_us = start.elapsed().as_micros() as i64;
+        galaxdb_observe::metrics()
+            .wal_write_latency_us
+            .set(elapsed_us);
         Ok(seq_no)
     }
 

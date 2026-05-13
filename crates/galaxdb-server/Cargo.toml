@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 galaxdb-common.workspace = true
 galaxdb-embedded.workspace = true
+galaxdb-observe.workspace = true
 galaxdb-wire.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }

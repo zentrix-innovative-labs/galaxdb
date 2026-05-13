@@ -2472,6 +2472,7 @@ dependencies = [
  "clap",
  "galaxdb-common",
  "galaxdb-io",
+ "galaxdb-observe",
  "galaxdb-sidecar",
  "galaxdb-storage",
  "galaxdb-vector",
@@ -2590,6 +2591,7 @@ version = "0.1.0"
 dependencies = [
  "galaxdb-common",
  "galaxdb-embedded",
+ "galaxdb-observe",
  "galaxdb-wire",
  "tempfile",
  "tokio",
@@ -2606,6 +2608,7 @@ dependencies = [
  "candle-nn",
  "candle-transformers",
  "galaxdb-common",
+ "galaxdb-observe",
  "hf-hub",
  "libc",
  "serde",
@@ -2629,6 +2632,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "xxhash-rust",
 ]
 

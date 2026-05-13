@@ -149,6 +149,27 @@ impl BufferPool {
                 scan.put_with_constraint(block_id, block, &hot_set_ids);
             }
         }
+        // Task 38.3: mirror total occupancy across all NUMA
+        // partitions into the observe gauges. "Usage" here is entry
+        // count (not bytes) — units the spec didn't fix, so we pick
+        // entries since that's what the buffer pool tracks natively.
+        self.publish_usage_metrics();
+    }
+
+    /// Publish current hot-set / scan-buffer occupancy to the observe
+    /// gauges (task 38.3). Called from `insert` so `/metrics` always
+    /// reflects the live state.
+    fn publish_usage_metrics(&self) {
+        let m = galaxdb_observe::metrics();
+        let nodes = self.hot_set.node_count();
+        let mut hot_total: i64 = 0;
+        let mut scan_total: i64 = 0;
+        for node in 0..nodes {
+            hot_total += self.hot_set.get(node).len() as i64;
+            scan_total += self.scan_buffer.get(node).len() as i64;
+        }
+        m.buffer_pool_hot_set_usage.set(hot_total);
+        m.buffer_pool_scan_buffer_usage.set(scan_total);
     }
 
     /// Returns the number of NUMA partitions.

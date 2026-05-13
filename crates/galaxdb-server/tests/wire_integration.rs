@@ -239,3 +239,49 @@ async fn many_concurrent_inserts_do_not_panic() {
         .collect();
     assert_eq!(rows.len(), 40);
 }
+
+/// Task 38.6: the server accepts a SQL statement carrying a W3C
+/// traceparent via the SQL commenter `/* traceparent='...' */`
+/// suffix. The query runs to completion (the commenter is stripped
+/// at parse time), proving the wire server doesn't choke on the
+/// trailing comment. The full-trace-span coverage (task 38.5) is
+/// still pending; this test confirms the header is at least
+/// tolerated end-to-end.
+#[tokio::test]
+async fn wire_server_accepts_sql_commenter_traceparent() {
+    let (conn_str, _td) = start_server().await;
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .simple_query("CREATE TABLE tp (id INTEGER PRIMARY KEY)")
+        .await
+        .expect("create table failed");
+
+    // Real W3C traceparent (trace id + span id from the spec examples).
+    let sql = concat!(
+        "INSERT INTO tp (id) VALUES (1) ",
+        "/* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */"
+    );
+    client
+        .simple_query(sql)
+        .await
+        .expect("insert with SQL commenter must succeed");
+
+    // Read-side commenter must also be tolerated.
+    let sql = concat!(
+        "SELECT id FROM tp ",
+        "/* traceparent='00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01' */"
+    );
+    let msgs = client.simple_query(sql).await.expect("select with SQL commenter");
+    let rows: Vec<_> = msgs
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1);
+}

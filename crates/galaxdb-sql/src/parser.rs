@@ -15,6 +15,11 @@ use crate::ast::*;
 /// First checks for AuroraSQL-specific extensions. If none match,
 /// falls back to standard sqlparser parsing.
 pub fn parse(sql: &str) -> GalaxResult<Vec<AuroraStatement>> {
+    // Task 38.5: `sql.parse` span over the parser entry point so
+    // OTel backends see per-query parse duration as a child of the
+    // `query.execute` root span.
+    let _span = tracing::info_span!("sql.parse", bytes = sql.len()).entered();
+
     let trimmed = sql.trim();
     if trimmed.is_empty() {
         return Err(GalaxError::SqlParse {

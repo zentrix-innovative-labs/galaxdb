@@ -122,6 +122,8 @@ impl SidecarManager {
         *child_guard = Some(child);
         *self.state.write().unwrap() = SidecarState::Healthy;
         self.missed_heartbeats.store(0, Ordering::Relaxed);
+        // Task 38.3: expose sidecar health on `/metrics`.
+        galaxdb_observe::metrics().sidecar_status.set(1);
         self.restart_attempt.store(0, Ordering::Relaxed);
 
         Ok(())
@@ -169,8 +171,15 @@ impl SidecarManager {
 
         // Check in-flight capacity
         let current = self.in_flight.fetch_add(1, Ordering::Relaxed);
+        // Task 38.3: queue-depth gauge mirrors the in-flight count.
+        galaxdb_observe::metrics()
+            .embedding_queue_depth
+            .set((current + 1) as i64);
         if current >= MAX_IN_FLIGHT {
             self.in_flight.fetch_sub(1, Ordering::Relaxed);
+            galaxdb_observe::metrics()
+                .embedding_queue_depth
+                .set(current as i64);
             // Over capacity — add to backlog
             self.add_to_backlog(request);
             return Err(GalaxError::Internal(
@@ -180,7 +189,10 @@ impl SidecarManager {
 
         // Connect and send request
         let result = self.send_embed_request(&request);
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let after = self.in_flight.fetch_sub(1, Ordering::Relaxed) - 1;
+        galaxdb_observe::metrics()
+            .embedding_queue_depth
+            .set(after as i64);
 
         match result {
             Ok(response) => {
@@ -226,6 +238,10 @@ impl SidecarManager {
     fn add_to_backlog(&self, request: EmbedRequest) {
         let mut backlog = self.backlog.lock().unwrap();
         backlog.push(request);
+        // Task 38.3: backlog depth gauge mirrors the Vec length.
+        galaxdb_observe::metrics()
+            .embedding_backlog_depth
+            .set(backlog.len() as i64);
     }
 
     /// Get the current backlog size.
@@ -255,6 +271,11 @@ impl SidecarManager {
             }
         }
 
+        // Task 38.3: reflect post-drain depth on the gauge.
+        galaxdb_observe::metrics()
+            .embedding_backlog_depth
+            .set(backlog.len() as i64);
+
         processed
     }
 
@@ -263,6 +284,9 @@ impl SidecarManager {
         let missed = self.missed_heartbeats.fetch_add(1, Ordering::Relaxed) + 1;
         if missed >= 3 {
             *self.state.write().unwrap() = SidecarState::Degraded;
+            // Task 38.3: mirror into the observe gauge so `/metrics`
+            // and `/health` report the degraded state.
+            galaxdb_observe::metrics().sidecar_status.set(0);
         }
     }
 
@@ -272,6 +296,7 @@ impl SidecarManager {
         if self.state() == SidecarState::Degraded {
             *self.state.write().unwrap() = SidecarState::Healthy;
         }
+        galaxdb_observe::metrics().sidecar_status.set(1);
     }
 
     /// Attempt to restart the sidecar after a crash.

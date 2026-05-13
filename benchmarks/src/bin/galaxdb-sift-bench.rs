@@ -362,6 +362,11 @@ fn main() {
             ef, cli.k, recall, mean_latency_us, p99_latency_us
         );
 
+        // Task 38.3: publish HNSW recall@k (scaled to basis points,
+        // 1 bp = 0.01%). A recall of 0.9902 renders as 9902.
+        let bp = (recall * 10_000.0).round() as i64;
+        galaxdb_observe::metrics().hnsw_recall_estimate.set(bp);
+
         sweep.push(EfPoint {
             ef,
             recall_at_k: recall,

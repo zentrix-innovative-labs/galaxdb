@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 galaxdb-common = { path = "../crates/galaxdb-common" }
+galaxdb-observe = { path = "../crates/galaxdb-observe" }
 galaxdb-storage = { path = "../crates/galaxdb-storage" }
 galaxdb-io = { path = "../crates/galaxdb-io" }
 galaxdb-vector = { path = "../crates/galaxdb-vector" }

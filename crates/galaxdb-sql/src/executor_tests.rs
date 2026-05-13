@@ -596,6 +596,97 @@ fn context_restore_validates_and_copies() {
     );
 }
 
+    /// Task 38.5: assert that the executor actually emits the spec-
+    /// required spans on a query execution. Uses a test subscriber
+    /// that captures span creation events.
+    ///
+    /// Note on implementation: tracing caches a span callsite's
+    /// "enabled" decision the first time a subscriber sees it, so in
+    /// a single test process where another test ran first with no
+    /// registered listener, the callsite may have been cached as
+    /// `disabled` — in which case a per-thread `set_default` won't
+    /// see any spans. To avoid that, we install a process-wide
+    /// `NoSubscriber`-plus-registry dispatcher the very first time
+    /// this test runs (via a `OnceLock`). The dispatcher forwards
+    /// span events to whatever `CAPTURE` bucket the current test
+    /// thread owns, so multiple invocations (e.g. under `cargo test
+    /// -- --test-threads=N`) still behave correctly.
+    #[test]
+    fn executor_emits_query_spans_on_insert_and_select() {
+        use std::sync::{Arc, Mutex, OnceLock};
+        use tracing::span::Attributes;
+        use tracing::{Event, Id, Subscriber};
+        use tracing_subscriber::layer::{Context, Layer};
+        use tracing_subscriber::prelude::*;
+
+        /// Thread-local + global bucket. Any spans the layer sees get
+        /// routed to the current thread's bucket if one is set,
+        /// otherwise dropped.
+        thread_local! {
+            static CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<String>>>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        struct CaptureLayer;
+        impl<S: Subscriber> Layer<S> for CaptureLayer {
+            fn on_new_span(&self, attrs: &Attributes<'_>, _id: &Id, _ctx: Context<'_, S>) {
+                CAPTURE.with(|c| {
+                    if let Some(bucket) = c.borrow().as_ref() {
+                        bucket
+                            .lock()
+                            .unwrap()
+                            .push(attrs.metadata().name().to_string());
+                    }
+                });
+            }
+            fn on_event(&self, _e: &Event<'_>, _ctx: Context<'_, S>) {}
+        }
+
+        static INIT: OnceLock<()> = OnceLock::new();
+        INIT.get_or_init(|| {
+            let sub = tracing_subscriber::registry().with(CaptureLayer);
+            // Best-effort: if a global is already installed, skip.
+            let _ = tracing::subscriber::set_global_default(sub);
+        });
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        CAPTURE.with(|c| *c.borrow_mut() = Some(captured.clone()));
+
+        let mut ctx = test_ctx();
+        ctx.catalog
+            .create_table("t".to_string(), users_entry())
+            .unwrap();
+        execute_with_context(
+            &QueryPlan::Insert {
+                table: "t".to_string(),
+                columns: vec!["id".to_string(), "name".to_string()],
+                values: vec![Value::Integer(1), Value::Text("alice".into())],
+            },
+            &mut ctx,
+        )
+        .unwrap();
+        execute_with_context(
+            &QueryPlan::FullScan {
+                table: "t".to_string(),
+                filter: None,
+                columns: vec![],
+            },
+            &mut ctx,
+        )
+        .unwrap();
+
+        CAPTURE.with(|c| *c.borrow_mut() = None);
+        let names = captured.lock().unwrap();
+        assert!(
+            names.iter().any(|n| n == "query.execute"),
+            "expected `query.execute` root span, got {names:?}"
+        );
+        assert!(
+            names.iter().any(|n| n == "executor.full_scan"),
+            "expected `executor.full_scan` child span on SELECT, got {names:?}"
+        );
+    }
+
 #[test]
 fn context_bulk_insert_writes_real_rows() {
     let mut ctx = ctx_with_users();

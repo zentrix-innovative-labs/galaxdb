@@ -61,6 +61,13 @@ pub async fn start(
     let active = Arc::new(AtomicUsize::new(0));
     let max_connections = config.max_connections;
 
+    // Task 38.3: mirror the live connection count into the observe
+    // crate's Prometheus gauge so /metrics reports it accurately.
+    // Eagerly register all metrics so the first scrape is complete.
+    galaxdb_observe::register_all_metrics();
+    let metrics = galaxdb_observe::metrics();
+    metrics.connections_active.set(0);
+
     let handle = tokio::spawn(async move {
         loop {
             let (stream, peer) = match listener.accept().await {
@@ -80,15 +87,18 @@ pub async fn start(
                 continue;
             }
 
-            active.fetch_add(1, Ordering::Relaxed);
+            let new_count = active.fetch_add(1, Ordering::Relaxed) + 1;
+            metrics.connections_active.set(new_count as i64);
             let db = db.clone();
             let counter = active.clone();
+            let metrics = metrics.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = handle_connection(stream, db).await {
                     tracing::debug!(peer = %peer, error = %e, "connection closed");
                 }
-                counter.fetch_sub(1, Ordering::Relaxed);
+                let new_count = counter.fetch_sub(1, Ordering::Relaxed) - 1;
+                metrics.connections_active.set(new_count as i64);
             });
         }
     });
@@ -130,6 +140,29 @@ async fn handle_connection(
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         };
+
+        // Task 38.6: SQL commenter format — extract a W3C traceparent
+        // from the `/* traceparent='...' */` suffix if the client
+        // attached one. When present the query span logs the trace
+        // and span ids so downstream backends can stitch together the
+        // full distributed trace. Task 38.5: the child spans emitted
+        // by the executor (`sql.parse`, `query.execute`,
+        // `executor.full_scan`, `executor.semantic_search`) run
+        // inside the `wire.query` span entered below, so tracing
+        // backends that support `trace_id`/`span_id` fields link the
+        // whole tree back to the client's traceparent.
+        let traceparent = galaxdb_observe::extract_traceparent_from_sql(&sql);
+        let wire_span = match traceparent.as_ref() {
+            Some(tp) => tracing::info_span!(
+                "wire.query",
+                trace_id = %tp.trace_id,
+                parent_span_id = %tp.span_id,
+                sampled = tp.sampled,
+            ),
+            None => tracing::info_span!("wire.query"),
+        };
+        let _wire_entered = wire_span.enter();
+        galaxdb_observe::metrics().queries_total.inc();
 
         // Catalog queries first (psycopg2 / SQLAlchemy reflection).
         if let Some(pg_result) = pg_catalog::try_handle_pg_catalog(&sql) {

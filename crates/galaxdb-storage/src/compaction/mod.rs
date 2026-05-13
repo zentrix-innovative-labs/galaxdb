@@ -181,6 +181,31 @@ impl LsmTree {
         &mut self.levels[idx]
     }
 
+    /// Total bytes of pending compaction work across all non-bottom
+    /// levels. Used as the `galaxdb_compaction_pending_bytes` metric
+    /// (task 38.3): higher means more I/O still owed before data
+    /// drains to the bottom level.
+    pub fn pending_bytes(&self) -> u64 {
+        // Everything above the bottom level is "pending". The bottom
+        // level's size is the steady-state working set and isn't
+        // counted as pending work.
+        self.levels
+            .iter()
+            .take(BOTTOM_LEVEL)
+            .map(|l| l.total_size_bytes())
+            .sum()
+    }
+
+    /// Publish the current pending-bytes value to the observe gauge.
+    /// Callers invoke this after any mutation that could change the
+    /// level sizes (flush add, compaction complete) so the metric
+    /// tracks real state.
+    pub fn publish_pending_bytes_metric(&self) {
+        galaxdb_observe::metrics()
+            .compaction_pending_bytes
+            .set(self.pending_bytes() as i64);
+    }
+
     /// Adds an SST to the specified level.
     pub fn add_sst(&mut self, level: usize, sst: SstMetadata) {
         self.levels[level].add_sst(sst);
