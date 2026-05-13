@@ -24,7 +24,6 @@ SHA256: `92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a`
 **Reproducing these numbers:**
 
 ```bash
-# Requires: AWS CLI, ssh key for the benchmark instance
 cargo run --release -p galaxdb-benchmarks -- \
     --sift-dir /path/to/sift \
     --ef-sweep 10,50,100,200 \
@@ -33,9 +32,21 @@ cargo run --release -p galaxdb-benchmarks -- \
 
 ---
 
+## Test Suite — v1 Release (AWS c6id.4xlarge)
+
+Confirmed on the same hardware as the vector benchmarks, release build:
+
+| Metric | Result |
+|--------|--------|
+| Rust unit tests | **740 passed / 0 failed** |
+| Chaos scenarios | **7 passed / 0 failed** |
+| Total chaos suite time | **10.91 s** (all recovery scenarios < 30 s each) |
+
+---
+
 ## Storage Engine
 
-**Hardware:** Same AWS c6id.4xlarge instance, NVMe storage.
+**Hardware:** AWS c6id.4xlarge, NVMe storage.
 
 ### Write throughput
 
@@ -99,15 +110,16 @@ All 7 chaos scenarios pass in < 30 s total:
 cargo run --release -p galaxdb-chaos-tests
 ```
 
-| Scenario | Result |
-|----------|--------|
-| Kill mid-flush → WAL replay | 1,000 rows recovered, zero loss |
-| Kill mid-compaction → old blocks intact | 4,000 keys readable |
-| Corrupt WAL record → replay stops at corruption | Partial recovery, no corrupt data returned |
-| Disk full → clean checkpoint, writes blocked | Reserve file freed, reads continue |
-| Kill sidecar → backlog preserved, no data loss | 50 requests queued, drained on recovery |
-| 100 concurrent writers | 100K writes, 0 duplicates, 0 missing |
-| OLAP scan during OLTP | 0 HotSet evictions, OLTP p99 unaffected |
+| Scenario | Result | Time |
+|----------|--------|------|
+| Kill mid-flush → WAL replay | 1,000 rows recovered, zero loss | 8.79 s |
+| Kill mid-compaction → old blocks intact | 4,000 keys readable | 0.02 s |
+| Corrupt WAL record → replay stops at corruption | Partial recovery, no corrupt data returned | 1.81 s |
+| Disk full → clean checkpoint, writes blocked | Reserve file freed, reads continue | 0.01 s |
+| Kill sidecar → backlog preserved, no data loss | 50 requests queued, drained on recovery | 0.00 s |
+| 100 concurrent writers | 100K writes, 0 duplicates, 0 missing | 0.13 s |
+| OLAP scan during OLTP | 0 HotSet evictions, OLTP p99 unaffected | 0.15 s |
+| **Total** | **7 passed / 0 failed** | **10.91 s** |
 
 ---
 
