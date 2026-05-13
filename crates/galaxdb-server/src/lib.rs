@@ -25,6 +25,16 @@ pub struct ServerConfig {
     pub data_dir: String,
     /// Maximum concurrent client connections.
     pub max_connections: usize,
+    /// Optional path to the `galaxdb-sidecar` binary. When set the
+    /// server opens the database in sidecar mode so embedding columns
+    /// are populated by the real model. When absent the database opens
+    /// without a sidecar — scalar SQL works, semantic search returns
+    /// `SidecarUnavailable`.
+    pub sidecar_binary: Option<String>,
+    /// HuggingFace model id for the sidecar (e.g.
+    /// `"sentence-transformers/all-MiniLM-L6-v2"`). Required when
+    /// `sidecar_binary` is set; ignored otherwise.
+    pub model_id: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -33,6 +43,8 @@ impl Default for ServerConfig {
             bind_addr: "0.0.0.0:5433".to_string(),
             data_dir: String::new(),
             max_connections: 1000,
+            sidecar_binary: None,
+            model_id: None,
         }
     }
 }
@@ -56,7 +68,22 @@ pub async fn start(
     );
 
     let db = Arc::new(RwLock::new(
-        Database::open(&config.data_dir).expect("failed to open database"),
+        // Task 40.1: spawn sidecar when configured. The sidecar binary
+        // and model id are optional — scalar SQL works without them.
+        if let (Some(sidecar_bin), Some(model)) = (
+            config.sidecar_binary.as_deref(),
+            config.model_id.as_deref(),
+        ) {
+            tracing::info!(
+                sidecar = %sidecar_bin,
+                model = %model,
+                "opening database with embedding sidecar"
+            );
+            Database::open_with_sidecar(&config.data_dir, sidecar_bin, model)
+                .expect("failed to open database with sidecar")
+        } else {
+            Database::open(&config.data_dir).expect("failed to open database")
+        },
     ));
     let active = Arc::new(AtomicUsize::new(0));
     let max_connections = config.max_connections;

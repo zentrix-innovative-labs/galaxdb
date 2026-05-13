@@ -19,7 +19,7 @@ galaxdb-common.workspace = true
 galaxdb-embedded.workspace = true
 galaxdb-observe.workspace = true
 galaxdb-wire.workspace = true
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }

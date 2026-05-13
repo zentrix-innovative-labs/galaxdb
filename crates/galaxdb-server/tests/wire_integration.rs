@@ -20,6 +20,8 @@ async fn start_server() -> (String, tempfile::TempDir) {
         bind_addr: "127.0.0.1:0".to_string(),
         data_dir: data_dir.path().to_string_lossy().to_string(),
         max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
     };
 
     let (addr, _handle) = start(cfg).await.expect("server failed to bind");
@@ -284,4 +286,50 @@ async fn wire_server_accepts_sql_commenter_traceparent() {
         })
         .collect();
     assert_eq!(rows.len(), 1);
+}
+
+/// Task 40.4 / 40.5: verify the release binary exists and is under the
+/// 70 MB "core" size limit. This test is skipped when the release binary
+/// hasn't been built yet (e.g. in a dev `cargo test` run). It passes
+/// automatically in CI where `cargo build --release` runs first.
+///
+/// The 70 MB limit is the spec's "core binary" gate — the full binary
+/// including the sidecar + model is a separate 350 MB gate that requires
+/// the sidecar to be built and the model to be downloaded.
+#[test]
+fn release_binary_size_under_70mb_when_built() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
+    let binary = workspace_root.join("target/release/galaxdb-server");
+
+    if !binary.exists() {
+        // Not built yet — skip rather than fail. CI always builds first.
+        eprintln!(
+            "SKIP: release binary not found at {}; run `cargo build --release -p galaxdb-server` first",
+            binary.display()
+        );
+        return;
+    }
+
+    let size_bytes = std::fs::metadata(&binary)
+        .expect("stat release binary")
+        .len();
+    let size_mb = size_bytes as f64 / (1024.0 * 1024.0);
+
+    println!(
+        "galaxdb-server release binary: {:.1} MB ({} bytes)",
+        size_mb, size_bytes
+    );
+
+    const CORE_LIMIT_MB: f64 = 70.0;
+    assert!(
+        size_mb < CORE_LIMIT_MB,
+        "galaxdb-server release binary is {:.1} MB, exceeds the {:.0} MB core limit. \
+         Check for accidental large static data or debug symbols leaking into the release build.",
+        size_mb,
+        CORE_LIMIT_MB
+    );
 }
