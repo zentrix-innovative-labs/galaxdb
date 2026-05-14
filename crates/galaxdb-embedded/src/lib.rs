@@ -574,6 +574,23 @@ impl Database {
 
     fn exec_select(&mut self, q: &sqlparser::ast::Query) -> GalaxResult<QueryResult> {
         let table = extract_table(q);
+
+        // Detect SEMANTIC_MATCH(...) in the WHERE clause and route to
+        // the vector search path instead of a full scan.
+        if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
+            let (_columns, extra_filter) = extract_projection_and_filter_no_semantic(q);
+            let plan = planner::plan_semantic_search(
+                table.clone(),
+                semantic_expr,
+                extra_filter,
+                None,
+            );
+            let mut ctx = self.context();
+            let res = execute_with_context(&plan, &mut ctx)?;
+            self.catalog = std::mem::take(&mut ctx.catalog);
+            return Ok(query_result_from(res));
+        }
+
         let (columns, filter) = extract_projection_and_filter(q);
         let plan = QueryPlan::FullScan {
             table: table.clone(),
@@ -1477,6 +1494,147 @@ fn extract_projection_and_filter(
     let filter = s.selection.as_ref().and_then(filter_from_expr);
 
     (columns, filter)
+}
+
+/// Extract a `SemanticMatchExpr` from a SELECT's WHERE clause if it
+/// contains a `SEMANTIC_MATCH(col, 'query', threshold)` call.
+/// Returns `None` if no SEMANTIC_MATCH is present.
+fn extract_semantic_match_from_query(
+    q: &sqlparser::ast::Query,
+) -> Option<galaxdb_sql::ast::SemanticMatchExpr> {
+    let sqlparser::ast::SetExpr::Select(s) = q.body.as_ref() else {
+        return None;
+    };
+    let selection = s.selection.as_ref()?;
+    extract_semantic_match_from_expr(selection)
+}
+
+/// Recursively walk a WHERE expression looking for a SEMANTIC_MATCH call.
+fn extract_semantic_match_from_expr(
+    expr: &sqlparser::ast::Expr,
+) -> Option<galaxdb_sql::ast::SemanticMatchExpr> {
+    use sqlparser::ast::{BinaryOperator, Expr, FunctionArguments};
+    match expr {
+        Expr::Function(f) => {
+            let name = f.name.to_string().to_uppercase();
+            if name != "SEMANTIC_MATCH" {
+                return None;
+            }
+            // Extract args: (column, 'query_text', threshold)
+            let FunctionArguments::List(arg_list) = &f.args else {
+                return None;
+            };
+            let args: Vec<&sqlparser::ast::Expr> = arg_list
+                .args
+                .iter()
+                .filter_map(|a| match a {
+                    sqlparser::ast::FunctionArg::Unnamed(
+                        sqlparser::ast::FunctionArgExpr::Expr(e),
+                    ) => Some(e),
+                    _ => None,
+                })
+                .collect();
+            if args.len() != 3 {
+                return None;
+            }
+            let column = match args[0] {
+                Expr::Identifier(id) => id.value.clone(),
+                Expr::CompoundIdentifier(parts) => {
+                    parts.last().map(|p| p.value.clone()).unwrap_or_default()
+                }
+                _ => return None,
+            };
+            let query = match args[1] {
+                Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => s.clone(),
+                _ => return None,
+            };
+            let threshold: f64 = match args[2] {
+                Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
+                    n.parse().ok()?
+                }
+                _ => return None,
+            };
+            Some(galaxdb_sql::ast::SemanticMatchExpr {
+                column,
+                query,
+                threshold,
+            })
+        }
+        Expr::BinaryOp {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => extract_semantic_match_from_expr(left)
+            .or_else(|| extract_semantic_match_from_expr(right)),
+        _ => None,
+    }
+}
+
+/// Like `extract_projection_and_filter` but strips any SEMANTIC_MATCH
+/// call from the WHERE clause, returning only the non-semantic filter
+/// (for hybrid search).
+fn extract_projection_and_filter_no_semantic(
+    q: &sqlparser::ast::Query,
+) -> (Vec<String>, Option<FilterExpr>) {
+    let sqlparser::ast::SetExpr::Select(s) = q.body.as_ref() else {
+        return (vec![], None);
+    };
+    let mut columns = Vec::new();
+    let mut projection_is_star = false;
+    for item in &s.projection {
+        match item {
+            sqlparser::ast::SelectItem::Wildcard(_)
+            | sqlparser::ast::SelectItem::QualifiedWildcard(..) => {
+                projection_is_star = true;
+                break;
+            }
+            sqlparser::ast::SelectItem::UnnamedExpr(expr)
+            | sqlparser::ast::SelectItem::ExprWithAlias { expr, .. } => {
+                if let Some(name) = column_name_from_expr(expr) {
+                    columns.push(name);
+                } else {
+                    projection_is_star = true;
+                    break;
+                }
+            }
+        }
+    }
+    let columns = if projection_is_star { Vec::new() } else { columns };
+    // Strip SEMANTIC_MATCH from the filter — only keep non-semantic predicates
+    let filter = s
+        .selection
+        .as_ref()
+        .and_then(|e| filter_from_expr_no_semantic(e));
+    (columns, filter)
+}
+
+/// Like `filter_from_expr` but returns `None` for SEMANTIC_MATCH calls
+/// (they are handled separately by the vector backend).
+fn filter_from_expr_no_semantic(expr: &sqlparser::ast::Expr) -> Option<FilterExpr> {
+    use sqlparser::ast::Expr;
+    // Skip SEMANTIC_MATCH function calls
+    if let Expr::Function(f) = expr {
+        if f.name.to_string().to_uppercase() == "SEMANTIC_MATCH" {
+            return None;
+        }
+    }
+    // For AND, strip the SEMANTIC_MATCH side and keep the other
+    if let Expr::BinaryOp {
+        left,
+        op: sqlparser::ast::BinaryOperator::And,
+        right,
+    } = expr
+    {
+        let l = filter_from_expr_no_semantic(left);
+        let r = filter_from_expr_no_semantic(right);
+        return match (l, r) {
+            (Some(a), Some(b)) => Some(FilterExpr::And(Box::new(a), Box::new(b))),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        };
+    }
+    filter_from_expr(expr)
 }
 
 /// If the SQL is a `SELECT` with an `AT VERSION ...` suffix, return
