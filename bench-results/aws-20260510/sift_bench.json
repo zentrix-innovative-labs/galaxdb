@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "commit_sha": "8567691d4f7859742c1e6cb54ba8c429ae36d297",
+  "timestamp_utc": "2026-05-10T21:51:55Z",
+  "instance": {
+    "type": "c6id.4xlarge"
+  },
+  "cpu": {
+    "model": "Intel(R) Xeon(R) Platinum 8375C CPU @ 2.90GHz",
+    "cores": 16,
+    "arch": "x86_64"
+  },
+  "ram_gb": 30,
+  "dataset": {
+    "name": "SIFT1M",
+    "size": 1000000,
+    "dim": 128,
+    "sha256": "92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a",
+    "source_url": "ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz"
+  },
+  "hnsw_config": {
+    "m": 16,
+    "ef_construction": 200
+  },
+  "build": {
+    "build_time_ms": 66163,
+    "build_rate_vec_per_sec": 15113.959664171472
+  },
+  "search": {
+    "k": 10,
+    "num_queries_evaluated": 10000,
+    "ef_search_sweep": [
+      {
+        "ef": 10,
+        "recall_at_k": 0.762059999999986,
+        "mean_latency_us": 57.5528,
+        "p99_latency_us": 101
+      },
+      {
+        "ef": 50,
+        "recall_at_k": 0.9586099999999673,
+        "mean_latency_us": 158.0856,
+        "p99_latency_us": 228
+      },
+      {
+        "ef": 100,
+        "recall_at_k": 0.9830999999999772,
+        "mean_latency_us": 266.4626,
+        "p99_latency_us": 364
+      },
+      {
+        "ef": 200,
+        "recall_at_k": 0.9901899999999844,
+        "mean_latency_us": 459.4348,
+        "p99_latency_us": 616
+      }
+    ]
+  }
+}
