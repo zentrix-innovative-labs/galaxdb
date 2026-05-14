@@ -169,8 +169,18 @@ Requires Python 3.9+. Pre-built wheels for Linux x86-64/ARM64, macOS Intel/Apple
 
 ### Binary (server mode)
 
-Download from [GitHub Releases](https://github.com/zentrix-innovative-labs/galaxdb/releases):
+**macOS (Homebrew):**
+```bash
+brew tap zentrix-innovative-labs/tap
+brew install galaxdb
+```
 
+**Linux / macOS (direct install):**
+```bash
+curl -fsSL https://raw.githubusercontent.com/zentrix-innovative-labs/galaxdb/main/install.sh | bash
+```
+
+**Download from [GitHub Releases](https://github.com/zentrix-innovative-labs/galaxdb/releases):**
 ```bash
 # Linux x86-64
 curl -L https://github.com/zentrix-innovative-labs/galaxdb/releases/latest/download/galaxdb-server-linux-x86_64 \
