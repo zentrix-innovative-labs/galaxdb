@@ -152,19 +152,24 @@ Measured on AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM, 88
 
 ## How It Compares
 
-| | GalaxDB | PostgreSQL + pgvector | Pinecone | Qdrant | LanceDB | ChromaDB |
-|---|---|---|---|---|---|---|
-| SQL queries | ✅ | ✅ | ❌ | ❌ | Partial | ❌ |
-| Vector search | ✅ recall=0.990 | ⚠️ lower recall | ✅ | ✅ | ✅ | ✅ |
-| Local embeddings | ✅ no API cost | ❌ | ❌ | ❌ | ✅ | ✅ |
-| Time-travel | ✅ `AT VERSION` | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Training export | ✅ Lance format | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Near-dedup | ✅ MinHash LSH | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Embedded mode | ✅ | ❌ | ❌ | ⚠️ | ✅ | ✅ |
-| PostgreSQL wire | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Self-hosted | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
+| | GalaxDB | PostgreSQL + pgvector | Pinecone | Qdrant | Weaviate | LanceDB | ChromaDB | Milvus | DuckDB |
+|---|---|---|---|---|---|---|---|---|---|
+| SQL queries | ✅ Full | ✅ Full | ❌ | ❌ | Partial | Partial¹ | ❌ | ❌ | ✅ Full |
+| Vector search | ✅ recall=0.990 | ⚠️ ~0.95 | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ❌ |
+| Local embeddings | ✅ no API cost | ❌ | ❌ | ⚠️ FastEmbed | ✅ modules | ✅ | ✅ | ❌ | ❌ |
+| Time-travel | ✅ `AT VERSION` | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Training export | ✅ Lance format | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Near-dedup | ✅ MinHash LSH | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Embedded mode | ✅ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ❌ | ✅ |
+| PostgreSQL wire | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Self-hosted | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Encryption at rest | ✅ AES-256-GCM | ✅ OS-level | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
+| MVCC / snapshots | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Single binary | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ |
 
-→ [Full comparison with Milvus, Weaviate, DuckDB, and more](docs/COMPARISON.md)
+¹ LanceDB OSS uses a Python/Arrow API; SQL is available via DuckDB bridge or Enterprise tier only.
+
+→ [Full comparison with benchmarks, pricing, and use-case guidance](docs/COMPARISON.md)
 
 ---
 
