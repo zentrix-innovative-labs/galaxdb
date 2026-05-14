@@ -1,34 +1,34 @@
 <div align="center">
   <img src="assets/GalaxDB-avatar.svg" alt="GalaxDB" width="120" />
   <h1>GalaxDB</h1>
-  <p><strong>The AI-native database. One system for structured data, vector search, and training exports.</strong></p>
+  <p><strong>The AI-native database. SQL + vector search + training exports in one system.</strong></p>
 
   [![CI](https://github.com/zentrix-innovative-labs/galaxdb/actions/workflows/ci.yml/badge.svg)](https://github.com/zentrix-innovative-labs/galaxdb/actions/workflows/ci.yml)
   [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
-  [![Python](https://img.shields.io/pypi/pyversions/galaxdb)](https://pypi.org/project/galaxdb)
+  [![Docker](https://img.shields.io/badge/docker-harbi256%2Fgalaxdb-blue)](https://hub.docker.com/r/harbi256/galaxdb)
 </div>
 
 ---
 
 ## What is GalaxDB?
 
-GalaxDB replaces the 5-service stack that most AI applications bolt together today:
+Most AI applications bolt together 3–5 separate services: a relational database, a vector database, an embedding API, an object store, and a data pipeline. GalaxDB replaces all of them with a single binary that speaks PostgreSQL wire protocol.
 
-| What you have today | GalaxDB |
-|---|---|
-| PostgreSQL + pgvector | ✅ SQL engine + HNSW vector index |
-| Pinecone / Weaviate | ✅ `SEMANTIC_MATCH` in SQL, no separate service |
-| OpenAI embeddings API | ✅ Local model via built-in sidecar, no API cost |
-| S3 + Airflow pipeline | ✅ `CREATE VERSION TAG FOR TRAINING` → Lance dataset |
-| Redis cache | ✅ NUMA-aware buffer pool inside the engine |
+```
+Before GalaxDB:
+  PostgreSQL + pgvector + Pinecone + OpenAI API + S3 + Airflow
 
-One connection string. One backup. One monitoring endpoint. PostgreSQL wire protocol — your existing `psycopg2`, `SQLAlchemy`, and `pg` code works unchanged.
+After GalaxDB:
+  galaxdb-server
+```
+
+One connection string. One backup. One monitoring endpoint. Your existing `psycopg2`, `SQLAlchemy`, and `pg` code works unchanged.
 
 ---
 
-## Quick start
+## Quick Start
 
-### Embedded mode (no server, like SQLite)
+### Python — embedded mode (no server, like SQLite)
 
 ```bash
 pip install galaxdb
@@ -39,6 +39,7 @@ import galaxdb
 
 db = galaxdb.Database("./mydata")
 
+# Create a table with an embedding column
 db.execute("""
     CREATE TABLE docs (
         id   INT PRIMARY KEY,
@@ -46,24 +47,36 @@ db.execute("""
     )
 """)
 
+# Insert — embeddings computed automatically by the local sidecar
 db.execute("INSERT INTO docs (id, text) VALUES (1, 'machine learning is great')")
 db.execute("INSERT INTO docs (id, text) VALUES (2, 'rust programming language')")
+db.execute("INSERT INTO docs (id, text) VALUES (3, 'deep neural networks')")
 
-# Semantic search — no separate vector DB, no API call
+# Semantic search — no external API, no separate vector DB
 results = db.execute(
-    "SELECT id, text FROM docs WHERE SEMANTIC_MATCH(text, 'neural networks', 0.7)"
+    "SELECT id, text FROM docs WHERE SEMANTIC_MATCH(text, 'AI and neural nets', 0.7)"
 )
 
-# Export a training dataset — one SQL command
+# Export a training dataset — one SQL command, Lance format, PyTorch-ready
 db.execute("CREATE VERSION TAG 'v1' FOR TRAINING WITH TRAINING PRECISION 'float32'")
-path = db.training_dataset("v1")          # → Lance format, ready for PyTorch
+path = db.training_dataset("v1")
+
+import lance
+dataset = lance.dataset(path).to_pytorch()  # zero-copy, memory-mapped
 ```
 
-### Server mode (multi-client, like PostgreSQL)
+### Server mode — multi-client, like PostgreSQL
 
 ```bash
-# Download the binary for your platform from GitHub Releases, then:
-./galaxdb-server --data-dir /data --port 5433
+# macOS
+brew tap zentrix-innovative-labs/tap && brew install galaxdb
+
+# Linux / macOS (direct install)
+curl -fsSL https://raw.githubusercontent.com/zentrix-innovative-labs/galaxdb/main/install.sh | bash
+
+# Docker
+docker run -p 5433:5433 -p 9090:9090 -v /data:/data \
+  harbi256/galaxdb:latest --data-dir /data
 ```
 
 ```python
@@ -77,7 +90,7 @@ Any PostgreSQL client works — `psycopg2`, `SQLAlchemy`, `tokio-postgres`, `pg`
 
 ---
 
-## AuroraSQL — SQL extensions for AI
+## AuroraSQL — SQL Extensions for AI
 
 GalaxDB extends standard SQL with AI-native primitives:
 
@@ -88,13 +101,13 @@ FROM articles
 WHERE SEMANTIC_MATCH(title, 'climate change policy', 0.75)
   AND published_at > '2024-01-01';
 
--- Time-travel query
+-- Time-travel query — reproduce exactly what data existed at a point in time
 SELECT * FROM docs AT VERSION 'training-v1';
 
--- Near-duplicate deduplication
+-- Near-duplicate deduplication — cut training set size by 15–30%
 SELECT * FROM docs WHERE NOT DUPLICATE;
 
--- Training export
+-- Create a versioned training snapshot
 CREATE VERSION TAG 'train-v2'
   FOR TRAINING
   WITH TRAINING PRECISION 'sq8'
@@ -104,27 +117,54 @@ CREATE VERSION TAG 'train-v2'
 BULK INSERT INTO docs (id, text) VALUES
   (1, 'first document'),
   (2, 'second document');
+
+-- Backup and restore
+BACKUP TO '/path/to/backup';
+RESTORE FROM '/path/to/backup';
 ```
 
 ---
 
-## How it compares
+## Performance
 
-| Feature | GalaxDB | PostgreSQL + pgvector | Pinecone | Weaviate |
-|---|---|---|---|---|
-| SQL queries | ✅ Full AuroraSQL | ✅ Standard SQL | ❌ | Partial |
-| Vector search | ✅ HNSW built-in | ⚠️ pgvector (slow) | ✅ | ✅ |
-| Embeddings | ✅ Local model | ❌ External API | ❌ External API | ✅ |
-| Time-travel | ✅ `AT VERSION` | ❌ | ❌ | ❌ |
-| Training export | ✅ Lance format | ❌ | ❌ | ❌ |
-| Near-dedup | ✅ MinHash LSH | ❌ | ❌ | ❌ |
-| Wire protocol | PostgreSQL | PostgreSQL | REST | REST/gRPC |
-| Embedded mode | ✅ (like SQLite) | ❌ | ❌ | ❌ |
-| Self-hosted | ✅ | ✅ | ❌ | ✅ |
+Measured on AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM, 884 GB NVMe), release build.
 
-**HNSW recall@10 on SIFT-1M:** 0.990 at ef=200, p99 616 µs  
-**740 Rust tests passing, 7 chaos scenarios in 10.9 s** — confirmed on AWS c6id.4xlarge release build.  
-*(see [BENCHMARKS.md](docs/BENCHMARKS.md) for full numbers)*
+### HNSW Vector Search — SIFT-1M
+
+| ef_search | recall@10 | mean latency | p99 latency |
+|-----------|-----------|--------------|-------------|
+| 50        | 0.959     | 158 µs       | 228 µs      |
+| 100       | 0.983     | 267 µs       | 364 µs      |
+| **200**   | **0.990** | **459 µs**   | **616 µs**  |
+
+### Storage Engine
+
+| Metric | GalaxDB | PostgreSQL 16 | RocksDB |
+|--------|---------|---------------|---------|
+| Write TPS | **258,555** | ~3,200 | ~80,000 |
+| Read p50 | **3 µs** | ~95 µs | ~180 µs |
+| Read p99 | **47 µs** | ~300 µs | ~500 µs |
+| Scan throughput | **4.49 GB/s** | ~0.9 GB/s | — |
+
+**740 Rust tests passing. 7 chaos scenarios in 10.9 s.** See [BENCHMARKS.md](docs/BENCHMARKS.md).
+
+---
+
+## How It Compares
+
+| | GalaxDB | PostgreSQL + pgvector | Pinecone | Qdrant | LanceDB | ChromaDB |
+|---|---|---|---|---|---|---|
+| SQL queries | ✅ | ✅ | ❌ | ❌ | Partial | ❌ |
+| Vector search | ✅ recall=0.990 | ⚠️ lower recall | ✅ | ✅ | ✅ | ✅ |
+| Local embeddings | ✅ no API cost | ❌ | ❌ | ❌ | ✅ | ✅ |
+| Time-travel | ✅ `AT VERSION` | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Training export | ✅ Lance format | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Near-dedup | ✅ MinHash LSH | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Embedded mode | ✅ | ❌ | ❌ | ⚠️ | ✅ | ✅ |
+| PostgreSQL wire | ✅ | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Self-hosted | ✅ | ✅ | ❌ | ✅ | ✅ | ✅ |
+
+→ [Full comparison with Milvus, Weaviate, DuckDB, and more](docs/COMPARISON.md)
 
 ---
 
@@ -147,13 +187,26 @@ Your application
 │  ┌──────────────────┐   HTTP :9090                  │
 │  │ galaxdb-sidecar  │   /health  /metrics           │
 │  │ (child process)  │                               │
-│  │ ONNX model       │                               │
-│  │ Unix socket      │                               │
+│  │ ONNX/Candle model│                               │
 │  └──────────────────┘                               │
 └─────────────────────────────────────────────────────┘
 ```
 
-The sidecar is spawned automatically by the server — you don't manage it separately.
+The sidecar is spawned automatically — you don't manage it separately.
+
+---
+
+## Use Cases
+
+**RAG applications** — store documents, compute embeddings locally, query with `SEMANTIC_MATCH` filtered by metadata. No Pinecone, no OpenAI embeddings API.
+
+**ML training pipelines** — `CREATE VERSION TAG ... FOR TRAINING` snapshots your data and exports it as a Lance dataset. Load directly into PyTorch with zero-copy memory mapping.
+
+**Hybrid search** — combine SQL filters with vector similarity in a single query. No application-side join between two systems.
+
+**Audit-safe AI** — `AT VERSION` queries let you reproduce exactly what data a model was trained on. EU AI Act compliance built in.
+
+**Time-series + semantic** — store sensor readings with text descriptions, query by time range AND semantic similarity in one SQL statement.
 
 ---
 
@@ -165,28 +218,19 @@ The sidecar is spawned automatically by the server — you don't manage it separ
 pip install galaxdb
 ```
 
-Requires Python 3.9+. Pre-built wheels for Linux x86-64/ARM64, macOS Intel/Apple Silicon, Windows x86-64.
+Requires Python 3.9+. Pre-built wheels for Linux x86-64, macOS Intel/Apple Silicon.
 
-### Binary (server mode)
+### macOS (Homebrew)
 
-**macOS (Homebrew):**
 ```bash
 brew tap zentrix-innovative-labs/tap
 brew install galaxdb
 ```
 
-**Linux / macOS (direct install):**
+### Linux / macOS (direct install)
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zentrix-innovative-labs/galaxdb/main/install.sh | bash
-```
-
-**Download from [GitHub Releases](https://github.com/zentrix-innovative-labs/galaxdb/releases):**
-```bash
-# Linux x86-64
-curl -L https://github.com/zentrix-innovative-labs/galaxdb/releases/latest/download/galaxdb-server-linux-x86_64 \
-  -o galaxdb-server && chmod +x galaxdb-server
-
-./galaxdb-server --data-dir /data --port 5433
 ```
 
 ### Docker
@@ -195,6 +239,10 @@ curl -L https://github.com/zentrix-innovative-labs/galaxdb/releases/latest/downl
 docker run -p 5433:5433 -p 9090:9090 -v /data:/data \
   harbi256/galaxdb:latest --data-dir /data
 ```
+
+### GitHub Releases
+
+Download pre-built binaries for Linux x86-64 and macOS x86-64 from the [Releases page](https://github.com/zentrix-innovative-labs/galaxdb/releases).
 
 ### Rust (embed in your application)
 
@@ -205,34 +253,42 @@ galaxdb-embedded = "1.0.0-beta"
 
 ---
 
-## Use cases
-
-**RAG applications** — store documents, compute embeddings locally, query with `SEMANTIC_MATCH` filtered by metadata. No Pinecone, no OpenAI embeddings API.
-
-**ML training pipelines** — `CREATE VERSION TAG ... FOR TRAINING` snapshots your data at a point in time and exports it as a Lance dataset. Load directly into PyTorch with zero-copy memory mapping.
-
-**Hybrid search** — combine SQL filters with vector similarity in a single query. No application-side join between two systems.
-
-**Audit-safe AI** — `AT VERSION` queries let you reproduce exactly what data a model was trained on. EU AI Act compliance built in.
-
----
-
 ## Observability
 
 Every server instance exposes:
 
-- `GET /health` — JSON status with subsystem health (disk, sidecar, connections)
-- `GET /metrics` — Prometheus text format with 12 gauges/counters
-
 ```bash
+# Health check — reflects real subsystem state
 curl http://localhost:9090/health
-# {"status":"ok","version":"1.0.0-beta","subsystems":{"disk_full":false,"sidecar_healthy":true,"connections_active":3}}
+# {"status":"ok","version":"1.0.0-beta.1","subsystems":{"disk_full":false,"sidecar_healthy":true,"connections_active":3}}
 
+# Prometheus metrics
 curl http://localhost:9090/metrics
 # galaxdb_connections_active 3
 # galaxdb_wal_write_latency_us 42
 # galaxdb_hnsw_recall_estimate_bp 9902
+# galaxdb_embedding_queue_depth 0
 # ...
+```
+
+---
+
+## Key Management
+
+GalaxDB supports pluggable encryption key management with no vendor lock-in:
+
+```bash
+# Local key file
+GALAXDB_KEY_PROVIDER=local:/path/to/key.bin galaxdb-server ...
+
+# Environment variable
+GALAXDB_KEY_PROVIDER=env:GALAXDB_MASTER_KEY galaxdb-server ...
+
+# Any KMS via shell command (AWS CLI, gcloud, az, vault, custom HSM)
+GALAXDB_KEY_PROVIDER=command:aws kms decrypt ... galaxdb-server ...
+
+# HashiCorp Vault Transit
+GALAXDB_KEY_PROVIDER=vault:transit/galaxdb-prod galaxdb-server ...
 ```
 
 ---
@@ -242,12 +298,13 @@ curl http://localhost:9090/metrics
 - [SQL Reference](docs/sql-reference.md) — full AuroraSQL syntax
 - [Storage Engine](docs/STORAGE_ENGINE.md) — LSM tree, WAL, PAX blocks, HNSW
 - [Benchmarks](docs/BENCHMARKS.md) — SIFT-1M recall, write throughput, latency
+- [Database Comparison](docs/COMPARISON.md) — GalaxDB vs PostgreSQL, Pinecone, Qdrant, LanceDB, ChromaDB, Milvus, DuckDB, Weaviate
 
 ---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). The short version: open an issue first for large changes, all PRs must pass the full test suite and three CI gates.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Open an issue first for large changes. All PRs must pass the full test suite and three CI gates (no mocks, no vendor SDKs, task tracker).
 
 ---
 
