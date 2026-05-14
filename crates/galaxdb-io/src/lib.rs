@@ -38,7 +38,18 @@ pub fn select_scheduler() -> GalaxResult<Box<dyn IoScheduler>> {
     match backend {
         IoBackend::Tokio => Ok(Box::new(TokioScheduler::new())),
         #[cfg(target_os = "linux")]
-        IoBackend::IoUring => Ok(Box::new(IoUringScheduler::new()?)),
+        IoBackend::IoUring => {
+            match IoUringScheduler::new() {
+                Ok(s) => Ok(Box::new(s)),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "io_uring unavailable (container/VM restriction?), falling back to tokio"
+                    );
+                    Ok(Box::new(TokioScheduler::new()))
+                }
+            }
+        }
         #[cfg(not(target_os = "linux"))]
         IoBackend::IoUring => {
             tracing::warn!("io_uring requested but not available on this platform, falling back to tokio");

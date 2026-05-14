@@ -1,14 +1,28 @@
-FROM debian:bookworm-slim
+FROM ubuntu:24.04 AS builder
 
-# Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    libssl3 \
+    curl ca-certificates build-essential pkg-config libssl-dev \
+    protobuf-compiler libprotobuf-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the pre-built Linux binary
-COPY release-binaries/linux-x86_64/galaxdb-server /usr/local/bin/galaxdb-server
-COPY release-binaries/linux-x86_64/galaxdb-sidecar /usr/local/bin/galaxdb-sidecar
+# Install Rust
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+WORKDIR /build
+COPY . .
+
+RUN RUSTFLAGS="-C target-cpu=x86-64" cargo build --release -p galaxdb-server -p galaxdb-sidecar
+
+# ── Runtime image ──────────────────────────────────────────────────
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /build/target/release/galaxdb-server /usr/local/bin/galaxdb-server
+COPY --from=builder /build/target/release/galaxdb-sidecar /usr/local/bin/galaxdb-sidecar
 RUN chmod +x /usr/local/bin/galaxdb-server /usr/local/bin/galaxdb-sidecar
 
 # Data directory
