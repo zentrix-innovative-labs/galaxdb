@@ -45,9 +45,11 @@ curl -fsSL "${BASE_URL}/galaxdb-server-${PLATFORM}" -o /tmp/galaxdb-server
 chmod +x /tmp/galaxdb-server
 
 # Install
+mkdir -p "$INSTALL_DIR" 2>/dev/null || true
 if [ -w "$INSTALL_DIR" ]; then
     mv /tmp/galaxdb-server "${INSTALL_DIR}/galaxdb-server"
 else
+    sudo mkdir -p "$INSTALL_DIR"
     sudo mv /tmp/galaxdb-server "${INSTALL_DIR}/galaxdb-server"
 fi
 
