@@ -183,7 +183,7 @@ curl -L https://github.com/zentrix-innovative-labs/galaxdb/releases/latest/downl
 
 ```bash
 docker run -p 5433:5433 -p 9090:9090 -v /data:/data \
-  zentrix/galaxdb:latest --data-dir /data
+  harbi256/galaxdb:latest --data-dir /data
 ```
 
 ### Rust (embed in your application)
