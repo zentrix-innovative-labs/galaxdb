@@ -53,5 +53,5 @@ docs/getting-started.md
 docs/storage-engine.md
 docs/vector-search.md
 
-# Bench results — raw data, not for public repo
-bench-results/
+# Release binaries (uploaded to GitHub Releases, not committed to git)
+release-binaries/
