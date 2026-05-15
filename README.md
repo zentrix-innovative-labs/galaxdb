@@ -300,6 +300,7 @@ GALAXDB_KEY_PROVIDER=vault:transit/galaxdb-prod galaxdb-server ...
 
 ## Documentation
 
+- [Getting Started](docs/GETTING_STARTED.md) — installation, all features, Docker Compose, troubleshooting
 - [SQL Reference](docs/sql-reference.md) — full AuroraSQL syntax
 - [Storage Engine](docs/STORAGE_ENGINE.md) — LSM tree, WAL, PAX blocks, HNSW
 - [Benchmarks](docs/BENCHMARKS.md) — SIFT-1M recall, write throughput, latency
