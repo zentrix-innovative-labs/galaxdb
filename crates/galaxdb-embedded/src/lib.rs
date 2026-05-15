@@ -273,17 +273,27 @@ impl Database {
     }
 
     fn select_readonly(&self, q: &sqlparser::ast::Query) -> GalaxResult<QueryResult> {
-        // Route through the canonical executor so WHERE clauses and
-        // projections are honoured. Before Phase I this did a raw
-        // prefix scan over `engine.scan_all()` and dropped the filter,
-        // which silently returned every row for any `SELECT ... WHERE`
-        // the wire server received.
-        //
-        // `execute_with_context` takes `&mut ExecutorContext`, but this
-        // method is `&self` (multiple concurrent readers). We build a
-        // throwaway context that clones the catalog; the executor
-        // never mutates the catalog on read paths, so the clone we
-        // take here is discarded at the end.
+        // Detect SEMANTIC_MATCH in WHERE and route to vector search.
+        if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
+            let table = extract_table(q);
+            let (_columns, extra_filter) = extract_projection_and_filter_no_semantic(q);
+            let plan = planner::plan_semantic_search(
+                table.clone(),
+                semantic_expr,
+                extra_filter,
+                None,
+            );
+            let mut ctx = ExecutorContext::new(self.engine.clone());
+            ctx.catalog = self.catalog.clone();
+            ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
+                sidecar: self.sidecar.clone(),
+                indexes: self.vector_indexes.clone(),
+                engine: self.engine.clone(),
+            }));
+            let res = execute_with_context(&plan, &mut ctx)?;
+            return Ok(query_result_from(res));
+        }
+
         let (columns, filter) = extract_projection_and_filter(q);
         let table = extract_table(q);
         if table != "unknown" && !self.catalog.table_exists(&table) {
