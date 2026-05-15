@@ -556,13 +556,24 @@ impl Database {
         };
 
         let row_id = {
-            let mut indexes = self.vector_indexes.write().unwrap();
-            let Some(mut_idx) = indexes.get_mut(table) else {
-                return;
-            };
-            let row_id = mut_idx.next_row_id;
-            mut_idx.next_row_id += 1;
-            row_id
+            // Use xxh3_64(storage_key) as the row_id so it matches
+            // what exec_semantic_search uses when joining results back
+            // to table rows. The sequential next_row_id counter was
+            // causing a mismatch — the executor joins by xxh3_64(key)
+            // but the delta buffer had sequential ids.
+            match &row_key {
+                Some(k) => xxhash_rust::xxh3::xxh3_64(k),
+                None => {
+                    // Fallback: sequential id when key isn't available.
+                    let mut indexes = self.vector_indexes.write().unwrap();
+                    let Some(mut_idx) = indexes.get_mut(table) else {
+                        return;
+                    };
+                    let id = mut_idx.next_row_id;
+                    mut_idx.next_row_id += 1;
+                    id
+                }
+            }
         };
 
         let request = EmbedRequest {

@@ -22,6 +22,7 @@ galaxdb-io = { path = "../galaxdb-io" }
 sqlparser.workspace = true
 tokio.workspace = true
 tracing = { workspace = true }
+xxhash-rust.workspace = true
 # Arrow schema construction for `Database::training_dataset` (task 22.4).
 # MUST match the version `galaxdb-versioning` uses (Lance 4.0.1 ↔ Arrow 57).
 # If these drift, `Arc<ArrowSchema>` from here becomes incompatible with
