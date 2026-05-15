@@ -1434,10 +1434,6 @@ fn exec_semantic_search(
     strategy: SearchStrategy,
     ctx: &mut ExecutorContext,
 ) -> GalaxResult<ExecuteResult> {
-    // Task 38.5: sidecar-call / HNSW-search span. The backend impl
-    // issues the sidecar embed + HNSW graph search under this span;
-    // a downstream OTel exporter sees the full path from query root
-    // through the vector backend.
     let _span = tracing::info_span!(
         "executor.semantic_search",
         table = %table,
@@ -1454,7 +1450,42 @@ fn exec_semantic_search(
         .ok_or(GalaxError::SidecarUnavailable)?;
 
     let results = backend.semantic_search(table, query_text, threshold, 10, strategy)?;
-    Ok(semantic_results_to_rows(&results))
+
+    // Join vector results back to actual table rows using the row_id
+    // (which is xxh3_64 of the primary key). Scan the table and match.
+    let table_entry = ctx.catalog.get_table(table).cloned()
+        .ok_or_else(|| GalaxError::TableNotFound(table.to_string()))?;
+    let col_names: Vec<String> = table_entry.columns.iter().map(|c| c.name.clone()).collect();
+
+    let prefix = format!("{}:", table);
+    let all_rows: Vec<(Vec<u8>, Vec<(String, Value)>)> = ctx.engine.scan_all()
+        .into_iter()
+        .filter(|(k, _)| String::from_utf8_lossy(k).starts_with(&prefix))
+        .map(|(k, v)| {
+            let cols = row_codec::decode_row(&v);
+            (k, cols)
+        })
+        .collect();
+
+    // Build a map from xxh3_64(key) → decoded row
+    let row_map: std::collections::HashMap<u64, Vec<(String, Value)>> = all_rows
+        .into_iter()
+        .map(|(k, cols)| (xxhash_rust::xxh3::xxh3_64(&k), cols))
+        .collect();
+
+    let rows: Vec<Row> = results
+        .iter()
+        .filter_map(|r| {
+            row_map.get(&r.row_id).map(|cols| Row {
+                columns: cols.clone(),
+            })
+        })
+        .collect();
+
+    Ok(ExecuteResult::Rows {
+        columns: col_names,
+        rows,
+    })
 }
 
 fn exec_hybrid_search(

@@ -868,13 +868,28 @@ fn context_semantic_search_returns_results() {
     ctx.catalog
         .create_table("docs".to_string(), embedding_entry())
         .unwrap();
+
+    // Insert real rows so the join-back can find them.
+    let key1 = b"docs:1".to_vec();
+    let key2 = b"docs:2".to_vec();
+    let row_id1 = xxhash_rust::xxh3::xxh3_64(&key1);
+    let row_id2 = xxhash_rust::xxh3::xxh3_64(&key2);
+    ctx.engine.put_sync(key1, crate::row_codec::encode_row(&[
+        ("id".to_string(), Value::Integer(1)),
+        ("content".to_string(), Value::Text("machine learning".to_string())),
+    ])).unwrap();
+    ctx.engine.put_sync(key2, crate::row_codec::encode_row(&[
+        ("id".to_string(), Value::Integer(2)),
+        ("content".to_string(), Value::Text("rust systems".to_string())),
+    ])).unwrap();
+
     ctx.vector_backend = Some(StubVectorBackend::with(vec![
         VectorSearchResult {
-            row_id: 42,
+            row_id: row_id1,
             similarity: 0.95,
         },
         VectorSearchResult {
-            row_id: 7,
+            row_id: row_id2,
             similarity: 0.88,
         },
     ]));
@@ -892,9 +907,10 @@ fn context_semantic_search_returns_results() {
     let result = execute_with_context(&plan, &mut ctx).unwrap();
     match result {
         ExecuteResult::Rows { columns, rows } => {
-            assert_eq!(columns, vec!["row_id", "similarity"]);
+            assert_eq!(columns, vec!["id", "content"]);
             assert_eq!(rows.len(), 2);
-            assert_eq!(rows[0].columns[0].1, Value::Integer(42));
+            // First result should be the highest-similarity row (id=1)
+            assert_eq!(rows[0].columns[0].1, Value::Integer(1));
         }
         other => panic!("{:?}", other),
     }
