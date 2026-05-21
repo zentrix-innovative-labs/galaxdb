@@ -47,9 +47,11 @@ jobs:
         if: runner.os == 'Windows'
         run: choco install protoc --yes
 
-      - name: Build wheel (Linux manylinux — runs on any Linux distro)
+      - name: Build wheel (Linux)
         if: runner.os == 'Linux'
-        run: maturin build --release --manylinux auto -m galaxdb-python/Cargo.toml
+        run: maturin build --release --manylinux off -m galaxdb-python/Cargo.toml
+        env:
+          PROTOC: /usr/bin/protoc
 
       - name: Build wheel (macOS / Windows)
         if: runner.os != 'Linux'
@@ -83,6 +85,8 @@ jobs:
 
       - name: Build sdist
         run: maturin sdist -m galaxdb-python/Cargo.toml
+        env:
+          PROTOC: /usr/bin/protoc
 
       - name: Upload sdist artifact
         uses: actions/upload-artifact@v4
