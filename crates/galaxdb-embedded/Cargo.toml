@@ -16,21 +16,15 @@ galaxdb-common.workspace = true
 galaxdb-sql = { path = "../galaxdb-sql" }
 galaxdb-storage = { path = "../galaxdb-storage" }
 galaxdb-vector = { path = "../galaxdb-vector" }
+galaxdb-sidecar = { path = "../galaxdb-sidecar" }
 galaxdb-versioning = { path = "../galaxdb-versioning" }
 galaxdb-io = { path = "../galaxdb-io" }
 sqlparser.workspace = true
 tokio.workspace = true
 tracing = { workspace = true }
 xxhash-rust.workspace = true
-# Arrow schema construction for `Database::training_dataset` (task 22.4).
 arrow = "57"
 lance = { version = "4.0", default-features = false }
-
-# Sidecar is Unix-only (uses Unix sockets + libc). On Windows the
-# embedded mode works without it; users connect to a remote server
-# for embedding features.
-[target.'cfg(unix)'.dependencies]
-galaxdb-sidecar = { path = "../galaxdb-sidecar" }
 
 [dev-dependencies]
 tempfile.workspace = true

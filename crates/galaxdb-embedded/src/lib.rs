@@ -26,45 +26,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use galaxdb_common::{GalaxError, GalaxResult};
-
-// Sidecar is Unix-only (Unix sockets). On Windows we provide stub types
-// so the rest of the code compiles; all sidecar calls return SidecarUnavailable.
-#[cfg(unix)]
 use galaxdb_sidecar::manager::{SidecarConfig, SidecarManager};
-#[cfg(unix)]
 use galaxdb_sidecar::protocol::EmbedRequest;
-
-#[cfg(not(unix))]
-mod sidecar_stub {
-    use galaxdb_common::{GalaxError, GalaxResult};
-    use std::path::PathBuf;
-
-    pub struct SidecarManager;
-    impl SidecarManager {
-        pub fn new(_cfg: SidecarConfig) -> Self { Self }
-        pub fn start(&self) -> GalaxResult<()> { Ok(()) }
-        pub fn embed(&self, _req: EmbedRequest) -> GalaxResult<EmbedResponse> {
-            Err(GalaxError::SidecarUnavailable)
-        }
-    }
-    pub struct SidecarConfig {
-        pub binary_path: PathBuf,
-        pub socket_path: PathBuf,
-        pub model_id: String,
-        pub data_dir: PathBuf,
-    }
-    pub struct EmbedRequest {
-        pub row_id: u64,
-        pub text: String,
-        pub column: String,
-    }
-    pub struct EmbedResponse {
-        pub embedding: Vec<f32>,
-        pub model_version: String,
-    }
-}
-#[cfg(not(unix))]
-use sidecar_stub::{EmbedRequest, SidecarConfig, SidecarManager};
 use galaxdb_sql::ast::{AuroraStatement, CreateTableStmt};
 use galaxdb_sql::executor::{
     execute_with_context, ExecuteResult, ExecutorContext, Row as SqlRow, VectorSearchBackend,

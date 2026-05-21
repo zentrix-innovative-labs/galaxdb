@@ -3,6 +3,12 @@
 //! Uses Candle (HuggingFace's pure Rust ML framework) for cross-platform inference.
 //! No external runtime needed — works on macOS and Linux.
 //!
+//! This binary is Unix-only (uses Unix sockets for IPC). On Windows, users
+//! run the server on Linux/macOS (Docker or WSL2) and connect via the wire protocol.
+
+// The sidecar binary is Unix-only. On Windows this compiles to an empty
+// binary that immediately exits — the real functionality requires Unix sockets.
+#![cfg(unix)]
 //! This binary:
 //! 1. Downloads and loads a sentence-transformer model from HuggingFace Hub
 //!    (`sentence-transformers/all-MiniLM-L6-v2` by default, any BERT-style
