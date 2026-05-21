@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "galaxdb"
+name = "galaxdb-client"
 version = "0.1.0"
 description = "GalaxDB — AI-native database Python client"
 readme = "README.md"

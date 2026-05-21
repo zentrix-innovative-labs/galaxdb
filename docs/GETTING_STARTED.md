@@ -60,7 +60,7 @@ The `-v ~/.cache/huggingface` mount caches the model (~90 MB) so it only downloa
 ### Option 4 — Python (embedded, no server)
 
 ```bash
-pip install galaxdb
+pip install galaxdb-client
 ```
 
 ```python

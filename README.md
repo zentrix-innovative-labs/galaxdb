@@ -31,7 +31,7 @@ One connection string. One backup. One monitoring endpoint. Your existing `psyco
 ### Python — embedded mode (no server, like SQLite)
 
 ```bash
-pip install galaxdb
+pip install galaxdb-client
 ```
 
 ```python
@@ -220,7 +220,7 @@ The sidecar is spawned automatically — you don't manage it separately.
 ### Python (embedded + remote)
 
 ```bash
-pip install galaxdb
+pip install galaxdb-client
 ```
 
 Requires Python 3.9+. Pre-built wheels for Linux x86-64, macOS Intel/Apple Silicon.
