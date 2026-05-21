@@ -14,10 +14,12 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64
-          - os: macos-13        # Intel
+          - os: macos-13        # Intel x86_64
             target: x86_64
-          - os: macos-14        # Apple Silicon
+          - os: macos-14        # Apple Silicon arm64
             target: aarch64
+          - os: windows-latest  # Windows x86_64
+            target: x86_64
 
     steps:
       - uses: actions/checkout@v4
@@ -41,12 +43,16 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      - name: Build wheel (Linux manylinux)
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc --yes
+
+      - name: Build wheel (Linux manylinux — runs on any Linux distro)
         if: runner.os == 'Linux'
         run: maturin build --release --manylinux 2_28 -m galaxdb-python/Cargo.toml
 
-      - name: Build wheel (macOS)
-        if: runner.os == 'macOS'
+      - name: Build wheel (macOS / Windows)
+        if: runner.os != 'Linux'
         run: maturin build --release -m galaxdb-python/Cargo.toml
 
       - name: Upload wheel artifact
@@ -55,15 +61,44 @@ jobs:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: target/wheels/*.whl
 
+  build-sdist:
+    # Source distribution — fallback for Linux aarch64, FreeBSD, or any
+    # platform without a pre-built wheel. pip will compile from source
+    # (requires Rust on the user's machine).
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Install protoc
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+
+      - name: Build sdist
+        run: maturin sdist -m galaxdb-python/Cargo.toml
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: target/wheels/*.tar.gz
+
   publish:
     name: Publish to PyPI
-    needs: build-wheels
+    needs: [build-wheels, build-sdist]
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/galaxdb/
+      url: https://pypi.org/project/galaxdb-client/
     permissions:
-      id-token: write  # required for trusted publishing
+      id-token: write  # required for trusted publishing (no token needed)
 
     steps:
       - name: Download all wheels
@@ -73,10 +108,16 @@ jobs:
           merge-multiple: true
           path: dist/
 
-      - name: List wheels
+      - name: Download sdist
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist/
+
+      - name: List distributions
         run: ls -lh dist/
 
-      - name: Publish to PyPI (Trusted Publisher)
+      - name: Publish to PyPI (Trusted Publisher — no token needed)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
