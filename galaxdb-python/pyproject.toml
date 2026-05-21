@@ -4,8 +4,8 @@ build-backend = "maturin"
 
 [project]
 name = "galaxdb-client"
-version = "0.1.0"
-description = "GalaxDB — AI-native database Python client"
+version = "0.1.1"
+description = "GalaxDB Python client -- SQL, vector search, and local embeddings in one database"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.9"
@@ -21,7 +21,15 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
 ]
+
+[project.urls]
+Homepage = "https://github.com/zentrix-innovative-labs/galaxdb"
+Documentation = "https://github.com/zentrix-innovative-labs/galaxdb/blob/main/docs/GETTING_STARTED.md"
+Repository = "https://github.com/zentrix-innovative-labs/galaxdb"
+"Bug Tracker" = "https://github.com/zentrix-innovative-labs/galaxdb/issues"
 
 [project.optional-dependencies]
 # Dependencies for running the integration test suite under

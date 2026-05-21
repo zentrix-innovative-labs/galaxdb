@@ -287,6 +287,6 @@ fn galaxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
     m.add_class::<Connection>()?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
-    m.add("__version__", "0.1.0")?;
+    m.add("__version__", "0.1.1")?;
     Ok(())
 }
