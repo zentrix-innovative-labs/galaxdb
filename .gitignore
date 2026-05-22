@@ -55,3 +55,10 @@ docs/vector-search.md
 
 # Release binaries (uploaded to GitHub Releases, not committed to git)
 release-binaries/
+
+# Local wheel upload staging dirs
+dist-upload/
+dist-upload-v011/
+
+# Local test data
+mydata/

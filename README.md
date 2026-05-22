@@ -6,6 +6,7 @@
   [![CI](https://github.com/zentrix-innovative-labs/galaxdb/actions/workflows/ci.yml/badge.svg)](https://github.com/zentrix-innovative-labs/galaxdb/actions/workflows/ci.yml)
   [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
   [![Docker](https://img.shields.io/badge/docker-harbi256%2Fgalaxdb-blue)](https://hub.docker.com/r/harbi256/galaxdb)
+  [![PyPI](https://img.shields.io/pypi/v/galaxdb-client.svg)](https://pypi.org/project/galaxdb-client/)
 </div>
 
 ---
@@ -223,7 +224,7 @@ The sidecar is spawned automatically — you don't manage it separately.
 pip install galaxdb-client
 ```
 
-Requires Python 3.9+. Pre-built wheels for Linux x86-64, macOS Intel/Apple Silicon.
+Requires Python 3.9+. Pre-built wheels for Linux x86-64, macOS Intel, macOS Apple Silicon, and Windows x86-64.
 
 ### macOS (Homebrew)
 
