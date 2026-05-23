@@ -62,3 +62,8 @@ dist-upload-v011/
 
 # Local test data
 mydata/
+
+# Generated paper artifacts and companion site/docs snapshots
+GalaxDB_arXiv_Paper.*
+galaxdb-docs/
+galaxdb-landing/

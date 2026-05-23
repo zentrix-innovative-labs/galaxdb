@@ -7,13 +7,14 @@
   [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
   [![Docker](https://img.shields.io/badge/docker-harbi256%2Fgalaxdb-blue)](https://hub.docker.com/r/harbi256/galaxdb)
   [![PyPI](https://img.shields.io/pypi/v/galaxdb-client.svg)](https://pypi.org/project/galaxdb-client/)
+  [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.20355229.svg)](https://doi.org/10.5281/zenodo.20355229)
 </div>
 
 ---
 
 ## What is GalaxDB?
 
-Most AI applications bolt together 3–5 separate services: a relational database, a vector database, an embedding API, an object store, and a data pipeline. GalaxDB replaces all of them with a single binary that speaks PostgreSQL wire protocol.
+Most AI applications bolt together 3–5 separate services: a relational database, a vector database, an embedding API, an object store, and a data pipeline. GalaxDB replaces all of them with a single binary that speaks PostgreSQL wire protocol. The release artifacts stay lightweight: `galaxdb-server` is 7.9 MB and `galaxdb-sidecar` is 7.6 MB.
 
 ```
 Before GalaxDB:
@@ -137,6 +138,8 @@ Measured on AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM, 88
 | 50        | 0.959     | 158 µs       | 228 µs      |
 | 100       | 0.983     | 267 µs       | 364 µs      |
 | **200**   | **0.990** | **459 µs**   | **616 µs**  |
+
+For methodology and the full SIFT-1M run, see the [GalaxDB paper on Zenodo](https://doi.org/10.5281/zenodo.20355229).
 
 ### Storage Engine
 
@@ -306,6 +309,7 @@ GALAXDB_KEY_PROVIDER=vault:transit/galaxdb-prod galaxdb-server ...
 - [Storage Engine](docs/STORAGE_ENGINE.md) — LSM tree, WAL, PAX blocks, HNSW
 - [Benchmarks](docs/BENCHMARKS.md) — SIFT-1M recall, write throughput, latency
 - [Database Comparison](docs/COMPARISON.md) — GalaxDB vs PostgreSQL, Pinecone, Qdrant, LanceDB, ChromaDB, Milvus, DuckDB, Weaviate
+- [Research Paper](https://doi.org/10.5281/zenodo.20355229) — GalaxDB: A Unified AI-Native Storage Engine for Transactional, Analytical, and Vector Workloads
 
 ---
 
@@ -322,5 +326,5 @@ Apache 2.0 — see [LICENSE](LICENSE).
 ---
 
 <div align="center">
-  <sub>Built by <a href="https://zentrix.ai">Zentrix Innovative Labs</a></sub>
+  <sub>Built by Zentrix Innovative Labs</sub>
 </div>
