@@ -302,9 +302,29 @@ GALAXDB_KEY_PROVIDER=vault:transit/galaxdb-prod galaxdb-server ...
 
 ---
 
+## Security status
+
+GalaxDB encrypts data at rest today (AES-256-GCM on every PAX block and WAL record, pluggable key
+management above). Network security is in active development:
+
+| Capability | Status |
+|------------|--------|
+| Encryption at rest (AES-256-GCM, pluggable KMS) | ✅ Available now |
+| Wire authentication (SCRAM-SHA-256) | 🚧 In progress |
+| TLS transport encryption | 🚧 In progress |
+| Roles, privileges, GRANT/REVOKE | 🚧 In progress |
+| SSO / fine-grained RBAC / audit logging | Enterprise edition |
+
+Until wire authentication and TLS land, run `galaxdb-server` only on a trusted network or loopback
+interface (the connection examples above use `sslmode=disable` accordingly). See
+[ROADMAP.md](ROADMAP.md) for what is shipping next.
+
+---
+
 ## Documentation
 
 - [Getting Started](docs/GETTING_STARTED.md) — installation, all features, Docker Compose, troubleshooting
+- [Roadmap](ROADMAP.md) — shipped capabilities, in-progress hardening, and planned features (OSS vs Enterprise)
 - [SQL Reference](docs/sql-reference.md) — full AuroraSQL syntax
 - [Storage Engine](docs/STORAGE_ENGINE.md) — LSM tree, WAL, PAX blocks, HNSW
 - [Benchmarks](docs/BENCHMARKS.md) — SIFT-1M recall, write throughput, latency
