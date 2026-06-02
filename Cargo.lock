@@ -2645,6 +2645,7 @@ dependencies = [
 name = "galaxdb-sql"
 version = "0.1.0"
 dependencies = [
+ "galaxdb-auth",
  "galaxdb-common",
  "galaxdb-sidecar",
  "galaxdb-storage",

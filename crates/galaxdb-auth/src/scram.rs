@@ -99,6 +99,50 @@ impl ScramVerifier {
             server_key,
         }
     }
+
+    /// Serialize to a compact, self-describing byte layout for storage:
+    /// `[version:u8=1][iterations:u32 LE][salt_len:u16 LE][salt][stored_key:32][server_key:32]`.
+    /// Contains no plaintext and is stable across restarts.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + 4 + 2 + self.salt.len() + 64);
+        out.push(1u8); // format version
+        out.extend_from_slice(&self.iterations.to_le_bytes());
+        out.extend_from_slice(&(self.salt.len() as u16).to_le_bytes());
+        out.extend_from_slice(&self.salt);
+        out.extend_from_slice(&self.stored_key);
+        out.extend_from_slice(&self.server_key);
+        out
+    }
+
+    /// Parse the layout produced by [`ScramVerifier::to_bytes`]. Returns
+    /// `None` on any structural mismatch.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 1 + 4 + 2 {
+            return None;
+        }
+        if bytes[0] != 1 {
+            return None;
+        }
+        let iterations = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+        let salt_len = u16::from_le_bytes([bytes[5], bytes[6]]) as usize;
+        let salt_start = 7;
+        let salt_end = salt_start + salt_len;
+        let keys_end = salt_end + SHA256_LEN + SHA256_LEN;
+        if bytes.len() != keys_end {
+            return None;
+        }
+        let salt = bytes[salt_start..salt_end].to_vec();
+        let mut stored_key = [0u8; SHA256_LEN];
+        let mut server_key = [0u8; SHA256_LEN];
+        stored_key.copy_from_slice(&bytes[salt_end..salt_end + SHA256_LEN]);
+        server_key.copy_from_slice(&bytes[salt_end + SHA256_LEN..keys_end]);
+        Some(ScramVerifier {
+            salt,
+            iterations,
+            stored_key,
+            server_key,
+        })
+    }
 }
 
 /// Errors during the SCRAM exchange. All map to authentication failure;
@@ -361,5 +405,19 @@ mod tests {
             assert!(!n.contains(','), "SCRAM nonce must not contain a comma");
             assert!(!n.is_empty());
         }
+    }
+
+    #[test]
+    fn verifier_byte_roundtrip() {
+        let v = ScramVerifier::from_password_with("pw", vec![3u8; 16], 8192);
+        let bytes = v.to_bytes();
+        let back = ScramVerifier::from_bytes(&bytes).expect("roundtrip");
+        assert_eq!(v, back);
+        // Wrong version / truncation rejected.
+        assert!(ScramVerifier::from_bytes(&[]).is_none());
+        assert!(ScramVerifier::from_bytes(&[2, 0, 0, 0, 0, 0, 0]).is_none());
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert!(ScramVerifier::from_bytes(&truncated).is_none());
     }
 }
