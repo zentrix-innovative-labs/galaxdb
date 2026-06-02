@@ -355,6 +355,21 @@ impl Database {
                 task: "B6",
                 feature: "AT VERSION planner wiring (consolidation Phase B6 deferred)",
             }),
+            AuroraStatement::CreateRole(stmt) => {
+                self.dispatch(QueryPlan::CreateRole(stmt.clone()))
+            }
+            AuroraStatement::DropRole { name, if_exists } => self.dispatch(QueryPlan::DropRole {
+                name: name.clone(),
+                if_exists: *if_exists,
+            }),
+            AuroraStatement::AlterRolePassword { name, password } => {
+                self.dispatch(QueryPlan::AlterRolePassword {
+                    name: name.clone(),
+                    password: password.clone(),
+                })
+            }
+            AuroraStatement::Grant(stmt) => self.dispatch(QueryPlan::Grant(stmt.clone())),
+            AuroraStatement::Revoke(stmt) => self.dispatch(QueryPlan::Revoke(stmt.clone())),
         }
     }
 
@@ -801,6 +816,8 @@ impl Database {
             indexes: self.vector_indexes.clone(),
             engine: self.engine.clone(),
         }));
+        // Role/grant DDL persists through the engine-backed auth store.
+        ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
         ctx
     }
 
@@ -3240,5 +3257,121 @@ mod tests {
              got a={a:?}, b={b:?}"
         );
         assert!(!a.is_empty(), "backup must include at least one SST");
+    }
+}
+
+#[cfg(test)]
+mod role_grant_tests {
+    use super::*;
+    use galaxdb_sql::auth_store::AuthStore;
+    use galaxdb_sql::auth_store::PrivilegeAction as Action;
+
+    fn test_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        std::mem::forget(dir);
+        Database::open(p.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn create_role_persists_verifier_via_ddl() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE alice PASSWORD 'secret'").unwrap();
+
+        // Inspect the persisted state through a fresh AuthStore over the
+        // same engine — proves the DDL wrote through to storage.
+        let store = AuthStore::new(db.engine.clone());
+        let role = store.get_role("alice").expect("role persisted");
+        assert!(!role.is_superuser);
+        assert!(role.verifier.is_some(), "password must produce a verifier");
+        // The plaintext must not be recoverable from the stored bytes.
+        let v = role.verifier.unwrap();
+        assert!(!v.salt.windows(6).any(|w| w == b"secret"));
+    }
+
+    #[test]
+    fn create_superuser_role() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE admin PASSWORD 'pw' SUPERUSER").unwrap();
+        let store = AuthStore::new(db.engine.clone());
+        assert!(store.is_superuser("admin"));
+    }
+
+    #[test]
+    fn create_duplicate_role_errors() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE alice PASSWORD 'pw'").unwrap();
+        let err = db.execute("CREATE ROLE alice PASSWORD 'pw2'");
+        assert!(err.is_err(), "duplicate role must error");
+    }
+
+    #[test]
+    fn alter_role_password_replaces_verifier() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE alice PASSWORD 'old'").unwrap();
+        let store = AuthStore::new(db.engine.clone());
+        let v_old = store.verifier_for("alice").unwrap();
+
+        db.execute("ALTER ROLE alice PASSWORD 'new'").unwrap();
+        let v_new = store.verifier_for("alice").unwrap();
+        // A new salt+keys must be derived (overwhelmingly different).
+        assert_ne!(v_old.stored_key, v_new.stored_key);
+    }
+
+    #[test]
+    fn alter_unknown_role_errors() {
+        let mut db = test_db();
+        assert!(db.execute("ALTER ROLE ghost PASSWORD 'x'").is_err());
+    }
+
+    #[test]
+    fn drop_role_removes_it() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE alice PASSWORD 'pw'").unwrap();
+        db.execute("DROP ROLE alice").unwrap();
+        let store = AuthStore::new(db.engine.clone());
+        assert!(store.get_role("alice").is_none());
+        // DROP of a missing role errors unless IF EXISTS.
+        assert!(db.execute("DROP ROLE alice").is_err());
+        db.execute("DROP ROLE IF EXISTS alice").unwrap();
+    }
+
+    #[test]
+    fn grant_and_revoke_persist() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE alice PASSWORD 'pw'").unwrap();
+        db.execute("GRANT SELECT ON docs TO alice").unwrap();
+        db.execute("GRANT INSERT ON docs TO alice").unwrap();
+
+        let store = AuthStore::new(db.engine.clone());
+        assert!(store.has_grant("alice", "docs", Action::Select));
+        assert!(store.has_grant("alice", "docs", Action::Insert));
+        assert!(!store.has_grant("alice", "docs", Action::Delete));
+
+        db.execute("REVOKE SELECT ON docs FROM alice").unwrap();
+        assert!(!store.has_grant("alice", "docs", Action::Select));
+        assert!(store.has_grant("alice", "docs", Action::Insert));
+    }
+
+    #[test]
+    fn grant_to_unknown_role_errors() {
+        let mut db = test_db();
+        assert!(db.execute("GRANT SELECT ON docs TO nobody").is_err());
+    }
+
+    #[test]
+    fn roles_and_grants_survive_reopen_via_ddl() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        {
+            let mut db = Database::open(p.to_str().unwrap()).unwrap();
+            db.execute("CREATE ROLE alice PASSWORD 'pw'").unwrap();
+            db.execute("GRANT UPDATE ON docs TO alice").unwrap();
+        }
+        // Reopen: WAL replay restores the auth rows.
+        let db = Database::open(p.to_str().unwrap()).unwrap();
+        let store = AuthStore::new(db.engine.clone());
+        assert!(store.get_role("alice").is_some());
+        assert!(store.has_grant("alice", "docs", Action::Update));
     }
 }

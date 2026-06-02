@@ -32,6 +32,10 @@ use galaxdb_auth::{Action, ScramVerifier};
 use galaxdb_common::{GalaxError, GalaxResult};
 use galaxdb_storage::engine::Engine;
 
+/// Re-export so consumers of the auth store (e.g. `galaxdb-embedded`
+/// tests and the wire server) can name the privilege action type without
+/// taking a direct dependency on `galaxdb-auth`.
+pub use galaxdb_auth::Action as PrivilegeAction;
 const ROLE_PREFIX: &[u8] = b"\x00galaxdb_auth\x00role\x00";
 const GRANT_PREFIX: &[u8] = b"\x00galaxdb_auth\x00grant\x00";
 

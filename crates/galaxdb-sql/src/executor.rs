@@ -259,6 +259,12 @@ pub struct ExecutorContext {
     /// When `None`, SEMANTIC_MATCH queries return
     /// [`GalaxError::SidecarUnavailable`].
     pub vector_backend: Option<Arc<dyn VectorSearchBackend>>,
+
+    /// Optional persistent role + grant catalog (Req 3). When `None`,
+    /// role/grant DDL returns [`GalaxError::NotYetAvailable`] rather than
+    /// a fake success. The server/embedded layer supplies a real
+    /// [`crate::auth_store::AuthStore`] backed by the engine.
+    pub auth_store: Option<crate::auth_store::AuthStore>,
 }
 
 impl ExecutorContext {
@@ -274,6 +280,7 @@ impl ExecutorContext {
             merkle_dag: None,
             minhash_policy: None,
             vector_backend: None,
+            auth_store: None,
         }
     }
 }
@@ -429,6 +436,11 @@ fn plan_kind_str(plan: &QueryPlan) -> &'static str {
         QueryPlan::Backup { .. } => "backup",
         QueryPlan::Restore { .. } => "restore",
         QueryPlan::ShowEmbeddingHealth { .. } => "show_embedding_health",
+        QueryPlan::CreateRole(_) => "create_role",
+        QueryPlan::DropRole { .. } => "drop_role",
+        QueryPlan::AlterRolePassword { .. } => "alter_role_password",
+        QueryPlan::Grant(_) => "grant",
+        QueryPlan::Revoke(_) => "revoke",
     }
 }
 
@@ -530,6 +542,14 @@ pub fn execute_with_context(
             strategy,
             at,
         } => exec_hybrid_search_at_version(table, semantic, filter.as_ref(), *strategy, at, ctx),
+
+        QueryPlan::CreateRole(stmt) => exec_create_role(stmt, ctx),
+        QueryPlan::DropRole { name, if_exists } => exec_drop_role_principal(name, *if_exists, ctx),
+        QueryPlan::AlterRolePassword { name, password } => {
+            exec_alter_role_password(name, password, ctx)
+        }
+        QueryPlan::Grant(stmt) => exec_grant(stmt, false, ctx),
+        QueryPlan::Revoke(stmt) => exec_grant(stmt, true, ctx),
     }
 }
 
@@ -1268,6 +1288,116 @@ fn exec_show_embedding_health(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Roles, privileges, grants (Req 3). All persist through the AuthStore,
+// which writes reserved rows via the engine's WAL+SST path.
+// ---------------------------------------------------------------------------
+
+/// Map an AST privilege to the auth `Action` it grants.
+fn privilege_action(p: crate::ast::Privilege) -> galaxdb_auth::Action {
+    match p {
+        crate::ast::Privilege::Select => galaxdb_auth::Action::Select,
+        crate::ast::Privilege::Insert => galaxdb_auth::Action::Insert,
+        crate::ast::Privilege::Update => galaxdb_auth::Action::Update,
+        crate::ast::Privilege::Delete => galaxdb_auth::Action::Delete,
+    }
+}
+
+fn require_auth_store(ctx: &ExecutorContext) -> GalaxResult<&crate::auth_store::AuthStore> {
+    ctx.auth_store.as_ref().ok_or(GalaxError::NotYetAvailable {
+        task: "4",
+        feature: "role/grant DDL without a configured auth store",
+    })
+}
+
+fn exec_create_role(
+    stmt: &crate::ast::CreateRoleStmt,
+    ctx: &mut ExecutorContext,
+) -> GalaxResult<ExecuteResult> {
+    let store = require_auth_store(ctx)?;
+    if store.get_role(&stmt.name).is_some() {
+        return Err(GalaxError::Internal(format!(
+            "role '{}' already exists",
+            stmt.name
+        )));
+    }
+    // The plaintext password is used only to derive the SCRAM verifier
+    // here and is never persisted. A passwordless role can be created
+    // and have its password set later via ALTER ROLE.
+    let verifier = stmt
+        .password
+        .as_ref()
+        .map(|pw| galaxdb_auth::ScramVerifier::from_password(pw));
+    let record = crate::auth_store::RoleRecord {
+        name: stmt.name.clone(),
+        is_superuser: stmt.is_superuser,
+        verifier,
+    };
+    store.put_role(&record)?;
+    Ok(ExecuteResult::Ok(format!("CREATE ROLE {}", stmt.name)))
+}
+
+fn exec_drop_role_principal(
+    name: &str,
+    if_exists: bool,
+    ctx: &mut ExecutorContext,
+) -> GalaxResult<ExecuteResult> {
+    let store = require_auth_store(ctx)?;
+    let existed = store.drop_role(name)?;
+    if !existed && !if_exists {
+        return Err(GalaxError::Internal(format!("role '{}' does not exist", name)));
+    }
+    Ok(ExecuteResult::Ok(format!("DROP ROLE {}", name)))
+}
+
+fn exec_alter_role_password(
+    name: &str,
+    password: &str,
+    ctx: &mut ExecutorContext,
+) -> GalaxResult<ExecuteResult> {
+    let store = require_auth_store(ctx)?;
+    let mut record = store
+        .get_role(name)
+        .ok_or_else(|| GalaxError::Internal(format!("role '{}' does not exist", name)))?;
+    // Re-derive the verifier from the new plaintext, then drop it.
+    record.verifier = Some(galaxdb_auth::ScramVerifier::from_password(password));
+    store.put_role(&record)?;
+    Ok(ExecuteResult::Ok(format!("ALTER ROLE {}", name)))
+}
+
+fn exec_grant(
+    stmt: &crate::ast::GrantStmt,
+    revoke: bool,
+    ctx: &mut ExecutorContext,
+) -> GalaxResult<ExecuteResult> {
+    let store = require_auth_store(ctx)?;
+    // The grantee role must exist.
+    if store.get_role(&stmt.role).is_none() {
+        return Err(GalaxError::Internal(format!(
+            "role '{}' does not exist",
+            stmt.role
+        )));
+    }
+    let action = privilege_action(stmt.privilege);
+    if revoke {
+        store.revoke(&stmt.role, &stmt.table, action)?;
+        Ok(ExecuteResult::Ok(format!(
+            "REVOKE {} ON {} FROM {}",
+            action.label(),
+            stmt.table,
+            stmt.role
+        )))
+    } else {
+        store.grant(&stmt.role, &stmt.table, action)?;
+        Ok(ExecuteResult::Ok(format!(
+            "GRANT {} ON {} TO {}",
+            action.label(),
+            stmt.table,
+            stmt.role
+        )))
+    }
+}
+
 fn exec_create_version_tag(
     stmt: &crate::ast::CreateVersionTagStmt,
     ctx: &mut ExecutorContext,
@@ -1879,5 +2009,13 @@ pub fn execute_legacy(plan: &QueryPlan, catalog: &mut Catalog) -> ExecuteResult 
                 )
             }
         }
+        QueryPlan::CreateRole(_)
+        | QueryPlan::DropRole { .. }
+        | QueryPlan::AlterRolePassword { .. }
+        | QueryPlan::Grant(_)
+        | QueryPlan::Revoke(_) => ExecuteResult::Error(
+            "role/grant DDL requires a storage-backed auth store; use execute_with_context"
+                .to_string(),
+        ),
     }
 }

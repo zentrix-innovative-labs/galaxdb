@@ -49,6 +49,21 @@ pub fn parse(sql: &str) -> GalaxResult<Vec<AuroraStatement>> {
     if upper.starts_with("ANALYZE") && !upper.starts_with("ANALYZE SELECT") {
         return Ok(vec![parse_analyze(trimmed)?]);
     }
+    if upper.starts_with("CREATE ROLE") {
+        return Ok(vec![parse_create_role(trimmed)?]);
+    }
+    if upper.starts_with("DROP ROLE") {
+        return Ok(vec![parse_drop_role(trimmed)?]);
+    }
+    if upper.starts_with("ALTER ROLE") {
+        return Ok(vec![parse_alter_role(trimmed)?]);
+    }
+    if upper.starts_with("GRANT ") {
+        return Ok(vec![parse_grant(trimmed, false)?]);
+    }
+    if upper.starts_with("REVOKE ") {
+        return Ok(vec![parse_grant(trimmed, true)?]);
+    }
 
     // Try standard sqlparser, then post-process for extensions
     // If CREATE TABLE contains EMBEDDING, pre-process to strip it before sqlparser
@@ -132,6 +147,180 @@ fn parse_analyze(sql: &str) -> GalaxResult<AuroraStatement> {
     Ok(AuroraStatement::Analyze {
         table: rest.to_string(),
     })
+}
+
+/// Strip an optional trailing `;` and surrounding whitespace.
+fn trim_stmt(s: &str) -> &str {
+    s.trim().trim_end_matches(';').trim()
+}
+
+/// Parse a bare or quoted SQL identifier token (role/table name) from the
+/// front of `s`, returning `(identifier, rest)`. Quoted identifiers use
+/// double quotes; bare identifiers run until whitespace.
+fn take_ident(s: &str) -> Option<(String, &str)> {
+    let s = s.trim_start();
+    if let Some(stripped) = s.strip_prefix('"') {
+        let end = stripped.find('"')?;
+        let ident = stripped[..end].to_string();
+        Some((ident, &stripped[end + 1..]))
+    } else {
+        let end = s.find(char::is_whitespace).unwrap_or(s.len());
+        if end == 0 {
+            return None;
+        }
+        Some((s[..end].to_string(), &s[end..]))
+    }
+}
+
+/// Parse `CREATE ROLE name [WITH] [PASSWORD '...'] [SUPERUSER]`.
+fn parse_create_role(sql: &str) -> GalaxResult<AuroraStatement> {
+    // Skip "CREATE ROLE".
+    let rest = trim_stmt(&sql[11..]);
+    let upper = rest.to_uppercase();
+
+    let (name, _after_name) = take_ident(rest).ok_or_else(|| GalaxError::SqlParse {
+        position: 11,
+        message: "CREATE ROLE requires a role name".to_string(),
+    })?;
+
+    // PASSWORD '...' is optional; extract the quoted literal that follows
+    // the PASSWORD keyword if present.
+    let password = if let Some(pos) = upper.find("PASSWORD") {
+        let after = rest[pos + "PASSWORD".len()..].trim_start();
+        Some(
+            extract_quoted_string(after).ok_or_else(|| GalaxError::SqlParse {
+                position: pos,
+                message: "PASSWORD requires a quoted string, e.g. PASSWORD 'secret'"
+                    .to_string(),
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let is_superuser = upper.contains("SUPERUSER");
+
+    Ok(AuroraStatement::CreateRole(CreateRoleStmt {
+        name,
+        password,
+        is_superuser,
+    }))
+}
+
+/// Parse `DROP ROLE [IF EXISTS] name`.
+fn parse_drop_role(sql: &str) -> GalaxResult<AuroraStatement> {
+    let rest = trim_stmt(&sql[9..]); // skip "DROP ROLE"
+    let upper = rest.to_uppercase();
+    let (if_exists, name_part) = if upper.starts_with("IF EXISTS") {
+        (true, rest["IF EXISTS".len()..].trim_start())
+    } else {
+        (false, rest)
+    };
+    let (name, _) = take_ident(name_part).ok_or_else(|| GalaxError::SqlParse {
+        position: 9,
+        message: "DROP ROLE requires a role name".to_string(),
+    })?;
+    Ok(AuroraStatement::DropRole { name, if_exists })
+}
+
+/// Parse `ALTER ROLE name [WITH] PASSWORD '...'`.
+fn parse_alter_role(sql: &str) -> GalaxResult<AuroraStatement> {
+    let rest = trim_stmt(&sql[10..]); // skip "ALTER ROLE"
+    let upper = rest.to_uppercase();
+    let (name, _) = take_ident(rest).ok_or_else(|| GalaxError::SqlParse {
+        position: 10,
+        message: "ALTER ROLE requires a role name".to_string(),
+    })?;
+    let pos = upper.find("PASSWORD").ok_or_else(|| GalaxError::SqlParse {
+        position: 10,
+        message: "ALTER ROLE currently supports only PASSWORD '...'".to_string(),
+    })?;
+    let after = rest[pos + "PASSWORD".len()..].trim_start();
+    let password = extract_quoted_string(after).ok_or_else(|| GalaxError::SqlParse {
+        position: pos,
+        message: "ALTER ROLE ... PASSWORD requires a quoted string".to_string(),
+    })?;
+    Ok(AuroraStatement::AlterRolePassword { name, password })
+}
+
+/// Parse `GRANT priv ON table TO role` / `REVOKE priv ON table FROM role`.
+fn parse_grant(sql: &str, revoke: bool) -> GalaxResult<AuroraStatement> {
+    // Skip leading GRANT / REVOKE.
+    let keyword_len = if revoke { "REVOKE".len() } else { "GRANT".len() };
+    let rest = trim_stmt(&sql[keyword_len..]);
+    let upper = rest.to_uppercase();
+
+    // <priv> ON <table> (TO|FROM) <role>
+    let on_pos = upper.find(" ON ").ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "expected ON in GRANT/REVOKE".to_string(),
+    })?;
+    let priv_str = rest[..on_pos].trim();
+    let privilege = match priv_str.to_uppercase().as_str() {
+        "SELECT" => Privilege::Select,
+        "INSERT" => Privilege::Insert,
+        "UPDATE" => Privilege::Update,
+        "DELETE" => Privilege::Delete,
+        other => {
+            return Err(GalaxError::SqlParse {
+                position: 0,
+                message: format!(
+                    "unsupported privilege '{}'; expected SELECT/INSERT/UPDATE/DELETE",
+                    other
+                ),
+            });
+        }
+    };
+
+    let after_on = &rest[on_pos + 4..];
+    // table (TO|FROM) role
+    let conn_upper = if revoke { "FROM" } else { "TO" };
+    let (table_part, role_part) =
+        split_on_keyword(after_on, conn_upper).ok_or_else(|| GalaxError::SqlParse {
+            position: on_pos,
+            message: format!("expected {} in GRANT/REVOKE", conn_upper),
+        })?;
+
+    let (table, _) = take_ident(table_part.trim()).ok_or_else(|| GalaxError::SqlParse {
+        position: on_pos,
+        message: "GRANT/REVOKE requires a table name after ON".to_string(),
+    })?;
+    let (role, _) = take_ident(role_part.trim()).ok_or_else(|| GalaxError::SqlParse {
+        position: on_pos,
+        message: "GRANT/REVOKE requires a role name".to_string(),
+    })?;
+
+    let stmt = GrantStmt {
+        privilege,
+        table,
+        role,
+    };
+    if revoke {
+        Ok(AuroraStatement::Revoke(stmt))
+    } else {
+        Ok(AuroraStatement::Grant(stmt))
+    }
+}
+
+/// Split `s` on the first whitespace-delimited occurrence of `keyword`
+/// (case-insensitive), returning `(before, after)`.
+fn split_on_keyword<'a>(s: &'a str, keyword: &str) -> Option<(&'a str, &'a str)> {
+    let upper = s.to_uppercase();
+    let ku = keyword.to_uppercase();
+    let mut search_from = 0;
+    while let Some(rel) = upper[search_from..].find(&ku) {
+        let pos = search_from + rel;
+        let before_ok = pos == 0
+            || upper.as_bytes()[pos - 1].is_ascii_whitespace();
+        let after_idx = pos + ku.len();
+        let after_ok = after_idx == upper.len()
+            || upper.as_bytes()[after_idx].is_ascii_whitespace();
+        if before_ok && after_ok {
+            return Some((&s[..pos], &s[after_idx..]));
+        }
+        search_from = pos + ku.len();
+    }
+    None
 }
 
 /// Parse CREATE VERSION TAG 'name' [FOR TRAINING [WITH TRAINING PRECISION ...] [TRAINING SEED n]].

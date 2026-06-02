@@ -23,6 +23,44 @@ pub enum AuroraStatement {
     RestoreFrom { path: String },
     /// ANALYZE table_name.
     Analyze { table: String },
+    /// CREATE ROLE name [PASSWORD '...'] [SUPERUSER].
+    CreateRole(CreateRoleStmt),
+    /// DROP ROLE name.
+    DropRole { name: String, if_exists: bool },
+    /// ALTER ROLE name PASSWORD '...'.
+    AlterRolePassword { name: String, password: String },
+    /// GRANT priv ON table TO role.
+    Grant(GrantStmt),
+    /// REVOKE priv ON table FROM role.
+    Revoke(GrantStmt),
+}
+
+/// A privilege that can be granted on a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Privilege {
+    Select,
+    Insert,
+    Update,
+    Delete,
+}
+
+/// CREATE ROLE statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateRoleStmt {
+    pub name: String,
+    /// Plaintext password, if `PASSWORD '...'` was supplied. Used only to
+    /// build the SCRAM verifier at execution time, then dropped — never
+    /// stored.
+    pub password: Option<String>,
+    pub is_superuser: bool,
+}
+
+/// GRANT / REVOKE statement (same shape for both).
+#[derive(Debug, Clone, PartialEq)]
+pub struct GrantStmt {
+    pub privilege: Privilege,
+    pub table: String,
+    pub role: String,
 }
 
 /// Column definition with optional embedding annotation.
