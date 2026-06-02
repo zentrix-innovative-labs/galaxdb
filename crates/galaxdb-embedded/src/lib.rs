@@ -236,6 +236,64 @@ impl Database {
         self.session.as_ref().map(|s| &s.role)
     }
 
+    /// An [`AuthStore`](galaxdb_sql::auth_store::AuthStore) over this
+    /// database's engine, for looking up role verifiers and superuser
+    /// flags during the wire SCRAM handshake and for provisioning the
+    /// initial superuser at startup (task 6). Cheap to construct (holds an
+    /// `Arc<Engine>`).
+    pub fn auth_store(&self) -> galaxdb_sql::auth_store::AuthStore {
+        galaxdb_sql::auth_store::AuthStore::new(self.engine.clone())
+    }
+
+    /// Whether any role exists in the auth catalog. Used at startup to
+    /// decide whether to provision the initial superuser (task 6, Req 1
+    /// AC7).
+    pub fn any_role_exists(&self) -> bool {
+        self.auth_store().any_role_exists()
+    }
+
+    /// Provision an initial superuser from a plaintext password. Used once
+    /// at first startup when auth is enabled and the catalog is empty
+    /// (Req 1 AC7). The plaintext is consumed to build the SCRAM verifier
+    /// and never stored. Returns an error if a role with that name already
+    /// exists.
+    pub fn provision_superuser(&self, name: &str, password: &str) -> GalaxResult<()> {
+        let store = self.auth_store();
+        if store.get_role(name).is_some() {
+            return Err(GalaxError::Internal(format!(
+                "cannot provision initial superuser: role '{name}' already exists"
+            )));
+        }
+        store.put_role(&galaxdb_sql::auth_store::RoleRecord {
+            name: name.to_string(),
+            is_superuser: true,
+            verifier: Some(galaxdb_auth::ScramVerifier::from_password(password)),
+        })
+    }
+
+    /// Execute a write-capable statement under an explicit per-call
+    /// session, overriding [`Database::session`] for the duration of this
+    /// call only (task 6). The wire server uses this so each connection
+    /// runs its statements under the role established by that connection's
+    /// SCRAM handshake, even though all connections share one `Database`
+    /// behind an `RwLock`.
+    ///
+    /// Safe because the caller holds the database exclusively (`&mut self`
+    /// / a write lock): the session is set, the statement runs
+    /// synchronously, and the previous session is restored before
+    /// returning. There is no reentrancy.
+    pub fn execute_with_session(
+        &mut self,
+        sql: &str,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        let prev = self.session.take();
+        self.session = session;
+        let result = self.execute(sql);
+        self.session = prev;
+        result
+    }
+
     /// Synchronous execute — for embedded Rust callers and the Python
     /// FFI.
     pub fn execute(&mut self, sql: &str) -> GalaxResult<QueryResult> {
@@ -267,10 +325,22 @@ impl Database {
     /// callers holding the database behind an `RwLock` that want to
     /// allow concurrent reads.
     pub fn execute_readonly(&self, sql: &str) -> GalaxResult<QueryResult> {
+        self.execute_readonly_with_session(sql, self.session.clone())
+    }
+
+    /// `&self` read path under an explicit per-call session (task 6). The
+    /// wire server uses this on the shared-read lock so each connection's
+    /// SELECTs are authorization-checked under that connection's role
+    /// without mutating the shared `Database`.
+    pub fn execute_readonly_with_session(
+        &self,
+        sql: &str,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
         // AT VERSION on the read path: same intercept as `execute`, but
         // we don't need `&mut self` because the plan only scans storage.
         if let Some((stripped, at)) = split_at_version(sql)? {
-            return self.select_at_version_readonly(&stripped, at);
+            return self.select_at_version_readonly(&stripped, at, session.as_ref());
         }
 
         let stmts = parser::parse(sql)?;
@@ -279,7 +349,7 @@ impl Database {
             match stmt {
                 AuroraStatement::Standard(s) => {
                     if let sqlparser::ast::Statement::Query(q) = s.as_ref() {
-                        last = self.select_readonly(q)?;
+                        last = self.select_readonly(q, session.as_ref())?;
                     } else {
                         return Err(GalaxError::Internal(
                             "execute_readonly only supports SELECT and SHOW; \
@@ -310,7 +380,11 @@ impl Database {
         Ok(last)
     }
 
-    fn select_readonly(&self, q: &sqlparser::ast::Query) -> GalaxResult<QueryResult> {
+    fn select_readonly(
+        &self,
+        q: &sqlparser::ast::Query,
+        session: Option<&galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
         // Detect SEMANTIC_MATCH in WHERE and route to vector search.
         if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
             let table = extract_table(q);
@@ -324,7 +398,7 @@ impl Database {
             let mut ctx = ExecutorContext::new(self.engine.clone());
             ctx.catalog = self.catalog.clone();
             ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
-            ctx.session = self.session.clone();
+            ctx.session = session.cloned();
             ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
                 sidecar: self.sidecar.clone(),
                 indexes: self.vector_indexes.clone(),
@@ -348,7 +422,7 @@ impl Database {
         let mut ctx = ExecutorContext::new(self.engine.clone());
         ctx.catalog = self.catalog.clone();
         ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
-        ctx.session = self.session.clone();
+        ctx.session = session.cloned();
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
             sidecar: self.sidecar.clone(),
             indexes: self.vector_indexes.clone(),
@@ -729,6 +803,7 @@ impl Database {
         &self,
         stripped_sql: &str,
         at: galaxdb_sql::ast::AtVersionExpr,
+        session: Option<&galaxdb_auth::SessionContext>,
     ) -> GalaxResult<QueryResult> {
         let stmts = parser::parse(stripped_sql)?;
         let Some(stmt) = stmts.first() else {
@@ -762,7 +837,7 @@ impl Database {
         let mut ctx = ExecutorContext::new(self.engine.clone());
         ctx.catalog = self.catalog.clone();
         ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
-        ctx.session = self.session.clone();
+        ctx.session = session.cloned();
         ctx.tag_catalog = Some(self.tag_catalog.clone());
         ctx.merkle_dag = Some(self.merkle_dag.clone());
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {

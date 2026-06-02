@@ -270,11 +270,23 @@ impl Authenticator for ScramAuthenticator {
                 Ok(s) => s,
                 Err(_) => return AuthStep::Fail(AuthError::Malformed("client-first not UTF-8".into())),
             };
-            let (username, client_nonce, client_first_bare) =
+            let (scram_username, client_nonce, client_first_bare) =
                 match scram::parse_client_first(client_first) {
                     Ok(t) => t,
                     Err(e) => return AuthStep::Fail(AuthError::Malformed(e.to_string())),
                 };
+
+            // PostgreSQL SCRAM: the authoritative role name is the startup
+            // `user` parameter (captured as `role_hint`), not the SCRAM
+            // `n=` field — clients (psql, tokio-postgres, JDBC) send an
+            // empty `n=` and expect the server to use the startup user.
+            // Fall back to the SCRAM username only when no hint was
+            // supplied (direct non-PostgreSQL callers / unit tests that
+            // drive the trait without a startup message).
+            let username = match state.role_hint.clone() {
+                Some(h) if !h.is_empty() => h,
+                _ => scram_username,
+            };
 
             let verifier = match (self.verifier_lookup)(&username) {
                 Some(v) => v,

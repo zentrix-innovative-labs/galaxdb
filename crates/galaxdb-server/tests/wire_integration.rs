@@ -22,6 +22,7 @@ async fn start_server() -> (String, tempfile::TempDir) {
         max_connections: 16,
         sidecar_binary: None,
         model_id: None,
+        ..Default::default()
     };
 
     let (addr, _handle) = start(cfg).await.expect("server failed to bind");
@@ -30,6 +31,28 @@ async fn start_server() -> (String, tempfile::TempDir) {
         addr.port()
     );
     (conn_str, data_dir)
+}
+
+/// Start a server with SCRAM-SHA-256 authentication enabled and an
+/// initial superuser provisioned from config. Returns the bound port and
+/// the tempdir (kept alive by the caller).
+async fn start_auth_server(
+    superuser: &str,
+    password: &str,
+) -> (u16, tempfile::TempDir) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        data_dir: data_dir.path().to_string_lossy().to_string(),
+        max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
+        auth_enabled: true,
+        trusted_local_user: "galaxdb".to_string(),
+        initial_superuser: Some((superuser.to_string(), password.to_string())),
+    };
+    let (addr, _handle) = start(cfg).await.expect("auth server failed to bind");
+    (addr.port(), data_dir)
 }
 
 #[tokio::test]
@@ -364,4 +387,184 @@ async fn http_observability_starts_alongside_wire_server() {
         .to_str()
         .unwrap();
     assert!(ct.contains("text/plain"), "/metrics must return Prometheus text format");
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: SCRAM-SHA-256 authentication over the wire (Req 1)
+// ---------------------------------------------------------------------------
+
+/// A correct password authenticates and can run statements; the role is
+/// the provisioned superuser so it may create tables and roles.
+#[tokio::test]
+async fn scram_correct_password_connects() {
+    let (port, _td) = start_auth_server("admin", "s3cr3t").await;
+    let conn_str = format!(
+        "host=127.0.0.1 port={port} user=admin password=s3cr3t dbname=galaxdb sslmode=disable"
+    );
+
+    let (client, connection) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("SCRAM connect with correct password must succeed");
+
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // The authenticated superuser can run DDL + DML.
+    client
+        .simple_query("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .await
+        .expect("superuser DDL must succeed");
+    client
+        .simple_query("INSERT INTO t (id, n) VALUES (1, 10)")
+        .await
+        .expect("superuser INSERT must succeed");
+    let msgs = client.simple_query("SELECT id, n FROM t").await.unwrap();
+    let rows: Vec<_> = msgs
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1);
+}
+
+/// A wrong password is rejected with SQLSTATE `28P01` and no session is
+/// established.
+#[tokio::test]
+async fn scram_wrong_password_is_rejected_28p01() {
+    let (port, _td) = start_auth_server("admin", "right-password").await;
+    let conn_str = format!(
+        "host=127.0.0.1 port={port} user=admin password=WRONG-password dbname=galaxdb sslmode=disable"
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect attempt timed out");
+
+    let err = match result {
+        Ok(_) => panic!("wrong password must fail to connect"),
+        Err(e) => e,
+    };
+    // tokio-postgres surfaces the server's ErrorResponse; its SQLSTATE
+    // must be 28P01 (invalid_password).
+    let code = err
+        .as_db_error()
+        .map(|e| e.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "28P01", "wrong password must map to SQLSTATE 28P01, got {code:?} ({err})");
+}
+
+/// An unknown role is rejected with `28P01` (and the message does not
+/// distinguish "no such role" from "wrong password", so it can't be used
+/// to enumerate roles).
+#[tokio::test]
+async fn scram_unknown_role_is_rejected_28p01() {
+    let (port, _td) = start_auth_server("admin", "pw").await;
+    let conn_str = format!(
+        "host=127.0.0.1 port={port} user=ghost password=anything dbname=galaxdb sslmode=disable"
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect attempt timed out");
+
+    let err = match result {
+        Ok(_) => panic!("unknown role must fail to connect"),
+        Err(e) => e,
+    };
+    let code = err
+        .as_db_error()
+        .map(|e| e.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "28P01", "unknown role must map to SQLSTATE 28P01, got {code:?} ({err})");
+}
+
+/// End-to-end authorization over the wire (task 5 + 6 together): the
+/// superuser creates a non-privileged role and a table; that role is
+/// denied SELECT with `42501` until granted, then succeeds — all without
+/// a server restart. This is the wire-path half of task 5.6.
+#[tokio::test]
+async fn wire_authz_denied_then_granted() {
+    let (port, _td) = start_auth_server("root", "rootpw").await;
+
+    // 1. Superuser sets up the table, a row, and a plain role with a
+    //    password.
+    let admin_dsn = format!(
+        "host=127.0.0.1 port={port} user=root password=rootpw dbname=galaxdb sslmode=disable"
+    );
+    let (admin, admin_conn) = tokio_postgres::connect(&admin_dsn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = admin_conn.await;
+    });
+    admin
+        .simple_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .await
+        .unwrap();
+    admin
+        .simple_query("INSERT INTO docs (id, body) VALUES (1, 'hello')")
+        .await
+        .unwrap();
+    admin
+        .simple_query("CREATE ROLE alice PASSWORD 'alicepw'")
+        .await
+        .unwrap();
+
+    // 2. alice connects (auth succeeds — she has a verifier) but has no
+    //    grant on docs, so SELECT is denied with 42501.
+    let alice_dsn = format!(
+        "host=127.0.0.1 port={port} user=alice password=alicepw dbname=galaxdb sslmode=disable"
+    );
+    let (alice, alice_conn) = tokio_postgres::connect(&alice_dsn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = alice_conn.await;
+    });
+    let denied = alice.simple_query("SELECT id, body FROM docs").await;
+    let err = denied.expect_err("alice without a grant must be denied");
+    let code = err
+        .as_db_error()
+        .map(|e| e.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "42501", "ungranted SELECT must map to 42501, got {code:?} ({err})");
+
+    // 3. Superuser grants SELECT.
+    admin
+        .simple_query("GRANT SELECT ON docs TO alice")
+        .await
+        .unwrap();
+
+    // 4. alice can now SELECT — the grant took effect with no restart and
+    //    on the same live connection.
+    let msgs = alice
+        .simple_query("SELECT id, body FROM docs")
+        .await
+        .expect("after GRANT, alice's SELECT must succeed");
+    let rows: Vec<_> = msgs
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "alice must see the one row after GRANT");
+
+    // 5. A non-superuser cannot administer roles/grants.
+    let denied = alice.simple_query("GRANT SELECT ON docs TO alice").await;
+    let err = denied.expect_err("alice may not GRANT");
+    let code = err
+        .as_db_error()
+        .map(|e| e.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "42501", "non-superuser GRANT must map to 42501, got {code:?}");
 }

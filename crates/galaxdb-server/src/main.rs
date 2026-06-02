@@ -52,12 +52,28 @@ async fn main() {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9090);
 
+    // Task 6 (Req 1): authentication mode. SCRAM-SHA-256 auth is enabled
+    // with `--auth` or `GALAXDB_AUTH=1`. When enabled the server provisions
+    // the initial superuser from GALAXDB_INITIAL_SUPERUSER[_PASSWORD] on a
+    // fresh catalog and refuses to start if neither is set (never ships a
+    // default password). Without it the server runs in trusted-local mode
+    // (v1-compatible) and logs a warning that auth is disabled.
+    let auth_enabled = std::env::args().any(|a| a == "--auth")
+        || matches!(std::env::var("GALAXDB_AUTH").as_deref(), Ok("1") | Ok("true"));
+    let trusted_local_user = std::env::var("GALAXDB_TRUSTED_LOCAL_USER")
+        .unwrap_or_else(|_| "galaxdb".to_string());
+
     let cfg = ServerConfig {
         bind_addr: format!("0.0.0.0:{port}"),
         data_dir,
         max_connections: 1000,
         sidecar_binary,
         model_id,
+        auth_enabled,
+        trusted_local_user,
+        // Read from env in `start()` via resolve_initial_superuser; leave
+        // None here so the password never sits in an argv-derived struct.
+        initial_superuser: None,
     };
 
     // Task 40.1: start the HTTP observability server (/health + /metrics)
