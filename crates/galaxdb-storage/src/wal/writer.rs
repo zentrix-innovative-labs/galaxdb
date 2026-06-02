@@ -85,7 +85,11 @@ pub struct WalWriter {
     current_size: AtomicU64,
     /// The file handle for async (STRICT mode) writes.
     file: TokioMutex<BufWriter<File>>,
-    /// The file handle for sync writes (embedded mode).
+    /// Third independent append handle opened at construction. Held to
+    /// keep an extra file descriptor reserved for the sync write path;
+    /// the actual sync writes flow through `group_commit_tx`, so this
+    /// handle is intentionally not read after construction.
+    #[allow(dead_code)]
     sync_file: std::sync::Mutex<BufWriter<File>>,
     /// Channel to send writes to the group commit background task.
     group_commit_tx: mpsc::UnboundedSender<GroupCommitRequest>,
@@ -154,7 +158,7 @@ impl WalWriter {
                     .await;
                 });
             })
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         Ok(Self {
             config,

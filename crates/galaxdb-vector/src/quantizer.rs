@@ -249,6 +249,13 @@ impl RabitqQuantizer {
     }
 
     /// Apply the rotation matrix to a vector.
+    //
+    // Index-based loops are intentional here: this is a dense
+    // matrix-vector multiply where both indices participate in the
+    // flattened `row_offset + j` / `i * dim` address arithmetic.
+    // Rewriting as iterator chains obscures the linear algebra without
+    // changing the generated code.
+    #[allow(clippy::needless_range_loop)]
     fn rotate(&self, vector: &[f32]) -> Vec<f32> {
         let mut rotated = vec![0.0f32; self.dim];
         for i in 0..self.dim {
@@ -275,7 +282,7 @@ impl Quantizer for RabitqQuantizer {
         let rotated = self.rotate(&normalized);
 
         // Binary quantization: take sign bit, pack into bytes
-        let num_bytes = (self.dim + 7) / 8;
+        let num_bytes = self.dim.div_ceil(8);
         let mut bytes = vec![0u8; num_bytes];
         for (i, &val) in rotated.iter().enumerate() {
             if val > 0.0 {
@@ -285,9 +292,15 @@ impl Quantizer for RabitqQuantizer {
         bytes
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn dequantize(&self, quantized: &[u8]) -> Vec<f32> {
         // Binary quantization is lossy — dequantize produces ±1/√dim values
         // which approximate the original direction after inverse rotation.
+        //
+        // Index-based loops are intentional: the first unpacks bit `i`
+        // from byte `i/8`; the second is the transposed matrix-vector
+        // multiply (`rotation[j * dim + i]`). Both rely on the index in
+        // address arithmetic.
         let scale = 1.0 / (self.dim as f32).sqrt();
         let mut binary = vec![0.0f32; self.dim];
         for i in 0..self.dim {
@@ -446,7 +459,7 @@ mod tests {
 
     #[test]
     fn sq8_compression_ratio() {
-        let vectors = vec![vec![0.0f32; 768]];
+        let vectors = [vec![0.0f32; 768]];
         let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
         let q = Sq8Quantizer::calibrate(&refs, 768);
         assert_eq!(q.compression_ratio(), 4.0);
@@ -463,7 +476,7 @@ mod tests {
         let b = vec![0.9, 0.1, 0.0, 0.0];
         let c = vec![0.0, 0.0, 0.0, 1.0];
 
-        let vectors = vec![a.clone(), b.clone(), c.clone()];
+        let vectors = [a.clone(), b.clone(), c.clone()];
         let refs: Vec<&[f32]> = vectors.iter().map(|v| v.as_slice()).collect();
         let q = Sq8Quantizer::calibrate(&refs, 4);
 
@@ -605,7 +618,7 @@ mod tests {
         let mut b = vec![0.0f32; 64];
         let mut c = vec![0.0f32; 64];
         for i in 0..32 { a[i] = 1.0; b[i] = 0.9; }
-        for i in 32..64 { c[i] = 1.0; }
+        for slot in c.iter_mut().take(64).skip(32) { *slot = 1.0; }
 
         let qa = q.quantize(&a);
         let qb = q.quantize(&b);

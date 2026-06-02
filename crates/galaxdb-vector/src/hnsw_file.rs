@@ -153,7 +153,7 @@ impl MmapHnswGraph {
         let file = std::fs::File::open(path)?;
         // Safety: the file is opened read-only and we don't modify it
         let mmap = unsafe {
-            Mmap::map(&file).map_err(|e| GalaxError::Io(e))?
+            Mmap::map(&file).map_err(GalaxError::Io)?
         };
 
         if mmap.len() < HEADER_SIZE {
@@ -368,7 +368,7 @@ mod tests {
     fn bad_magic_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad.hnsw");
-        std::fs::write(&path, &[0u8; 64]).unwrap();
+        std::fs::write(&path, [0u8; 64]).unwrap();
         assert!(MmapHnswGraph::open(&path).is_err());
     }
 
@@ -376,7 +376,7 @@ mod tests {
     fn too_small_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tiny.hnsw");
-        std::fs::write(&path, &[0u8; 10]).unwrap();
+        std::fs::write(&path, [0u8; 10]).unwrap();
         assert!(MmapHnswGraph::open(&path).is_err());
     }
 }

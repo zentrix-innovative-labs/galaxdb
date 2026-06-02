@@ -14,7 +14,6 @@
 //! graceful shutdown on SIGTERM/SIGINT.
 
 use galaxdb_server::{start, ServerConfig};
-use galaxdb_observe;
 
 #[tokio::main]
 async fn main() {

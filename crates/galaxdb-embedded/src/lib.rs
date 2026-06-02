@@ -864,7 +864,7 @@ impl Database {
                 deterministic_order: true,
             }),
         )
-        .map_err(|e| GalaxError::Internal(format!("{e}")))?;
+        .map_err(|e| GalaxError::Internal(e.to_string()))?;
         Ok(tag_ts)
     }
 
@@ -1625,7 +1625,7 @@ fn extract_projection_and_filter_no_semantic(
     let filter = s
         .selection
         .as_ref()
-        .and_then(|e| filter_from_expr_no_semantic(e));
+        .and_then(filter_from_expr_no_semantic);
     (columns, filter)
 }
 

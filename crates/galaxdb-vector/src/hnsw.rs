@@ -88,14 +88,17 @@ impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool { self.dist == other.dist && self.id == other.id }
 }
 impl Eq for Candidate {}
-impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        other.dist.partial_cmp(&self.dist)
-    }
-}
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        // Reverse ordering on distance so a max-`BinaryHeap` of
+        // `Candidate` behaves as a min-heap by distance (nearest first).
+        // `dist` is f32 (only PartialOrd), so NaN collapses to Equal.
+        other.dist.partial_cmp(&self.dist).unwrap_or(Ordering::Equal)
+    }
+}
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -108,14 +111,17 @@ impl PartialEq for MaxCandidate {
     fn eq(&self, other: &Self) -> bool { self.dist == other.dist && self.id == other.id }
 }
 impl Eq for MaxCandidate {}
-impl PartialOrd for MaxCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.dist.partial_cmp(&other.dist)
-    }
-}
 impl Ord for MaxCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        // Normal ordering on distance: a max-`BinaryHeap` of
+        // `MaxCandidate` keeps the farthest result on top so it can be
+        // evicted when the result set exceeds `ef`.
+        self.dist.partial_cmp(&other.dist).unwrap_or(Ordering::Equal)
+    }
+}
+impl PartialOrd for MaxCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -135,6 +141,14 @@ impl<T> ConcurrentVec<T> {
     fn as_mut_slice(&mut self) -> &mut [T] {
         self.inner.get_mut().as_mut_slice()
     }
+    /// Returns a mutable slice into the interior buffer from a shared
+    /// reference. This is deliberate interior mutability: `ConcurrentVec`
+    /// hands out disjoint mutable slices to different node ranges from
+    /// parallel build threads, with per-node `RwLock`s (in `HnswGraph`)
+    /// serialising writes to any given node. The clippy lint flags the
+    /// `&self -> &mut` shape, which is exactly the intended (unsafe)
+    /// contract here.
+    #[allow(clippy::mut_from_ref)]
     unsafe fn get_slice_mut(&self, start: usize, len: usize) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut((*self.inner.get()).as_mut_ptr().add(start), len) }
     }
@@ -274,8 +288,7 @@ impl HnswGraph {
             if layer == 0 {
                 let count = unsafe { *self.neighbors0_counts.as_mut_ptr().add(c.id as usize) } as usize;
                 let nb_slice = unsafe { self.neighbors0.get_slice_mut(c.id as usize * m0, count) };
-                for i in 0..count {
-                    let nb = nb_slice[i];
+                for &nb in nb_slice.iter() {
                     if !visited.mark_visited(nb) {
                         let d = cosine_distance_normalized(query, self.get_vector(nb).unwrap());
                         let farthest_dist = results.peek().unwrap().dist;

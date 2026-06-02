@@ -12,7 +12,7 @@ use galaxdb_vector::{HnswConfig, HnswGraph};
 
 /// Read .fvecs format: [dim: i32][float32 × dim] per vector
 fn read_fvecs(path: &Path) -> Vec<Vec<f32>> {
-    let mut file = File::open(path).expect(&format!("cannot open {:?}", path));
+    let mut file = File::open(path).unwrap_or_else(|_| panic!("cannot open {:?}", path));
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).unwrap();
 
@@ -33,7 +33,7 @@ fn read_fvecs(path: &Path) -> Vec<Vec<f32>> {
 
 /// Read .ivecs format: [dim: i32][int32 × dim] per vector
 fn read_ivecs(path: &Path) -> Vec<Vec<i32>> {
-    let mut file = File::open(path).expect(&format!("cannot open {:?}", path));
+    let mut file = File::open(path).unwrap_or_else(|_| panic!("cannot open {:?}", path));
     let mut buf = Vec::new();
     file.read_to_end(&mut buf).unwrap();
 

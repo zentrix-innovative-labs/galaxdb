@@ -57,9 +57,10 @@ const EXPORT_BATCH_SIZE: usize = 8192;
 /// `CREATE VERSION TAG … FOR TRAINING` (see Req 24 and
 /// `galaxdb_sql::ast::TrainingPrecision`). Kept as a local enum so this crate
 /// does not have to depend on `galaxdb-sql`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TrainingPrecision {
     /// Raw 4-byte IEEE 754 floats (no conversion).
+    #[default]
     Float32,
     /// int8 scalar quantisation — 4× I/O reduction.
     Sq8,
@@ -85,12 +86,6 @@ impl TrainingPrecision {
             Self::Sq8 => "sq8",
             Self::Rabitq => "rabitq",
         }
-    }
-}
-
-impl Default for TrainingPrecision {
-    fn default() -> Self {
-        Self::Float32
     }
 }
 
@@ -414,6 +409,7 @@ impl LanceExporter {
     ///   [`LanceExportSource`].
     /// * `tag_name` — the `CREATE VERSION TAG … FOR TRAINING` name.
     /// * `precision`, `dedup`, `seed` — training configuration.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         output_path: impl Into<std::path::PathBuf>,
         schema: Arc<ArrowSchema>,
@@ -516,19 +512,19 @@ impl LanceExporter {
     /// 1. Resolve `tag_name` via the `TagCatalog`.
     /// 2. Ask the source to materialise rows for the tag's pinned blocks.
     /// 3. Sort rows by `primary_key` for deterministic ordering.
-    /// 3b. If [`LanceExporter::dedup`] is `true`, collapse every
+    /// 4. If [`LanceExporter::dedup`] is `true`, collapse every
     ///    [`ExportedRow::near_duplicate_group`] to a single representative
     ///    (lowest primary key per group). Rows whose group is `None` are
     ///    always retained — they are unique by definition.
-    /// 4. Apply [`TrainingPrecision`] conversion to every embedding column
+    /// 5. Apply [`TrainingPrecision`] conversion to every embedding column
     ///    (34.3). `Float32` is a passthrough; `Sq8` and `Rabitq` turn each
     ///    `FieldValue::Embedding` into `FieldValue::Binary` and require the
     ///    caller's schema to declare that column as [`DataType::Binary`].
-    /// 5. Compute the XXH3-128 content hash over the canonical row bytes
+    /// 6. Compute the XXH3-128 content hash over the canonical row bytes
     ///    (post-conversion, so the hash pins the precision used).
-    /// 6. Build Arrow `RecordBatch`es (8 192 rows each) against `schema`.
-    /// 7. Write the batches out as a Lance dataset via `Dataset::write`.
-    /// 8. Sum up on-disk bytes and return [`ExportStats`].
+    /// 7. Build Arrow `RecordBatch`es (8 192 rows each) against `schema`.
+    /// 8. Write the batches out as a Lance dataset via `Dataset::write`.
+    /// 9. Sum up on-disk bytes and return [`ExportStats`].
     ///
     /// ### Schema requirements for quantised precisions
     ///
@@ -1191,7 +1187,7 @@ fn build_column_array(
     }
 }
 
-fn field_at<'a>(row: &'a ExportedRow, col_idx: usize, row_idx: usize) -> ExportResult<&'a FieldValue> {
+fn field_at(row: &ExportedRow, col_idx: usize, row_idx: usize) -> ExportResult<&FieldValue> {
     row.fields.get(col_idx).ok_or_else(|| {
         ExportError::SchemaMismatch(format!(
             "row {} has {} fields, but schema requires column index {}",
@@ -2233,7 +2229,7 @@ mod tests {
         let rows: Vec<ExportedRow> = (0..10i64)
             .map(|i| {
                 let group = match i {
-                    2 | 3 | 4 => Some(5u64),
+                    2..=4 => Some(5u64),
                     7 | 8 => Some(9u64),
                     _ => None,
                 };
@@ -2350,7 +2346,7 @@ mod tests {
         let rows: Vec<ExportedRow> = (0..10i64)
             .map(|i| {
                 let group = match i {
-                    2 | 3 | 4 => Some(5u64),
+                    2..=4 => Some(5u64),
                     7 | 8 => Some(9u64),
                     _ => None,
                 };
@@ -2409,7 +2405,7 @@ mod tests {
         let rows: Vec<ExportedRow> = (0..10i64)
             .map(|i| {
                 let group = match i {
-                    2 | 3 | 4 => Some(5u64),
+                    2..=4 => Some(5u64),
                     7 | 8 => Some(9u64),
                     _ => None,
                 };
@@ -2472,7 +2468,7 @@ mod tests {
         let rows: Vec<ExportedRow> = (0..6i64)
             .map(|i| {
                 let group = match i {
-                    2 | 3 | 4 => Some(7u64),
+                    2..=4 => Some(7u64),
                     _ => None,
                 };
                 ExportedRow {

@@ -37,7 +37,7 @@ pub fn merge_hnsw(
     let (delta_vectors, tombstones) = delta.drain();
 
     // Build new graph with all non-tombstoned vectors
-    let mut new_graph = HnswGraph::new(config.clone());
+    let mut new_graph = HnswGraph::new(*config);
 
     // Add base graph vectors (excluding tombstones)
     if let Some(base) = base_graph {
@@ -108,7 +108,7 @@ mod tests {
         let config = HnswConfig::new(4).with_m(4).with_ef_construction(20);
 
         // Build initial base graph
-        let mut base = HnswGraph::new(config.clone());
+        let mut base = HnswGraph::new(config);
         base.insert(1, vec![1.0, 0.0, 0.0, 0.0]);
         base.insert(2, vec![0.0, 1.0, 0.0, 0.0]);
         base.insert(3, vec![0.0, 0.0, 1.0, 0.0]);

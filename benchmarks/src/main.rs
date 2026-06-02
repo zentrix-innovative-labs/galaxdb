@@ -932,7 +932,7 @@ async fn run_coldcache(
             rows_since_flush = 0;
         }
 
-        if (batch_start / batch_size) % 500 == 0 {
+        if (batch_start / batch_size).is_multiple_of(500) {
             let elapsed = start.elapsed().as_secs_f64();
             let rows_done = batch_end;
             let rate = rows_done as f64 / elapsed;
@@ -977,7 +977,7 @@ async fn run_coldcache(
         .map(|entries| {
             entries
                 .filter_map(|e| e.ok())
-                .filter(|e| e.path().extension().map_or(false, |ext| ext == "pax"))
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "pax"))
                 .count()
         })
         .unwrap_or(0);

@@ -533,6 +533,13 @@ mod tests {
         assert_eq!(extracted, tp);
     }
 
+    // The GAUGE_LOCK serializes the two HTTP tests that share the
+    // process-global Prometheus gauge: they must not run their servers
+    // concurrently or one test's gauge mutation would race the other's
+    // assertion. Holding the std Mutex across the test's awaits is the
+    // intended behavior (full-test mutual exclusion), and is safe here
+    // because the lock is never acquired by the server tasks themselves.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn http_health_returns_ok_json() {
         let _guard = GAUGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -554,6 +561,7 @@ mod tests {
         assert_eq!(body["subsystems"]["disk_full"], false);
     }
 
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn http_health_reports_503_when_disk_full() {
         let _guard = GAUGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());

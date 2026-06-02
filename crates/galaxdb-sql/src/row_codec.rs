@@ -358,7 +358,7 @@ mod tests {
             ("id".to_string(), Value::Integer(42)),
             ("name".to_string(), Value::Text("alice".into())),
             ("active".to_string(), Value::Bool(true)),
-            ("score".to_string(), Value::Float(3.14)),
+            ("score".to_string(), Value::Float(3.5)),
             ("bio".to_string(), Value::Null),
         ];
         let bytes = encode_row(&row);
