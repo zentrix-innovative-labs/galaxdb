@@ -2466,6 +2466,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "galaxdb-auth"
+version = "0.1.0"
+dependencies = [
+ "galaxdb-common",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tracing",
+]
+
+[[package]]
 name = "galaxdb-benchmarks"
 version = "0.1.0"
 dependencies = [

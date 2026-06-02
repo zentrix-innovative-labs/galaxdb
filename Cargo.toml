@@ -5,6 +5,7 @@ members = [
     "crates/galaxdb-storage",
     "crates/galaxdb-io",
     "crates/galaxdb-crypto",
+    "crates/galaxdb-auth",
     "crates/galaxdb-vector",
     "crates/galaxdb-sql",
     "crates/galaxdb-wire",
@@ -108,6 +109,7 @@ galaxdb-common = { path = "crates/galaxdb-common" }
 galaxdb-storage = { path = "crates/galaxdb-storage" }
 galaxdb-io = { path = "crates/galaxdb-io" }
 galaxdb-crypto = { path = "crates/galaxdb-crypto" }
+galaxdb-auth = { path = "crates/galaxdb-auth" }
 galaxdb-vector = { path = "crates/galaxdb-vector" }
 galaxdb-sql = { path = "crates/galaxdb-sql" }
 galaxdb-wire = { path = "crates/galaxdb-wire" }
