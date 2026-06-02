@@ -234,6 +234,7 @@ impl Engine {
             checkpoint_size_bytes: 512 * 1024 * 1024,
             checkpoint_interval: Duration::from_secs(60),
         };
+        let wal_path_for_replay = config.data_dir.join("wal.log");
 
         let wal = Arc::new(WalWriter::new(wal_config).map_err(GalaxError::Io)?);
 
@@ -241,6 +242,7 @@ impl Engine {
             config.memtable_size_bytes,
             config.back_pressure_bytes,
         );
+        let art = Arc::new(ArtIndex::new());
 
         let sst_cache_bytes = config.sst_cache_bytes;
 
@@ -289,15 +291,103 @@ impl Engine {
         }
         let next_sst_id_start = max_sst_id.saturating_add(1).max(1);
 
+        // WAL replay (crash recovery). `WalWriter::new` opens the WAL with
+        // O_APPEND and does not truncate, so any records written before a
+        // restart or crash are still on disk. `recover_wal` reads from the
+        // last CHECKPOINT, verifying the XXH3-64 checksum per record and
+        // stopping at the first corruption (records before it are kept).
+        // We apply each recovered record to the memtable + ART so a row
+        // that was committed to the WAL but not yet flushed to an SST is
+        // visible again after reopen.
+        //
+        // This is what makes the engine actually durable across restart
+        // and underpins the crash-safety guarantee: a `put_sync` that
+        // returned Ok is recoverable even if the process dies before the
+        // next flush. Without this step a clean restart silently lost any
+        // WAL-only (not-yet-flushed) rows.
+        //
+        // Timestamps: recovered rows are re-applied under fresh monotonic
+        // timestamps allocated from `next_timestamp`. MVCC ordering among
+        // recovered rows is preserved because `recover_wal` returns records
+        // in WAL (write) order, and we replay them in that order.
+        //
+        // Payload format: production `RowPut` records carry the single-row
+        // `encode_kv` layout (`[key_len:u32][key][value]`), decoded by
+        // `decode_kv`. `RowDelete` records carry the raw key bytes. A
+        // record whose payload does not decode is logged and skipped
+        // rather than aborting recovery, mirroring the WAL's
+        // stop-at-corruption contract without discarding valid prior rows.
+        let recovered = match crate::wal::recover_wal(&wal_path_for_replay) {
+            Ok((records, _next_seq)) => records,
+            Err(e) => {
+                tracing::error!(error = %e, "WAL recovery read failed; starting with empty memtable");
+                Vec::new()
+            }
+        };
+
+        let mut next_ts: u64 = 1;
+        let mut replayed_puts: u64 = 0;
+        let mut replayed_deletes: u64 = 0;
+        for record in &recovered {
+            match record.record_type {
+                WalRecordType::RowPut => {
+                    let Some((key, value)) = decode_kv(&record.payload) else {
+                        tracing::warn!(
+                            seq = record.seq_no,
+                            "skipping RowPut WAL record with undecodable payload during replay"
+                        );
+                        continue;
+                    };
+                    let ts = next_ts;
+                    next_ts += 1;
+                    let active = memtable_mgr.active();
+                    active.put(key.clone(), ts, Some(value));
+                    let shard = (xxhash_rust::xxh3::xxh3_64(&key) % 16) as u8;
+                    art.insert(key.clone(), RowLocation::Memtable { shard, key });
+                    replayed_puts += 1;
+                }
+                WalRecordType::RowDelete => {
+                    let key = record.payload.clone();
+                    let ts = next_ts;
+                    next_ts += 1;
+                    let active = memtable_mgr.active();
+                    active.put(key.clone(), ts, None); // tombstone
+                    let shard = (xxhash_rust::xxh3::xxh3_64(&key) % 16) as u8;
+                    art.insert(key.clone(), RowLocation::Memtable { shard, key });
+                    replayed_deletes += 1;
+                }
+                // Vector delta records are replayed by the vector layer
+                // (galaxdb-vector) from the same WAL, not here. Checkpoints
+                // carry no row payload. BlobRef records belong to the
+                // KV-separation (blob log) layer and are not row data; the
+                // blob log owns their replay. None of these affect the
+                // row memtable, so the row-replay path skips them.
+                WalRecordType::DeltaInsert
+                | WalRecordType::DeltaTombstone
+                | WalRecordType::Checkpoint
+                | WalRecordType::BlobRef => {}
+            }
+        }
+
+        if replayed_puts > 0 || replayed_deletes > 0 {
+            tracing::info!(
+                puts = replayed_puts,
+                deletes = replayed_deletes,
+                "replayed WAL records into memtable on open"
+            );
+        }
+
         Ok(Self {
             config,
             memtable_mgr,
-            art: Arc::new(ArtIndex::new()),
+            art,
             wal,
             sst_registry: RwLock::new(registry),
-            next_timestamp: AtomicU64::new(1),
+            // Resume timestamp allocation past every recovered row so new
+            // writes never reuse a recovered row's logical timestamp.
+            next_timestamp: AtomicU64::new(next_ts.max(1)),
             next_sst_id: AtomicU64::new(next_sst_id_start),
-            row_count: AtomicU64::new(0),
+            row_count: AtomicU64::new(replayed_puts),
             io_scheduler,
             #[cfg(feature = "aegis-tde")]
             tde: None,
