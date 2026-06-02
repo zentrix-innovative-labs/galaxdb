@@ -2545,6 +2545,7 @@ name = "galaxdb-embedded"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "galaxdb-auth",
  "galaxdb-common",
  "galaxdb-io",
  "galaxdb-sidecar",

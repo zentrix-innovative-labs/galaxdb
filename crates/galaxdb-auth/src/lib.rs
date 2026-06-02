@@ -44,6 +44,9 @@ pub use authn::{
     AuthError, AuthStep, Authenticator, Role, RoleId, ScramAuthenticator, SessionContext,
     TrustedLocalAuthenticator, VerifierLookup,
 };
-pub use authz::{Action, AuthzError, Authorizer, ObjectRef, SuperuserBypassAuthorizer};
+pub use authz::{
+    Action, AuthzError, Authorizer, GrantLookup, ObjectRef, SuperuserBypassAuthorizer,
+    TableGrantAuthorizer,
+};
 pub use providers::SecurityProviders;
 pub use scram::{ScramError, ScramVerifier, DEFAULT_ITERATIONS};

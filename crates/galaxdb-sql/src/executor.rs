@@ -265,6 +265,27 @@ pub struct ExecutorContext {
     /// a fake success. The server/embedded layer supplies a real
     /// [`crate::auth_store::AuthStore`] backed by the engine.
     pub auth_store: Option<crate::auth_store::AuthStore>,
+
+    /// The authenticated session, if the connection ran through
+    /// authentication (Req 3). When `Some`, the executor enforces
+    /// authorization at the chokepoint in [`execute_with_context`] before
+    /// any storage access: every plan maps to an
+    /// [`galaxdb_auth::Action`] + [`galaxdb_auth::ObjectRef`] and is
+    /// checked against the [`Self::authorizer`].
+    ///
+    /// When `None` (in-process trusted embedded use without auth, e.g. a
+    /// PyO3 caller that opened the database directly), the check is
+    /// skipped — there is no authenticated principal to evaluate and the
+    /// caller already holds the engine handle. The wire server always
+    /// supplies a session when auth is enabled, so a networked client can
+    /// never bypass the check (Req 3, AC7).
+    pub session: Option<galaxdb_auth::SessionContext>,
+
+    /// The authorizer consulted at the chokepoint. Defaults to the
+    /// grant-backed [`galaxdb_auth::TableGrantAuthorizer`] wired to this
+    /// context's [`Self::auth_store`] when a session is attached. Only
+    /// consulted when [`Self::session`] is `Some`.
+    pub authorizer: Option<Arc<dyn galaxdb_auth::Authorizer>>,
 }
 
 impl ExecutorContext {
@@ -281,6 +302,8 @@ impl ExecutorContext {
             minhash_policy: None,
             vector_backend: None,
             auth_store: None,
+            session: None,
+            authorizer: None,
         }
     }
 }
@@ -444,6 +467,117 @@ fn plan_kind_str(plan: &QueryPlan) -> &'static str {
     }
 }
 
+/// Map a [`QueryPlan`] to the `(Action, ObjectRef)` it must be authorized
+/// for. This is the single source of truth for "what privilege does this
+/// statement require", consulted by the authorization chokepoint in
+/// [`execute_with_context`].
+///
+/// * Data reads (SELECT, point lookup, semantic/hybrid search, time-travel
+///   scans) require [`Action::Select`] on the target table.
+/// * Data writes require the matching [`Action::Insert`]/`Update`/`Delete`
+///   on the target table.
+/// * Schema changes (CREATE/DROP TABLE, ANALYZE) and version tags require
+///   [`Action::Ddl`] (superuser-only in the open-core baseline).
+/// * Role/grant administration requires [`Action::Admin`] (superuser-only).
+/// * BACKUP/RESTORE are operator actions and require [`Action::Admin`].
+fn plan_authz_target(plan: &QueryPlan) -> (galaxdb_auth::Action, galaxdb_auth::ObjectRef) {
+    use galaxdb_auth::{Action, ObjectRef};
+    match plan {
+        // -- Reads (SELECT family) --
+        QueryPlan::PointLookup { table, .. }
+        | QueryPlan::FullScan { table, .. }
+        | QueryPlan::FullScanAtVersion { table, .. }
+        | QueryPlan::SemanticSearch { table, .. }
+        | QueryPlan::HybridSearch { table, .. }
+        | QueryPlan::HybridSearchAtVersion { table, .. } => {
+            (Action::Select, ObjectRef::Table(table.clone()))
+        }
+
+        // -- Writes --
+        QueryPlan::Insert { table, .. } | QueryPlan::BulkInsert { table, .. } => {
+            (Action::Insert, ObjectRef::Table(table.clone()))
+        }
+        QueryPlan::Update { table, .. } => (Action::Update, ObjectRef::Table(table.clone())),
+        QueryPlan::Delete { table, .. } => (Action::Delete, ObjectRef::Table(table.clone())),
+
+        // -- Schema (DDL) --
+        QueryPlan::CreateTable(stmt) => {
+            (Action::Ddl, ObjectRef::Table(stmt.table_name.clone()))
+        }
+        QueryPlan::DropTable { name, .. } => (Action::Ddl, ObjectRef::Table(name.clone())),
+        QueryPlan::Analyze { table } => (Action::Ddl, ObjectRef::Table(table.clone())),
+        QueryPlan::CreateVersionTag(_) => (Action::Ddl, ObjectRef::Cluster),
+        // SHOW EMBEDDING HEALTH reads health for a table (or the whole
+        // server when no table is named): a table-scoped read, or a
+        // cluster-scoped read needing superuser when global.
+        QueryPlan::ShowEmbeddingHealth { table } => match table {
+            Some(t) => (Action::Select, ObjectRef::Table(t.clone())),
+            None => (Action::Select, ObjectRef::Cluster),
+        },
+
+        // -- Operator actions --
+        QueryPlan::Backup { .. } | QueryPlan::Restore { .. } => (Action::Admin, ObjectRef::Cluster),
+
+        // -- Role/grant administration --
+        QueryPlan::CreateRole(_)
+        | QueryPlan::DropRole { .. }
+        | QueryPlan::AlterRolePassword { .. }
+        | QueryPlan::Grant(_)
+        | QueryPlan::Revoke(_) => (Action::Admin, ObjectRef::Cluster),
+    }
+}
+
+/// Enforce authorization for `plan` before any storage access (Req 3, AC3).
+///
+/// When the context carries no [`ExecutorContext::session`] (trusted
+/// in-process embedded use), this is a no-op: there is no authenticated
+/// principal to evaluate and the caller already holds the engine handle.
+///
+/// When a session *is* present, the plan is mapped to an
+/// `(Action, ObjectRef)` via [`plan_authz_target`] and checked against the
+/// authorizer. The authorizer is, in precedence order:
+///
+/// 1. an explicitly-installed [`ExecutorContext::authorizer`], or
+/// 2. the grant-backed [`galaxdb_auth::TableGrantAuthorizer`] built over
+///    the context's [`ExecutorContext::auth_store`] — this reads the
+///    *live* grant set, so a `GRANT`/`REVOKE` committed by an earlier
+///    statement takes effect immediately (Req 3, AC6).
+///
+/// If a session is attached but neither an authorizer nor an auth store is
+/// available, the check **fails closed** (`InsufficientPrivilege`) rather
+/// than allowing unchecked access — a misconfigured server must never
+/// silently skip authorization.
+fn enforce_authorization(plan: &QueryPlan, ctx: &ExecutorContext) -> GalaxResult<()> {
+    use galaxdb_auth::Authorizer as _;
+    let Some(session) = ctx.session.as_ref() else {
+        return Ok(());
+    };
+    let role = &session.role;
+    let (action, object) = plan_authz_target(plan);
+
+    let outcome = if let Some(authz) = ctx.authorizer.as_ref() {
+        authz.check(role, action, &object)
+    } else if let Some(store) = ctx.auth_store.as_ref() {
+        let store = store.clone();
+        let authz = galaxdb_auth::TableGrantAuthorizer::new(Arc::new(
+            move |r: &str, t: &str, a: galaxdb_auth::Action| store.has_grant(r, t, a),
+        ));
+        authz.check(role, action, &object)
+    } else {
+        return Err(GalaxError::InsufficientPrivilege {
+            role: role.id.to_string(),
+            action: action.label(),
+            object: object.label(),
+        });
+    };
+
+    outcome.map_err(|e| GalaxError::InsufficientPrivilege {
+        role: e.role.to_string(),
+        action: e.action,
+        object: e.object,
+    })
+}
+
 /// Execute a query plan against real storage.
 ///
 /// This is the canonical executor entry point. It satisfies every plan
@@ -472,6 +606,14 @@ pub fn execute_with_context(
     let plan_kind = plan_kind_str(plan);
     let span = tracing::info_span!("query.execute", plan = plan_kind);
     let _entered = span.enter();
+
+    // Authorization chokepoint (Req 3, AC3 + AC7). Enforced here — before
+    // the match dispatches to any `exec_*` that touches storage — so the
+    // wire path and the embedded path share one check and a non-privileged
+    // role is rejected with SQLSTATE 42501 before any data is read or
+    // written. A `None` session (trusted in-process embedded use) skips
+    // the check and preserves today's behavior.
+    enforce_authorization(plan, ctx)?;
 
     match plan {
         QueryPlan::CreateTable(stmt) => exec_create_table(stmt, ctx),

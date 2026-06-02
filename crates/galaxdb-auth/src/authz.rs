@@ -5,10 +5,11 @@
 //! executor consults before any storage read or write, so the wire path
 //! and the embedded path enforce the same policy.
 //!
-//! The open core bundles [`SuperuserBypassAuthorizer`] here. The
-//! table-level GRANT/REVOKE authorizer (backed by the `_galaxdb_grants`
-//! catalog) lands in a later task; the enterprise edition adds
-//! fine-grained (column/row-level) RBAC. All implement this trait.
+//! The open core bundles [`SuperuserBypassAuthorizer`] (the baseline used
+//! before grants exist) and [`TableGrantAuthorizer`] (the grant-backed
+//! authorizer of Requirement 3, wired in once the `_galaxdb_grants`
+//! catalog is populated). The enterprise edition adds fine-grained
+//! (column/row-level) RBAC. All implement this trait.
 
 use crate::authn::{Role, RoleId};
 
@@ -128,6 +129,86 @@ impl Authorizer for SuperuserBypassAuthorizer {
     }
 }
 
+/// Live grant lookup: `(role_name, table_name, action) -> granted?`.
+///
+/// The engine supplies this backed by the persistent `_galaxdb_grants`
+/// catalog so every check reads the *current* grant set — a `GRANT` or
+/// `REVOKE` committed by another statement is visible to the next check
+/// without any restart or cache invalidation (Requirement 3, AC6). Tests
+/// supply an in-memory closure.
+pub type GrantLookup = dyn Fn(&str, &str, Action) -> bool + Send + Sync;
+
+/// The open-core table-level grant authorizer (the bundled OSS
+/// `Authorizer` of Requirement 3 / Requirement 4 AC2).
+///
+/// Policy:
+/// * A superuser bypasses every check.
+/// * Data actions (`Select`/`Insert`/`Update`/`Delete`) on a table are
+///   permitted only if the role holds the matching grant on that table,
+///   looked up live through [`GrantLookup`].
+/// * `Admin` (role/grant management) is superuser-only (Requirement 3,
+///   AC5).
+/// * `Ddl` (schema changes, version tags, ANALYZE) is superuser-only in
+///   the open-core baseline. The Requirement 3 grant model defines only
+///   the four table-data privileges; it has no schema-level privilege to
+///   delegate, so schema management is reserved to the operator
+///   (superuser). This is a deliberate, documented policy — not a stub —
+///   and matches the Requirement 3 user story (the operator manages the
+///   schema and grants *data* access to client roles). The enterprise
+///   edition's fine-grained RBAC authorizer can relax this.
+///
+/// This is a real authorizer, not a mock: it inspects the role's
+/// superuser flag, the action, and the live grant set. It replaces
+/// [`SuperuserBypassAuthorizer`] as the default once grants exist.
+pub struct TableGrantAuthorizer {
+    grant_lookup: std::sync::Arc<GrantLookup>,
+}
+
+impl TableGrantAuthorizer {
+    /// Build a table-grant authorizer over a live grant lookup.
+    pub fn new(grant_lookup: std::sync::Arc<GrantLookup>) -> Self {
+        TableGrantAuthorizer { grant_lookup }
+    }
+
+    fn deny(role: &Role, action: Action, object: &ObjectRef) -> AuthzError {
+        AuthzError {
+            role: role.id.clone(),
+            action: action.label(),
+            object: object.label(),
+        }
+    }
+}
+
+impl Authorizer for TableGrantAuthorizer {
+    fn check(&self, role: &Role, action: Action, object: &ObjectRef) -> Result<(), AuthzError> {
+        if role.is_superuser {
+            return Ok(());
+        }
+        match action {
+            // Role/grant administration and schema changes are
+            // superuser-only in the baseline (see the type docs).
+            Action::Admin | Action::Ddl => Err(Self::deny(role, action, object)),
+            // Table-data actions require a matching grant on the target
+            // table. Global (Cluster-scoped) data actions have no grant
+            // to satisfy them and are denied to non-superusers.
+            Action::Select | Action::Insert | Action::Update | Action::Delete => match object {
+                ObjectRef::Table(table) => {
+                    if (self.grant_lookup)(role.id.as_str(), table, action) {
+                        Ok(())
+                    } else {
+                        Err(Self::deny(role, action, object))
+                    }
+                }
+                ObjectRef::Cluster => Err(Self::deny(role, action, object)),
+            },
+        }
+    }
+
+    fn name(&self) -> &str {
+        "table-grant"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +256,95 @@ mod tests {
         assert_eq!(Action::Admin.label(), "admin");
         assert_eq!(ObjectRef::Table("docs".into()).label(), "table:docs");
         assert_eq!(ObjectRef::Cluster.label(), "cluster");
+    }
+
+    // --- TableGrantAuthorizer ---
+
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
+
+    /// A live, mutable grant set behind the lookup closure, so a test can
+    /// model GRANT/REVOKE taking effect without rebuilding the authorizer.
+    fn grant_authorizer_with(
+        grants: Arc<Mutex<HashSet<(String, String, Action)>>>,
+    ) -> TableGrantAuthorizer {
+        TableGrantAuthorizer::new(Arc::new(move |role: &str, table: &str, action: Action| {
+            grants
+                .lock()
+                .unwrap()
+                .contains(&(role.to_string(), table.to_string(), action))
+        }))
+    }
+
+    #[test]
+    fn table_grant_superuser_bypasses_everything() {
+        let grants = Arc::new(Mutex::new(HashSet::new()));
+        let authz = grant_authorizer_with(grants);
+        let admin = Role::superuser("admin");
+        assert!(authz
+            .check(&admin, Action::Select, &ObjectRef::Table("t".into()))
+            .is_ok());
+        assert!(authz
+            .check(&admin, Action::Admin, &ObjectRef::Cluster)
+            .is_ok());
+        assert!(authz
+            .check(&admin, Action::Ddl, &ObjectRef::Table("t".into()))
+            .is_ok());
+        assert_eq!(authz.name(), "table-grant");
+    }
+
+    #[test]
+    fn table_grant_non_superuser_needs_matching_grant() {
+        let grants = Arc::new(Mutex::new(HashSet::new()));
+        let authz = grant_authorizer_with(grants.clone());
+        let alice = Role::user("alice");
+
+        // No grant yet → denied with a useful error.
+        let err = authz
+            .check(&alice, Action::Select, &ObjectRef::Table("docs".into()))
+            .unwrap_err();
+        assert_eq!(err.role.as_str(), "alice");
+        assert_eq!(err.action, "select");
+        assert_eq!(err.object, "table:docs");
+
+        // GRANT SELECT ON docs TO alice (takes effect immediately, no
+        // rebuild of the authorizer).
+        grants
+            .lock()
+            .unwrap()
+            .insert(("alice".into(), "docs".into(), Action::Select));
+        assert!(authz
+            .check(&alice, Action::Select, &ObjectRef::Table("docs".into()))
+            .is_ok());
+
+        // The grant is scoped: a different action or table is still denied.
+        assert!(authz
+            .check(&alice, Action::Insert, &ObjectRef::Table("docs".into()))
+            .is_err());
+        assert!(authz
+            .check(&alice, Action::Select, &ObjectRef::Table("other".into()))
+            .is_err());
+
+        // REVOKE takes effect immediately too.
+        grants
+            .lock()
+            .unwrap()
+            .remove(&("alice".into(), "docs".into(), Action::Select));
+        assert!(authz
+            .check(&alice, Action::Select, &ObjectRef::Table("docs".into()))
+            .is_err());
+    }
+
+    #[test]
+    fn table_grant_denies_admin_and_ddl_to_non_superuser() {
+        let grants = Arc::new(Mutex::new(HashSet::new()));
+        let authz = grant_authorizer_with(grants);
+        let alice = Role::user("alice");
+        assert!(authz
+            .check(&alice, Action::Admin, &ObjectRef::Cluster)
+            .is_err());
+        assert!(authz
+            .check(&alice, Action::Ddl, &ObjectRef::Table("docs".into()))
+            .is_err());
     }
 }

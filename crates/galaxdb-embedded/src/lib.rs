@@ -121,6 +121,15 @@ pub struct Database {
     /// catalog. Carried here so `&self` read-only methods
     /// (`table_exists`, `table_count`) don't need to rebuild it.
     catalog: galaxdb_sql::executor::Catalog,
+    /// The authenticated session this database handle runs statements
+    /// under, if any (Req 3). `None` is trusted in-process embedded use:
+    /// no authenticated principal, so the executor skips authorization
+    /// (today's behavior, preserved for direct PyO3/Rust callers). The
+    /// wire server sets this to the role established by the SCRAM
+    /// handshake (task 6) via [`Database::with_session`] so every
+    /// networked statement is authorization-checked at the executor
+    /// chokepoint (Req 3, AC7).
+    session: Option<galaxdb_auth::SessionContext>,
 }
 
 impl Database {
@@ -146,6 +155,7 @@ impl Database {
             tag_catalog: Arc::new(Mutex::new(TagCatalog::new())),
             vector_indexes: Arc::new(RwLock::new(HashMap::new())),
             catalog: galaxdb_sql::executor::Catalog::new(),
+            session: None,
         })
     }
 
@@ -196,6 +206,34 @@ impl Database {
 
         db.sidecar = Some(Arc::new(mgr));
         Ok(db)
+    }
+
+    /// Attach an authenticated session to this database handle so every
+    /// statement it executes is authorization-checked against the role's
+    /// privileges at the executor chokepoint (Req 3, AC7).
+    ///
+    /// The wire server calls this after a successful SCRAM handshake
+    /// (task 6) so a networked client runs under its authenticated role.
+    /// Without a session (the default), the handle is trusted in-process
+    /// embedded mode and skips authorization — there is no authenticated
+    /// principal and the caller already holds the engine directly.
+    ///
+    /// Consumes and returns `self` for builder-style use.
+    pub fn with_session(mut self, session: galaxdb_auth::SessionContext) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Set (or clear) the authenticated session on an existing handle.
+    /// See [`Database::with_session`].
+    pub fn set_session(&mut self, session: Option<galaxdb_auth::SessionContext>) {
+        self.session = session;
+    }
+
+    /// The role this handle runs statements under, if a session is
+    /// attached.
+    pub fn session_role(&self) -> Option<&galaxdb_auth::Role> {
+        self.session.as_ref().map(|s| &s.role)
     }
 
     /// Synchronous execute — for embedded Rust callers and the Python
@@ -285,6 +323,8 @@ impl Database {
             );
             let mut ctx = ExecutorContext::new(self.engine.clone());
             ctx.catalog = self.catalog.clone();
+            ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+            ctx.session = self.session.clone();
             ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
                 sidecar: self.sidecar.clone(),
                 indexes: self.vector_indexes.clone(),
@@ -307,6 +347,8 @@ impl Database {
 
         let mut ctx = ExecutorContext::new(self.engine.clone());
         ctx.catalog = self.catalog.clone();
+        ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+        ctx.session = self.session.clone();
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
             sidecar: self.sidecar.clone(),
             indexes: self.vector_indexes.clone(),
@@ -719,6 +761,8 @@ impl Database {
 
         let mut ctx = ExecutorContext::new(self.engine.clone());
         ctx.catalog = self.catalog.clone();
+        ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+        ctx.session = self.session.clone();
         ctx.tag_catalog = Some(self.tag_catalog.clone());
         ctx.merkle_dag = Some(self.merkle_dag.clone());
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
@@ -803,11 +847,18 @@ impl Database {
 
     /// Build a fresh `ExecutorContext` that shares this database's
     /// engine, sidecar, tag catalog, merkle DAG, and vector backend.
-    /// The context's catalog is moved in from `self.catalog` and moved
-    /// back after the executor runs so DDL mutations are preserved.
+    ///
+    /// The context's catalog is **cloned** from `self.catalog` (not moved)
+    /// so that if `execute_with_context` returns an error — for example
+    /// the authorization chokepoint rejecting a statement before it runs —
+    /// the caller's early `?` return cannot strand the catalog inside the
+    /// dropped context. On success the caller writes the (possibly DDL-
+    /// mutated) catalog back via `self.catalog = std::mem::take(&mut
+    /// ctx.catalog)`. The clone is cheap: the catalog holds only table
+    /// metadata, not row data.
     fn context(&mut self) -> ExecutorContext {
         let mut ctx = ExecutorContext::new(self.engine.clone());
-        ctx.catalog = std::mem::take(&mut self.catalog);
+        ctx.catalog = self.catalog.clone();
         ctx.sidecar = self.sidecar.clone();
         ctx.merkle_dag = Some(self.merkle_dag.clone());
         ctx.tag_catalog = Some(self.tag_catalog.clone());
@@ -818,6 +869,9 @@ impl Database {
         }));
         // Role/grant DDL persists through the engine-backed auth store.
         ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+        // The authenticated session (if any) drives the executor's
+        // authorization chokepoint. `None` = trusted embedded mode.
+        ctx.session = self.session.clone();
         ctx
     }
 
@@ -3373,5 +3427,180 @@ mod role_grant_tests {
         let store = AuthStore::new(db.engine.clone());
         assert!(store.get_role("alice").is_some());
         assert!(store.has_grant("alice", "docs", Action::Update));
+    }
+}
+
+/// Authorization chokepoint tests (task 5): the executor must reject a
+/// non-privileged role with SQLSTATE `42501` *before* touching storage,
+/// and accept the same statement once the matching grant exists. These
+/// run on the embedded `Database` path; the wire path is covered by the
+/// `tokio-postgres` integration test in task 6 once SCRAM supplies the
+/// session. Both paths funnel through `execute_with_context`, so this
+/// exercises the single shared chokepoint (Req 3, AC7).
+#[cfg(test)]
+mod authz_chokepoint_tests {
+    use super::*;
+    use galaxdb_auth::{Role, SessionContext};
+
+    fn fresh_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        std::mem::forget(dir);
+        Database::open(p.to_str().unwrap()).unwrap()
+    }
+
+    /// Assert a result is an `InsufficientPrivilege` error for `role` on
+    /// the given action label, and that it renders to SQLSTATE 42501.
+    fn assert_denied(res: GalaxResult<QueryResult>, role: &str, action: &str) {
+        match res {
+            Err(GalaxError::InsufficientPrivilege {
+                role: r,
+                action: a,
+                ..
+            }) => {
+                assert_eq!(r, role, "denied role");
+                assert_eq!(a, action, "denied action");
+                assert_eq!(
+                    GalaxError::InsufficientPrivilege {
+                        role: r,
+                        action: a,
+                        object: "x".into()
+                    }
+                    .sqlstate(),
+                    "42501",
+                    "insufficient_privilege must map to SQLSTATE 42501",
+                );
+            }
+            other => panic!("expected InsufficientPrivilege, got {other:?}"),
+        }
+    }
+
+    /// A superuser session (the operator) sets up the schema and a
+    /// non-privileged role; a session for that role is then denied until
+    /// granted.
+    #[test]
+    fn non_privileged_role_is_denied_then_granted_select() {
+        // 1. As superuser: create the table and a plain role.
+        let mut admin = fresh_db().with_session(SessionContext::new(Role::superuser("root")));
+        admin
+            .execute("CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)")
+            .unwrap();
+        admin.execute("INSERT INTO docs VALUES (1, 'hello')").unwrap();
+        admin.execute("CREATE ROLE alice PASSWORD 'pw'").unwrap();
+
+        // 2. A handle for alice over the SAME engine/catalog. We reuse
+        //    the admin handle but swap the session, which is exactly what
+        //    the wire server does per-connection.
+        admin.set_session(Some(SessionContext::new(Role::user("alice"))));
+
+        // alice has no grant on docs → SELECT denied with 42501, before
+        // any row is read.
+        assert_denied(admin.execute("SELECT * FROM docs"), "alice", "select");
+
+        // 3. Grant SELECT (must be done by a superuser). Swap back.
+        admin.set_session(Some(SessionContext::new(Role::superuser("root"))));
+        admin.execute("GRANT SELECT ON docs TO alice").unwrap();
+
+        // 4. Now alice can SELECT — no restart, the grant took effect
+        //    immediately (Req 3, AC6).
+        admin.set_session(Some(SessionContext::new(Role::user("alice"))));
+        let res = admin.execute("SELECT * FROM docs").unwrap();
+        match res {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            other => panic!("expected one row, got {other:?}"),
+        }
+    }
+
+    /// INSERT/UPDATE/DELETE each require their own privilege; a SELECT
+    /// grant does not let alice write.
+    #[test]
+    fn write_privileges_are_distinct() {
+        let mut db = fresh_db().with_session(SessionContext::new(Role::superuser("root")));
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        db.execute("CREATE ROLE bob PASSWORD 'pw'").unwrap();
+        db.execute("GRANT SELECT ON t TO bob").unwrap();
+
+        db.set_session(Some(SessionContext::new(Role::user("bob"))));
+        // SELECT works.
+        db.execute("SELECT * FROM t").unwrap();
+        // INSERT/UPDATE/DELETE denied with the matching action label.
+        assert_denied(db.execute("INSERT INTO t VALUES (2, 20)"), "bob", "insert");
+        assert_denied(db.execute("UPDATE t SET n = 99 WHERE id = 1"), "bob", "update");
+        assert_denied(db.execute("DELETE FROM t WHERE id = 1"), "bob", "delete");
+
+        // Grant INSERT; now INSERT works but UPDATE still denied.
+        db.set_session(Some(SessionContext::new(Role::superuser("root"))));
+        db.execute("GRANT INSERT ON t TO bob").unwrap();
+        db.set_session(Some(SessionContext::new(Role::user("bob"))));
+        db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        assert_denied(db.execute("UPDATE t SET n = 99 WHERE id = 1"), "bob", "update");
+    }
+
+    /// Only a superuser may run CREATE ROLE / GRANT / REVOKE (Req 3, AC5).
+    #[test]
+    fn role_admin_is_superuser_only() {
+        let mut db = fresh_db().with_session(SessionContext::new(Role::superuser("root")));
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE ROLE carol PASSWORD 'pw'").unwrap();
+
+        // carol (non-superuser) cannot administer roles/grants.
+        db.set_session(Some(SessionContext::new(Role::user("carol"))));
+        assert_denied(db.execute("CREATE ROLE mallory PASSWORD 'x'"), "carol", "admin");
+        assert_denied(db.execute("GRANT SELECT ON t TO carol"), "carol", "admin");
+        assert_denied(db.execute("REVOKE SELECT ON t FROM carol"), "carol", "admin");
+        // DDL is also superuser-only in the baseline.
+        assert_denied(
+            db.execute("CREATE TABLE t2 (id INT PRIMARY KEY)"),
+            "carol",
+            "ddl",
+        );
+    }
+
+    /// REVOKE takes effect immediately for the next statement (Req 3, AC6).
+    #[test]
+    fn revoke_takes_effect_without_restart() {
+        let mut db = fresh_db().with_session(SessionContext::new(Role::superuser("root")));
+        db.execute("CREATE TABLE docs (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE ROLE dave PASSWORD 'pw'").unwrap();
+        db.execute("GRANT SELECT ON docs TO dave").unwrap();
+
+        db.set_session(Some(SessionContext::new(Role::user("dave"))));
+        db.execute("SELECT * FROM docs").unwrap();
+
+        // Superuser revokes; dave is immediately denied.
+        db.set_session(Some(SessionContext::new(Role::superuser("root"))));
+        db.execute("REVOKE SELECT ON docs FROM dave").unwrap();
+        db.set_session(Some(SessionContext::new(Role::user("dave"))));
+        assert_denied(db.execute("SELECT * FROM docs"), "dave", "select");
+    }
+
+    /// A handle with no session (trusted embedded use) skips authorization
+    /// entirely — today's behavior for direct PyO3/Rust callers.
+    #[test]
+    fn no_session_skips_authorization() {
+        let mut db = fresh_db(); // no session attached
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+        db.execute("UPDATE t SET n = 7 WHERE id = 1").unwrap();
+        db.execute("SELECT * FROM t").unwrap();
+        db.execute("DELETE FROM t WHERE id = 1").unwrap();
+        // Even role administration works with no session (trusted caller).
+        db.execute("CREATE ROLE anyone PASSWORD 'pw'").unwrap();
+    }
+
+    /// The grant is scoped to its exact table: a SELECT grant on `a` does
+    /// not authorize SELECT on `b`.
+    #[test]
+    fn grants_are_table_scoped() {
+        let mut db = fresh_db().with_session(SessionContext::new(Role::superuser("root")));
+        db.execute("CREATE TABLE a (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE b (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE ROLE eve PASSWORD 'pw'").unwrap();
+        db.execute("GRANT SELECT ON a TO eve").unwrap();
+
+        db.set_session(Some(SessionContext::new(Role::user("eve"))));
+        db.execute("SELECT * FROM a").unwrap();
+        assert_denied(db.execute("SELECT * FROM b"), "eve", "select");
     }
 }

@@ -271,7 +271,11 @@ async fn handle_connection(
                 write_command_complete(&mut writer, &msg).await?;
             }
             Err(e) => {
-                write_error_response(&mut writer, "42000", &format!("{}", e)).await?;
+                // Render the typed engine error to its PostgreSQL SQLSTATE
+                // so standard clients classify it correctly — e.g. a
+                // failed authorization surfaces as `42501`
+                // (insufficient_privilege), not a generic syntax error.
+                write_error_response(&mut writer, e.sqlstate(), &format!("{}", e)).await?;
             }
         }
 
