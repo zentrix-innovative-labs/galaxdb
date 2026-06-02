@@ -254,20 +254,15 @@ impl Default for LsmTree {
 /// because every flush rewrites the L0 footprint.
 ///
 /// Switchable per-engine via `CompactionTrigger::with_l0_strategy`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum L0CompactionStrategy {
     /// Classic LevelDB/RocksDB L0: tiered sorted runs, fire when file
     /// count crosses `l0_file_count_threshold`.
+    #[default]
     Tiered,
     /// SILK-style leveled L0: fire as soon as L0 has more than one
     /// SST, keeping L0 a single sorted run.
     Leveled,
-}
-
-impl Default for L0CompactionStrategy {
-    fn default() -> Self {
-        Self::Tiered
-    }
 }
 
 /// Determines when compaction should be triggered.

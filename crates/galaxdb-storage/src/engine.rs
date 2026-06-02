@@ -1116,7 +1116,7 @@ fn key_range_overlaps_prefix(zone_min: &[u8], zone_max: &[u8], prefix: &[u8]) ->
         return true;
     }
     // Case 1: zone_max strictly precedes prefix lexicographically.
-    if zone_max.as_ref() < prefix {
+    if zone_max < prefix {
         return false;
     }
     // Case 2: zone_min exceeds every possible `prefix..` key. The
@@ -1556,7 +1556,7 @@ mod tests {
         let sst_files: Vec<_> = std::fs::read_dir(engine.data_dir())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "pax"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "pax"))
             .collect();
         assert!(!sst_files.is_empty(), "should have SST files");
 

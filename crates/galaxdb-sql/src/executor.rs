@@ -402,20 +402,12 @@ impl MinHashPolicy {
 // Canonical entry point: execute_with_context
 // ---------------------------------------------------------------------------
 
-/// Execute a query plan against real storage.
-///
-/// This is the canonical executor entry point. It satisfies every plan
-/// variant either by a real operation against [`Engine`] + catalog +
-/// optional subsystems, or by a typed [`GalaxError`] — never a fake
-/// success.
-///
-/// # Return contract
-///
-/// * DDL (`CREATE TABLE`, `DROP TABLE`, `ANALYZE`) → `Ok(ExecuteResult::Ok(msg))`
-/// * DML (`INSERT`, `UPDATE`, `DELETE`, `BULK INSERT`) → `Ok(ExecuteResult::RowCount(n))`
-/// * SELECT, `SHOW EMBEDDING HEALTH`, `SEMANTIC_MATCH` → `Ok(ExecuteResult::Rows{..})`
-/// * Unsupported or missing-prerequisite → `Err(GalaxError::NotYetAvailable { task })`
-/// * Runtime failures (I/O, catalog conflict, checksum, etc.) → `Err(GalaxError)`
+/// A decoded row buffered in memory during scan-and-filter passes:
+/// the raw primary-key bytes paired with the row's `(column, value)`
+/// pairs in catalog order. Used by UPDATE/DELETE rewrite passes and the
+/// `WHERE NOT DUPLICATE` dedup pass.
+type BufferedRow = (Vec<u8>, Vec<(String, Value)>);
+
 /// Human-readable label for a [`QueryPlan`] variant, used as the
 /// `plan` field on the `query.execute` span (task 38.5).
 fn plan_kind_str(plan: &QueryPlan) -> &'static str {
@@ -440,6 +432,20 @@ fn plan_kind_str(plan: &QueryPlan) -> &'static str {
     }
 }
 
+/// Execute a query plan against real storage.
+///
+/// This is the canonical executor entry point. It satisfies every plan
+/// variant either by a real operation against [`Engine`] + catalog +
+/// optional subsystems, or by a typed [`GalaxError`] — never a fake
+/// success.
+///
+/// # Return contract
+///
+/// * DDL (`CREATE TABLE`, `DROP TABLE`, `ANALYZE`) → `Ok(ExecuteResult::Ok(msg))`
+/// * DML (`INSERT`, `UPDATE`, `DELETE`, `BULK INSERT`) → `Ok(ExecuteResult::RowCount(n))`
+/// * SELECT, `SHOW EMBEDDING HEALTH`, `SEMANTIC_MATCH` → `Ok(ExecuteResult::Rows{..})`
+/// * Unsupported or missing-prerequisite → `Err(GalaxError::NotYetAvailable { task })`
+/// * Runtime failures (I/O, catalog conflict, checksum, etc.) → `Err(GalaxError)`
 pub fn execute_with_context(
     plan: &QueryPlan,
     ctx: &mut ExecutorContext,
@@ -836,7 +842,7 @@ fn exec_full_scan(
     // `(primary_key, decoded_row)` rather than projecting as we go,
     // run the dedup pass if needed, then project at the end. Task 35.5.
     let dedup = filter.map(filter_has_not_duplicate).unwrap_or(false);
-    let mut buffered: Vec<(Vec<u8>, Vec<(String, Value)>)> = Vec::new();
+    let mut buffered: Vec<BufferedRow> = Vec::new();
 
     for (key, value_bytes) in ctx.engine.scan_all_with_prefix(Some(prefix_bytes)) {
         if !key.starts_with(prefix_bytes) {
@@ -886,7 +892,7 @@ fn exec_full_scan(
 /// [`galaxdb_versioning::export::apply_dedup_filter`] so `WHERE NOT
 /// DUPLICATE` queries and `CREATE VERSION TAG … FOR TRAINING` exports
 /// pick the same representative per group.
-fn apply_not_duplicate_pass(buffered: &mut Vec<(Vec<u8>, Vec<(String, Value)>)>) {
+fn apply_not_duplicate_pass(buffered: &mut Vec<BufferedRow>) {
     use std::collections::HashMap;
 
     // Pass 1: for each group ID, remember the smallest primary key.
@@ -1027,7 +1033,7 @@ fn exec_full_scan_at_version(
 
     let prefix = format!("{}:", table);
     let dedup = filter.map(filter_has_not_duplicate).unwrap_or(false);
-    let mut buffered: Vec<(Vec<u8>, Vec<(String, Value)>)> = Vec::new();
+    let mut buffered: Vec<BufferedRow> = Vec::new();
 
     for (key, value_bytes, _row_ts) in ctx.engine.scan_all_at(read_ts) {
         if !String::from_utf8_lossy(&key).starts_with(&prefix) {
@@ -1458,7 +1464,7 @@ fn exec_semantic_search(
     let col_names: Vec<String> = table_entry.columns.iter().map(|c| c.name.clone()).collect();
 
     let prefix = format!("{}:", table);
-    let all_rows: Vec<(Vec<u8>, Vec<(String, Value)>)> = ctx.engine.scan_all()
+    let all_rows: Vec<BufferedRow> = ctx.engine.scan_all()
         .into_iter()
         .filter(|(k, _)| String::from_utf8_lossy(k).starts_with(&prefix))
         .map(|(k, v)| {

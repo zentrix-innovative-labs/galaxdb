@@ -43,7 +43,7 @@ fn make_embedding_column(dims: u32, vectors: &[Vec<f32>]) -> ColumnData {
 #[test]
 fn round_trip_single_int32_column() {
     let col = make_int32_column(&[10, 20, 30, 40, 50]);
-    let block = PaxBlock::write(1, 1000, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 1000, std::slice::from_ref(&col)).unwrap();
 
     let serialized = block.serialize().unwrap();
     let deserialized = PaxBlock::deserialize(&serialized).unwrap();
@@ -196,7 +196,7 @@ fn fastpfor_compresses_sequential_integers() {
     // Sequential integers should compress well with delta encoding
     let values: Vec<i32> = (0..100).collect();
     let col = make_int32_column(&values);
-    let block = PaxBlock::write(1, 100, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 100, std::slice::from_ref(&col)).unwrap();
 
     // Verify round-trip
     let serialized = block.serialize().unwrap();
@@ -220,7 +220,7 @@ fn zstd_compresses_repetitive_text() {
     // Repetitive text should compress well with Zstd
     let values: Vec<&str> = (0..50).map(|_| "the quick brown fox jumps over the lazy dog").collect();
     let col = make_text_column(&values);
-    let block = PaxBlock::write(1, 100, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 100, std::slice::from_ref(&col)).unwrap();
 
     // Verify round-trip
     let serialized = block.serialize().unwrap();
@@ -234,7 +234,7 @@ fn fastpfor_handles_negative_deltas() {
     // Decreasing values produce negative deltas
     let values: Vec<i32> = vec![100, 50, 25, 10, 5, 1, 0, -10, -100];
     let col = make_int32_column(&values);
-    let block = PaxBlock::write(1, 100, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 100, std::slice::from_ref(&col)).unwrap();
 
     let serialized = block.serialize().unwrap();
     let deserialized = PaxBlock::deserialize(&serialized).unwrap();
@@ -245,7 +245,7 @@ fn fastpfor_handles_negative_deltas() {
 #[test]
 fn fastpfor_handles_single_value() {
     let col = make_int32_column(&[42]);
-    let block = PaxBlock::write(1, 100, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 100, std::slice::from_ref(&col)).unwrap();
 
     let serialized = block.serialize().unwrap();
     let deserialized = PaxBlock::deserialize(&serialized).unwrap();
@@ -315,7 +315,7 @@ fn round_trip_int64_column() {
         col_type: ColumnType::Int64,
         values: values.iter().map(|v| v.to_le_bytes().to_vec()).collect(),
     };
-    let block = PaxBlock::write(1, 100, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 100, std::slice::from_ref(&col)).unwrap();
     let serialized = block.serialize().unwrap();
     let deserialized = PaxBlock::deserialize(&serialized).unwrap();
     let read_values = deserialized.read_column(0).unwrap();
@@ -329,7 +329,7 @@ fn round_trip_uint32_column() {
         col_type: ColumnType::UInt32,
         values: values.iter().map(|v| v.to_le_bytes().to_vec()).collect(),
     };
-    let block = PaxBlock::write(1, 100, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 100, std::slice::from_ref(&col)).unwrap();
     let serialized = block.serialize().unwrap();
     let deserialized = PaxBlock::deserialize(&serialized).unwrap();
     let read_values = deserialized.read_column(0).unwrap();
@@ -342,7 +342,7 @@ fn round_trip_boolean_column() {
         col_type: ColumnType::Boolean,
         values: vec![vec![1], vec![0], vec![1], vec![1], vec![0]],
     };
-    let block = PaxBlock::write(1, 100, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 100, std::slice::from_ref(&col)).unwrap();
     let serialized = block.serialize().unwrap();
     let deserialized = PaxBlock::deserialize(&serialized).unwrap();
     let read_values = deserialized.read_column(0).unwrap();
@@ -359,7 +359,7 @@ fn round_trip_blob_column() {
             vec![0xDE, 0xAD, 0xBE, 0xEF],
         ],
     };
-    let block = PaxBlock::write(1, 100, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 100, std::slice::from_ref(&col)).unwrap();
     let serialized = block.serialize().unwrap();
     let deserialized = PaxBlock::deserialize(&serialized).unwrap();
     let read_values = deserialized.read_column(0).unwrap();
@@ -376,7 +376,7 @@ fn round_trip_json_column() {
             b"null".to_vec(),
         ],
     };
-    let block = PaxBlock::write(1, 100, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 100, std::slice::from_ref(&col)).unwrap();
     let serialized = block.serialize().unwrap();
     let deserialized = PaxBlock::deserialize(&serialized).unwrap();
     let read_values = deserialized.read_column(0).unwrap();
@@ -390,7 +390,7 @@ fn round_trip_float64_column() {
         col_type: ColumnType::Float64,
         values: values.iter().map(|v| v.to_le_bytes().to_vec()).collect(),
     };
-    let block = PaxBlock::write(1, 100, &[col.clone()]).unwrap();
+    let block = PaxBlock::write(1, 100, std::slice::from_ref(&col)).unwrap();
     let serialized = block.serialize().unwrap();
     let deserialized = PaxBlock::deserialize(&serialized).unwrap();
     let read_values = deserialized.read_column(0).unwrap();

@@ -235,7 +235,7 @@ async fn handle_connection(
         })
         .await
         .map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, format!("worker panic: {e}"))
+            std::io::Error::other(format!("worker panic: {e}"))
         })?;
 
         match result {

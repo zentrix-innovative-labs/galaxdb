@@ -19,7 +19,7 @@ use rand::{Rng, SeedableRng};
 
 use galaxdb_vector::{
     HnswConfig, HnswGraph, DeltaBuffer,
-    cosine_distance, normalize,
+    cosine_distance,
     execute_semantic_match, execute_brute_force_filtered,
     choose_strategy, SemanticMatchConfig, SearchStrategy,
 };
@@ -299,7 +299,7 @@ pub fn run_integration_test() {
 
         // Verify distance ordering is preserved
         let q0 = quantizer.quantize(&vectors[0]);
-        let q1 = quantizer.quantize(&vectors[1]);
+        let _q1 = quantizer.quantize(&vectors[1]);
         let q_same_cluster = quantizer.quantize(&vectors[1]); // same cluster as 0
         let q_diff_cluster = quantizer.quantize(&vectors[500]); // different cluster
 

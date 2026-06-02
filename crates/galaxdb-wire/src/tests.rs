@@ -2,7 +2,6 @@
 
 use crate::messages::*;
 use std::io::Cursor;
-use tokio::io::AsyncWriteExt;
 
 // ── Message encoding tests ─────────────────────────────────────────
 

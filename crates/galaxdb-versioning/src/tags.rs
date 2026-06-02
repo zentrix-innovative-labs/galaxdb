@@ -53,6 +53,14 @@ impl TagCatalog {
     }
 
     /// Create a new version tag.
+    ///
+    /// Takes the full tag descriptor as individual fields rather than a
+    /// struct because each is independently sourced by the executor
+    /// (name from SQL, root/timestamp from the Merkle DAG, pinned blocks
+    /// from the compactor view, training opts from the parser). Grouping
+    /// them into a parameter struct would just move the assembly burden
+    /// to the caller without improving clarity.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_tag(
         &mut self,
         name: String,
