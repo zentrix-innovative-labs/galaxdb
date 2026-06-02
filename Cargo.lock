@@ -2469,9 +2469,15 @@ dependencies = [
 name = "galaxdb-auth"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "galaxdb-common",
+ "hmac",
+ "pbkdf2",
+ "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "subtle",
  "tempfile",
  "thiserror 1.0.69",
  "tracing",
@@ -4774,6 +4780,16 @@ dependencies = [
  "serde_derive",
  "std_prelude",
  "stfu8",
+]
+
+[[package]]
+name = "pbkdf2"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "112d82ceb8c5bf524d9af484d4e4970c9fd5a0cc15ba14ad93dccd28873b0629"
+dependencies = [
+ "digest 0.11.3",
+ "hmac",
 ]
 
 [[package]]

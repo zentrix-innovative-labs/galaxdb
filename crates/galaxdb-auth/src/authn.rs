@@ -213,6 +213,142 @@ impl Authenticator for TrustedLocalAuthenticator {
     }
 }
 
+/// Looks up the stored SCRAM verifier for a role name, returning `None`
+/// if the role does not exist. The engine supplies this backed by the
+/// `_galaxdb_roles` catalog; tests supply an in-memory map.
+pub type VerifierLookup =
+    dyn Fn(&str) -> Option<crate::scram::ScramVerifier> + Send + Sync;
+
+/// SCRAM-SHA-256 authenticator (RFC 5802 / 7677). Verifies a client's
+/// password proof against the stored verifier for the claimed role,
+/// without ever seeing the plaintext password. This is the mechanism
+/// PostgreSQL clients use by default.
+///
+/// Whether the authenticated role is a superuser is decided by the
+/// `is_superuser` lookup the engine supplies (backed by `_galaxdb_roles`).
+pub struct ScramAuthenticator {
+    verifier_lookup: std::sync::Arc<VerifierLookup>,
+    superuser_lookup: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    server_nonce_len: usize,
+}
+
+impl ScramAuthenticator {
+    /// Build a SCRAM authenticator from a verifier lookup (role name →
+    /// stored verifier) and a superuser lookup (role name → is_superuser).
+    pub fn new(
+        verifier_lookup: std::sync::Arc<VerifierLookup>,
+        superuser_lookup: std::sync::Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    ) -> Self {
+        ScramAuthenticator {
+            verifier_lookup,
+            superuser_lookup,
+            server_nonce_len: 18,
+        }
+    }
+}
+
+impl Authenticator for ScramAuthenticator {
+    fn mechanisms(&self) -> &[&str] {
+        &["SCRAM-SHA-256"]
+    }
+
+    fn begin(&self, role_hint: Option<&str>) -> AuthState {
+        AuthState {
+            scratch: Vec::new(),
+            role_hint: role_hint.map(str::to_owned),
+        }
+    }
+
+    fn step(&self, state: &mut AuthState, client_msg: &[u8]) -> AuthStep {
+        use crate::scram;
+
+        // The exchange is two server steps. We track which one we're on by
+        // whether `scratch` already holds our saved context.
+        if state.scratch.is_empty() {
+            // --- Round 1: receive client-first, send server-first. ---
+            let client_first = match std::str::from_utf8(client_msg) {
+                Ok(s) => s,
+                Err(_) => return AuthStep::Fail(AuthError::Malformed("client-first not UTF-8".into())),
+            };
+            let (username, client_nonce, client_first_bare) =
+                match scram::parse_client_first(client_first) {
+                    Ok(t) => t,
+                    Err(e) => return AuthStep::Fail(AuthError::Malformed(e.to_string())),
+                };
+
+            let verifier = match (self.verifier_lookup)(&username) {
+                Some(v) => v,
+                None => return AuthStep::Fail(AuthError::UnknownRole),
+            };
+
+            let server_nonce = scram::generate_nonce(self.server_nonce_len);
+            let combined_nonce = format!("{client_nonce}{server_nonce}");
+            let server_first = scram::server_first_message(&combined_nonce, &verifier);
+
+            // Save context needed in round 2, newline-delimited:
+            //   username \n client_first_bare \n server_first
+            let saved = format!("{username}\n{client_first_bare}\n{server_first}");
+            state.scratch = saved.into_bytes();
+
+            AuthStep::Continue(server_first.into_bytes())
+        } else {
+            // --- Round 2: receive client-final, verify, send server-final. ---
+            let saved = String::from_utf8_lossy(&state.scratch).into_owned();
+            let mut parts = saved.splitn(3, '\n');
+            let username = parts.next().unwrap_or("");
+            let client_first_bare = parts.next().unwrap_or("");
+            let server_first = parts.next().unwrap_or("");
+
+            let verifier = match (self.verifier_lookup)(username) {
+                Some(v) => v,
+                None => return AuthStep::Fail(AuthError::UnknownRole),
+            };
+
+            let client_final = match std::str::from_utf8(client_msg) {
+                Ok(s) => s,
+                Err(_) => return AuthStep::Fail(AuthError::Malformed("client-final not UTF-8".into())),
+            };
+            let (final_nonce, proof, client_final_without_proof) =
+                match scram::parse_client_final(client_final) {
+                    Ok(t) => t,
+                    Err(e) => return AuthStep::Fail(AuthError::Malformed(e.to_string())),
+                };
+
+            // The client must echo our combined nonce (it is embedded in
+            // server_first as `r=<combined>,...`).
+            let expected_nonce = server_first
+                .strip_prefix("r=")
+                .and_then(|s| s.split(',').next())
+                .unwrap_or("");
+            if final_nonce != expected_nonce {
+                return AuthStep::Fail(AuthError::Malformed("nonce mismatch".into()));
+            }
+
+            let auth_message =
+                format!("{client_first_bare},{server_first},{client_final_without_proof}");
+            match scram::verify_and_server_final(&verifier, &auth_message, &proof) {
+                Ok(server_final) => {
+                    let is_super = (self.superuser_lookup)(username);
+                    let role = if is_super {
+                        Role::superuser(username)
+                    } else {
+                        Role::user(username)
+                    };
+                    AuthStep::Success {
+                        role,
+                        final_message: Some(server_final.into_bytes()),
+                    }
+                }
+                Err(_) => AuthStep::Fail(AuthError::InvalidCredentials),
+            }
+        }
+    }
+
+    fn name(&self) -> &str {
+        "scram-sha-256"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +388,121 @@ mod tests {
             other => panic!("expected success, got {other:?}"),
         }
         assert_eq!(auth.name(), "trusted-local");
+    }
+
+    // --- ScramAuthenticator integration over the trait ---
+
+    use crate::scram::ScramVerifier;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD as B64;
+    use std::sync::Arc;
+
+    /// Reference client proof for driving the server authenticator.
+    fn client_proof_for(password: &str, verifier: &ScramVerifier, auth_message: &str) -> Vec<u8> {
+        use hmac::{Hmac, Mac, KeyInit};
+        use sha2::{Digest, Sha256};
+        type H = Hmac<Sha256>;
+        let mut salted = [0u8; 32];
+        pbkdf2::pbkdf2::<H>(password.as_bytes(), &verifier.salt, verifier.iterations, &mut salted)
+            .unwrap();
+        let mut mac = H::new_from_slice(&salted).unwrap();
+        mac.update(b"Client Key");
+        let client_key: [u8; 32] = mac.finalize().into_bytes().into();
+        let stored_key: [u8; 32] = {
+            let mut h = Sha256::new();
+            h.update(client_key);
+            h.finalize().into()
+        };
+        let mut mac = H::new_from_slice(&stored_key).unwrap();
+        mac.update(auth_message.as_bytes());
+        let client_sig: [u8; 32] = mac.finalize().into_bytes().into();
+        (0..32).map(|i| client_key[i] ^ client_sig[i]).collect()
+    }
+
+    fn scram_auth_with(role: &'static str, password: &'static str, is_super: bool) -> ScramAuthenticator {
+        let verifier = ScramVerifier::from_password_with(role, vec![5u8; 16], 4096);
+        let v = verifier.clone();
+        let role_name = role.to_string();
+        let pw_role = role_name.clone();
+        let _ = password;
+        ScramAuthenticator::new(
+            Arc::new(move |name: &str| if name == pw_role { Some(v.clone()) } else { None }),
+            Arc::new(move |name: &str| name == role_name && is_super),
+        )
+    }
+
+    /// Drive the full two-round SCRAM exchange through the Authenticator
+    /// trait, acting as the client.
+    fn run_scram(auth: &ScramAuthenticator, user: &str, password: &str) -> AuthStep {
+        let verifier = ScramVerifier::from_password_with(user, vec![5u8; 16], 4096);
+        let mut state = auth.begin(Some(user));
+
+        let client_nonce = "clientNONCE123456";
+        let client_first = format!("n,,n={user},r={client_nonce}");
+        let client_first_bare = format!("n={user},r={client_nonce}");
+
+        let server_first_bytes = match auth.step(&mut state, client_first.as_bytes()) {
+            AuthStep::Continue(b) => b,
+            other => return other, // UnknownRole etc. surface here
+        };
+        let server_first = String::from_utf8(server_first_bytes).unwrap();
+        let combined = server_first
+            .strip_prefix("r=")
+            .and_then(|s| s.split(',').next())
+            .unwrap()
+            .to_string();
+
+        let without_proof = format!("c=biws,r={combined}");
+        let auth_message = format!("{client_first_bare},{server_first},{without_proof}");
+        let proof = client_proof_for(password, &verifier, &auth_message);
+        let client_final = format!("{without_proof},p={}", B64.encode(&proof));
+
+        auth.step(&mut state, client_final.as_bytes())
+    }
+
+    #[test]
+    fn scram_authenticator_succeeds_with_correct_password() {
+        let auth = scram_auth_with("alice", "alice", false);
+        match run_scram(&auth, "alice", "alice") {
+            AuthStep::Success { role, final_message } => {
+                assert_eq!(role.id.as_str(), "alice");
+                assert!(!role.is_superuser);
+                let sf = String::from_utf8(final_message.unwrap()).unwrap();
+                assert!(sf.starts_with("v="));
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
+        assert_eq!(auth.mechanisms(), &["SCRAM-SHA-256"]);
+        assert_eq!(auth.name(), "scram-sha-256");
+    }
+
+    #[test]
+    fn scram_authenticator_assigns_superuser_flag() {
+        let auth = scram_auth_with("admin", "admin", true);
+        match run_scram(&auth, "admin", "admin") {
+            AuthStep::Success { role, .. } => assert!(role.is_superuser),
+            other => panic!("expected success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scram_authenticator_rejects_wrong_password() {
+        let auth = scram_auth_with("alice", "alice", false);
+        match run_scram(&auth, "alice", "WRONG") {
+            AuthStep::Fail(AuthError::InvalidCredentials) => {}
+            other => panic!("expected InvalidCredentials, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scram_authenticator_rejects_unknown_role() {
+        let auth = scram_auth_with("alice", "alice", false);
+        // The client claims a role the lookup doesn't know.
+        let mut state = auth.begin(Some("bob"));
+        let client_first = "n,,n=bob,r=clientNONCE123456";
+        match auth.step(&mut state, client_first.as_bytes()) {
+            AuthStep::Fail(AuthError::UnknownRole) => {}
+            other => panic!("expected UnknownRole, got {other:?}"),
+        }
     }
 }

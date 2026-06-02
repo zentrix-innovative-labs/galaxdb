@@ -37,10 +37,13 @@ pub mod audit;
 pub mod authn;
 pub mod authz;
 pub mod providers;
+pub mod scram;
 
 pub use audit::{AuditEvent, AuditOutcome, AuditSink, FileAuditSink, NoOpAuditSink};
 pub use authn::{
-    AuthError, AuthStep, Authenticator, Role, RoleId, SessionContext, TrustedLocalAuthenticator,
+    AuthError, AuthStep, Authenticator, Role, RoleId, ScramAuthenticator, SessionContext,
+    TrustedLocalAuthenticator, VerifierLookup,
 };
 pub use authz::{Action, AuthzError, Authorizer, ObjectRef, SuperuserBypassAuthorizer};
 pub use providers::SecurityProviders;
+pub use scram::{ScramError, ScramVerifier, DEFAULT_ITERATIONS};

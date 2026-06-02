@@ -51,6 +51,15 @@ memmap2 = "0.9"
 aes-gcm = "0.10"
 aegis = "0.9"
 
+# SCRAM-SHA-256 authentication (RFC 5802 / 7677). Pure-Rust RustCrypto
+# stack, no OpenSSL. Versions chosen to match crates already in the graph
+# (hmac 0.13 / sha2 0.11) so no duplicate major versions are introduced.
+hmac = "0.13"
+sha2 = "0.11"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+base64 = "0.22"
+subtle = "2.6"
+
 # AWS KMS
 aws-sdk-kms = "1"
 aws-config = "1"
