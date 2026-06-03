@@ -82,6 +82,12 @@ async fn main() {
         .and_then(|i| std::env::args().nth(i + 1))
         .or_else(|| std::env::var("GALAXDB_TLS_KEY").ok());
 
+    // Task 4 (Req 4): optional JSONL security audit log.
+    let audit_log_path = std::env::args()
+        .position(|a| a == "--audit-log")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .or_else(|| std::env::var("GALAXDB_AUDIT_LOG").ok());
+
     let cfg = ServerConfig {
         bind_addr: format!("0.0.0.0:{port}"),
         data_dir,
@@ -96,6 +102,7 @@ async fn main() {
         tls_mode,
         tls_cert_path,
         tls_key_path,
+        audit_log_path,
     };
 
     // Task 40.1: start the HTTP observability server (/health + /metrics)

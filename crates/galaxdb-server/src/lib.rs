@@ -12,7 +12,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::RwLock;
 
-use galaxdb_auth::{Authenticator, AuthStep, Role, ScramAuthenticator, SessionContext};
+use galaxdb_auth::{
+    AuditEvent, AuditOutcome, AuditSink, Authenticator, AuthStep, FileAuditSink, NoOpAuditSink,
+    Role, ScramAuthenticator, SessionContext,
+};
 use galaxdb_embedded::Database;
 use galaxdb_wire::messages::*;
 use galaxdb_wire::pg_catalog;
@@ -70,6 +73,11 @@ pub struct ServerConfig {
     pub tls_cert_path: Option<String>,
     /// Path to the PEM server private key (PKCS#8 / SEC1 / PKCS#1).
     pub tls_key_path: Option<String>,
+    /// Optional path to a JSONL security audit log (Req 4). When set, the
+    /// server records authentication outcomes, authorization denials, and
+    /// role/grant/DDL changes via a [`galaxdb_auth::FileAuditSink`]. When
+    /// `None`, audit events are discarded (no-op).
+    pub audit_log_path: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -86,6 +94,7 @@ impl Default for ServerConfig {
             tls_mode: TlsMode::Disable,
             tls_cert_path: None,
             tls_key_path: None,
+            audit_log_path: None,
         }
     }
 }
@@ -98,6 +107,10 @@ struct AuthPolicy {
     enabled: bool,
     /// The superuser name used in trusted-local mode (`enabled = false`).
     trusted_local_user: String,
+    /// Audit sink for authentication outcomes (login success/failure).
+    /// Shared with the `Database` so auth and authz events land in the
+    /// same place.
+    audit: Arc<dyn AuditSink>,
 }
 
 /// Resolve the initial-superuser credential from config or environment.
@@ -134,22 +147,41 @@ pub async fn start(
         "GalaxDB server started"
     );
 
+    // Task 4 (Req 4): build the security audit sink. A JSONL file when
+    // configured, else a no-op. Shared between the auth path (login
+    // events) and the Database (authz/role-change events) so all security
+    // events land in one place.
+    let audit_sink: Arc<dyn AuditSink> = match config.audit_log_path.as_deref() {
+        Some(path) => {
+            let sink = FileAuditSink::open(path)
+                .unwrap_or_else(|e| panic!("failed to open audit log '{path}': {e}"));
+            tracing::info!(path = %path, "security audit log enabled (JSONL)");
+            Arc::new(sink)
+        }
+        None => Arc::new(NoOpAuditSink),
+    };
+
     let db = Arc::new(RwLock::new(
         // Task 40.1: spawn sidecar when configured. The sidecar binary
         // and model id are optional — scalar SQL works without them.
-        if let (Some(sidecar_bin), Some(model)) = (
-            config.sidecar_binary.as_deref(),
-            config.model_id.as_deref(),
-        ) {
-            tracing::info!(
-                sidecar = %sidecar_bin,
-                model = %model,
-                "opening database with embedding sidecar"
-            );
-            Database::open_with_sidecar(&config.data_dir, sidecar_bin, model)
-                .expect("failed to open database with sidecar")
-        } else {
-            Database::open(&config.data_dir).expect("failed to open database")
+        {
+            let base = if let (Some(sidecar_bin), Some(model)) = (
+                config.sidecar_binary.as_deref(),
+                config.model_id.as_deref(),
+            ) {
+                tracing::info!(
+                    sidecar = %sidecar_bin,
+                    model = %model,
+                    "opening database with embedding sidecar"
+                );
+                Database::open_with_sidecar(&config.data_dir, sidecar_bin, model)
+                    .expect("failed to open database with sidecar")
+            } else {
+                Database::open(&config.data_dir).expect("failed to open database")
+            };
+            // Attach the audit sink so the executor records authz denials
+            // and role/grant/DDL changes (Req 4).
+            base.with_audit_sink(audit_sink.clone())
         },
     ));
 
@@ -205,6 +237,7 @@ pub async fn start(
     let auth_policy = AuthPolicy {
         enabled: config.auth_enabled,
         trusted_local_user: config.trusted_local_user.clone(),
+        audit: audit_sink.clone(),
     };
 
     // Task 7 (Req 2): build the TLS acceptor when TLS is offered. In
@@ -616,6 +649,7 @@ where
     // Round 1: client selects a mechanism and sends client-first.
     let initial = read_sasl_initial_response(reader).await?;
     if !mechanisms.contains(&initial.mechanism.as_str()) {
+        audit_login(auth_policy, user_param.as_deref(), AuditOutcome::Denied);
         reject_auth(
             writer,
             &format!("unsupported SASL mechanism '{}'", initial.mechanism),
@@ -629,6 +663,7 @@ where
         AuthStep::Continue(data) => data,
         AuthStep::Fail(e) => {
             tracing::debug!(error = %e, "SCRAM round 1 failed");
+            audit_login(auth_policy, user_param.as_deref(), AuditOutcome::Denied);
             reject_auth(writer, "authentication failed").await?;
             return Err(AuthOutcome::Rejected);
         }
@@ -652,10 +687,15 @@ where
                 write_auth_sasl_final(writer, &server_final).await?;
             }
             tracing::info!(role = %role.id, superuser = role.is_superuser, "authenticated");
+            auth_policy.audit.record(
+                &AuditEvent::new("auth", "login", AuditOutcome::Allowed)
+                    .with_role(role.id.as_str()),
+            );
             Ok(SessionContext::new(role))
         }
         AuthStep::Fail(e) => {
             tracing::debug!(error = %e, "SCRAM round 2 failed");
+            audit_login(auth_policy, user_param.as_deref(), AuditOutcome::Denied);
             reject_auth(writer, "authentication failed").await?;
             Err(AuthOutcome::Rejected)
         }
@@ -664,6 +704,17 @@ where
             Err(AuthOutcome::Rejected)
         }
     }
+}
+
+/// Record a failed login. The role is the claimed startup `user` (which
+/// may not exist); the generic outcome avoids confirming whether the role
+/// exists.
+fn audit_login(auth_policy: &AuthPolicy, claimed_user: Option<&str>, outcome: AuditOutcome) {
+    let mut event = AuditEvent::new("auth", "login", outcome);
+    if let Some(u) = claimed_user {
+        event = event.with_role(u);
+    }
+    auth_policy.audit.record(&event);
 }
 
 /// Send `ErrorResponse 28P01` (invalid_password). The message is generic

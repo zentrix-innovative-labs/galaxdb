@@ -286,6 +286,15 @@ pub struct ExecutorContext {
     /// context's [`Self::auth_store`] when a session is attached. Only
     /// consulted when [`Self::session`] is `Some`.
     pub authorizer: Option<Arc<dyn galaxdb_auth::Authorizer>>,
+
+    /// Security audit sink (Req 4). When set, the executor records
+    /// authorization denials at the chokepoint and role/grant changes as
+    /// they commit, so security-relevant events land in the configured
+    /// [`galaxdb_auth::AuditSink`] (a JSONL file in OSS, a tamper-evident
+    /// sink in ENT). `None` (the default) discards events — equivalent to
+    /// [`galaxdb_auth::NoOpAuditSink`]. The server/embedded layer supplies
+    /// a real sink when one is configured.
+    pub audit: Option<Arc<dyn galaxdb_auth::AuditSink>>,
 }
 
 impl ExecutorContext {
@@ -304,6 +313,7 @@ impl ExecutorContext {
             auth_store: None,
             session: None,
             authorizer: None,
+            audit: None,
         }
     }
 }
@@ -564,18 +574,62 @@ fn enforce_authorization(plan: &QueryPlan, ctx: &ExecutorContext) -> GalaxResult
         ));
         authz.check(role, action, &object)
     } else {
-        return Err(GalaxError::InsufficientPrivilege {
+        let err = GalaxError::InsufficientPrivilege {
             role: role.id.to_string(),
             action: action.label(),
             object: object.label(),
-        });
+        };
+        audit_authz(ctx, role, action, &object, galaxdb_auth::AuditOutcome::Denied,
+            Some("no authorizer or auth store configured (fail-closed)"));
+        return Err(err);
     };
 
-    outcome.map_err(|e| GalaxError::InsufficientPrivilege {
-        role: e.role.to_string(),
-        action: e.action,
-        object: e.object,
-    })
+    match outcome {
+        Ok(()) => {
+            // Record successful privileged actions (role/grant admin and
+            // schema changes) so the audit trail shows who changed
+            // security state or the schema. High-volume data reads/writes
+            // are intentionally not audited per-row here to keep the hot
+            // path quiet; the chokepoint still records every denial below.
+            if matches!(action, galaxdb_auth::Action::Admin | galaxdb_auth::Action::Ddl) {
+                audit_authz(ctx, role, action, &object,
+                    galaxdb_auth::AuditOutcome::Allowed, None);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            audit_authz(ctx, role, action, &object,
+                galaxdb_auth::AuditOutcome::Denied, None);
+            Err(GalaxError::InsufficientPrivilege {
+                role: e.role.to_string(),
+                action: e.action,
+                object: e.object,
+            })
+        }
+    }
+}
+
+/// Emit an `authz` audit event when an audit sink is configured. A no-op
+/// when `ctx.audit` is `None`, so the hot path is untouched for engines
+/// without auditing.
+fn audit_authz(
+    ctx: &ExecutorContext,
+    role: &galaxdb_auth::Role,
+    action: galaxdb_auth::Action,
+    object: &galaxdb_auth::ObjectRef,
+    outcome: galaxdb_auth::AuditOutcome,
+    detail: Option<&str>,
+) {
+    let Some(sink) = ctx.audit.as_ref() else {
+        return;
+    };
+    let mut event = galaxdb_auth::AuditEvent::new("authz", action.label(), outcome)
+        .with_role(role.id.as_str())
+        .with_object(object.label());
+    if let Some(d) = detail {
+        event = event.with_detail(d);
+    }
+    sink.record(&event);
 }
 
 /// Execute a query plan against real storage.

@@ -130,6 +130,11 @@ pub struct Database {
     /// networked statement is authorization-checked at the executor
     /// chokepoint (Req 3, AC7).
     session: Option<galaxdb_auth::SessionContext>,
+    /// Security audit sink (Req 4). When set, the executor records
+    /// authorization denials and role/grant/DDL changes. `None` discards
+    /// events (no-op). The server attaches a real sink (e.g. a JSONL file)
+    /// when one is configured.
+    audit: Option<Arc<dyn galaxdb_auth::AuditSink>>,
 }
 
 impl Database {
@@ -156,6 +161,7 @@ impl Database {
             vector_indexes: Arc::new(RwLock::new(HashMap::new())),
             catalog: galaxdb_sql::executor::Catalog::new(),
             session: None,
+            audit: None,
         })
     }
 
@@ -228,6 +234,19 @@ impl Database {
     /// See [`Database::with_session`].
     pub fn set_session(&mut self, session: Option<galaxdb_auth::SessionContext>) {
         self.session = session;
+    }
+
+    /// Attach a security audit sink (Req 4) so authorization denials and
+    /// role/grant/DDL changes are recorded. Without one, audit events are
+    /// discarded (no-op). Builder-style; consumes and returns `self`.
+    pub fn with_audit_sink(mut self, sink: Arc<dyn galaxdb_auth::AuditSink>) -> Self {
+        self.audit = Some(sink);
+        self
+    }
+
+    /// Set (or clear) the audit sink on an existing handle.
+    pub fn set_audit_sink(&mut self, sink: Option<Arc<dyn galaxdb_auth::AuditSink>>) {
+        self.audit = sink;
     }
 
     /// The role this handle runs statements under, if a session is
@@ -399,6 +418,7 @@ impl Database {
             ctx.catalog = self.catalog.clone();
             ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
             ctx.session = session.cloned();
+            ctx.audit = self.audit.clone();
             ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
                 sidecar: self.sidecar.clone(),
                 indexes: self.vector_indexes.clone(),
@@ -423,6 +443,7 @@ impl Database {
         ctx.catalog = self.catalog.clone();
         ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
         ctx.session = session.cloned();
+        ctx.audit = self.audit.clone();
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
             sidecar: self.sidecar.clone(),
             indexes: self.vector_indexes.clone(),
@@ -838,6 +859,7 @@ impl Database {
         ctx.catalog = self.catalog.clone();
         ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
         ctx.session = session.cloned();
+        ctx.audit = self.audit.clone();
         ctx.tag_catalog = Some(self.tag_catalog.clone());
         ctx.merkle_dag = Some(self.merkle_dag.clone());
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
@@ -947,6 +969,7 @@ impl Database {
         // The authenticated session (if any) drives the executor's
         // authorization chokepoint. `None` = trusted embedded mode.
         ctx.session = self.session.clone();
+        ctx.audit = self.audit.clone();
         ctx
     }
 

@@ -790,3 +790,94 @@ async fn tls_allow_still_serves_plaintext() {
         .await
         .expect("plaintext DDL under allow mode must succeed");
 }
+
+// ---------------------------------------------------------------------------
+// Req 4: security audit sink wired end-to-end (JSONL file)
+// ---------------------------------------------------------------------------
+
+/// With an audit log configured, the server records authentication
+/// outcomes, authorization denials, and role/grant changes to the JSONL
+/// file. This proves the AuditSink seam is actually wired into the running
+/// server (auth path + executor chokepoint), not just defined.
+#[tokio::test]
+async fn audit_log_records_auth_authz_and_admin_events() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let audit_path = data_dir.path().join("audit.jsonl");
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        data_dir: data_dir.path().to_string_lossy().to_string(),
+        max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
+        auth_enabled: true,
+        trusted_local_user: "galaxdb".to_string(),
+        initial_superuser: Some(("root".to_string(), "rootpw".to_string())),
+        audit_log_path: Some(audit_path.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let (addr, _handle) = start(cfg).await.expect("server failed to bind");
+    let port = addr.port();
+
+    // Superuser creates a table (DDL → Allowed admin/ddl event), a role,
+    // and grants nothing yet.
+    let admin_dsn =
+        format!("host=127.0.0.1 port={port} user=root password=rootpw dbname=galaxdb sslmode=disable");
+    let (admin, admin_conn) = tokio_postgres::connect(&admin_dsn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = admin_conn.await;
+    });
+    admin
+        .simple_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .await
+        .unwrap();
+    admin
+        .simple_query("CREATE ROLE alice PASSWORD 'alicepw'")
+        .await
+        .unwrap();
+
+    // A wrong-password login (Denied auth event).
+    let bad_dsn =
+        format!("host=127.0.0.1 port={port} user=alice password=WRONG dbname=galaxdb sslmode=disable");
+    let _ = tokio_postgres::connect(&bad_dsn, NoTls).await;
+
+    // alice logs in (Allowed auth event) and is denied SELECT (Denied
+    // authz event).
+    let alice_dsn =
+        format!("host=127.0.0.1 port={port} user=alice password=alicepw dbname=galaxdb sslmode=disable");
+    let (alice, alice_conn) = tokio_postgres::connect(&alice_dsn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = alice_conn.await;
+    });
+    let _ = alice.simple_query("SELECT id FROM docs").await; // denied 42501
+
+    // Give the file writes a moment to flush (synchronous, but the bad
+    // login closes async).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let contents = std::fs::read_to_string(&audit_path).expect("audit log must exist");
+    let events: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each audit line is valid JSON"))
+        .collect();
+    assert!(!events.is_empty(), "audit log must contain events");
+
+    let has = |kind: &str, action: &str, outcome: &str| {
+        events.iter().any(|e| {
+            e["kind"] == kind && e["action"] == action && e["outcome"] == outcome
+        })
+    };
+
+    // Auth: root + alice logged in (allowed); alice's wrong password denied.
+    assert!(has("auth", "login", "allowed"), "expected an allowed login event");
+    assert!(has("auth", "login", "denied"), "expected a denied login event");
+    // Authz: DDL by superuser allowed; alice's SELECT without a grant denied.
+    assert!(has("authz", "ddl", "allowed"), "expected an allowed DDL event");
+    assert!(
+        has("authz", "admin", "allowed"),
+        "expected an allowed admin event (CREATE ROLE)"
+    );
+    assert!(
+        has("authz", "select", "denied"),
+        "expected a denied SELECT event for alice"
+    );
+}
