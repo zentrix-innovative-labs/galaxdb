@@ -50,6 +50,7 @@ async fn start_auth_server(
         auth_enabled: true,
         trusted_local_user: "galaxdb".to_string(),
         initial_superuser: Some((superuser.to_string(), password.to_string())),
+        ..Default::default()
     };
     let (addr, _handle) = start(cfg).await.expect("auth server failed to bind");
     (addr.port(), data_dir)
@@ -567,4 +568,225 @@ async fn wire_authz_denied_then_granted() {
         .map(|e| e.code().code().to_string())
         .unwrap_or_default();
     assert_eq!(code, "42501", "non-superuser GRANT must map to 42501, got {code:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: TLS transport encryption (Req 2)
+// ---------------------------------------------------------------------------
+
+/// Generate a self-signed cert+key for `localhost`, write them to PEM
+/// files in `dir`, and return the two paths. Test-only: the cert is not
+/// from a real CA, so the client below uses an accept-any verifier.
+fn write_test_cert(dir: &std::path::Path) -> (String, String) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate self-signed cert");
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+    let cert_path = dir.join("server.crt");
+    let key_path = dir.join("server.key");
+    std::fs::write(&cert_path, cert_pem).unwrap();
+    std::fs::write(&key_path, key_pem).unwrap();
+    (
+        cert_path.to_string_lossy().to_string(),
+        key_path.to_string_lossy().to_string(),
+    )
+}
+
+/// A rustls client config that accepts any server certificate. TEST ONLY —
+/// it disables authentication of the server, which is acceptable here
+/// because the test only verifies that the TLS *channel* is established
+/// and that SCRAM runs inside it, not that PKI validation works.
+fn insecure_tls_connector() -> tokio_postgres_rustls::MakeRustlsConnect {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+
+    #[derive(Debug)]
+    struct AcceptAny;
+    impl ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAny))
+        .with_no_client_auth();
+    tokio_postgres_rustls::MakeRustlsConnect::new(config)
+}
+
+/// `sslmode=require` against a TLS-enabled server: the client negotiates
+/// TLS, completes the handshake, and runs SQL over the encrypted channel.
+#[tokio::test]
+async fn tls_require_connects_over_encrypted_channel() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let data_dir = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = write_test_cert(data_dir.path());
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        data_dir: data_dir.path().to_string_lossy().to_string(),
+        max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
+        tls_mode: galaxdb_wire::tls::TlsMode::Require,
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(key_path),
+        ..Default::default()
+    };
+    let (addr, _handle) = start(cfg).await.expect("tls server failed to bind");
+
+    let conn_str = format!(
+        "host=localhost port={} user=galaxdb dbname=galaxdb sslmode=require",
+        addr.port()
+    );
+    let connector = insecure_tls_connector();
+    let (client, connection) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, connector),
+    )
+    .await
+    .expect("TLS connect timed out")
+    .expect("TLS connect with sslmode=require must succeed");
+
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // Run real SQL over the TLS channel.
+    client
+        .simple_query("CREATE TABLE secure_t (id INTEGER PRIMARY KEY, v TEXT)")
+        .await
+        .expect("DDL over TLS must succeed");
+    client
+        .simple_query("INSERT INTO secure_t (id, v) VALUES (1, 'tls-works')")
+        .await
+        .expect("INSERT over TLS must succeed");
+    let msgs = client
+        .simple_query("SELECT id, v FROM secure_t")
+        .await
+        .unwrap();
+    let rows: Vec<_> = msgs
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("v"), Some("tls-works"));
+}
+
+/// `require` mode must reject a plaintext StartupMessage that arrives
+/// without a prior `SSLRequest` (Req 2 AC3). `tokio-postgres` with
+/// `NoTls` + `sslmode=disable` sends a plaintext startup, which the server
+/// must refuse.
+#[tokio::test]
+async fn tls_require_rejects_plaintext_startup() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let data_dir = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = write_test_cert(data_dir.path());
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        data_dir: data_dir.path().to_string_lossy().to_string(),
+        max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
+        tls_mode: galaxdb_wire::tls::TlsMode::Require,
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(key_path),
+        ..Default::default()
+    };
+    let (addr, _handle) = start(cfg).await.expect("tls server failed to bind");
+
+    // sslmode=disable forces a plaintext StartupMessage with no SSLRequest.
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=galaxdb dbname=galaxdb sslmode=disable",
+        addr.port()
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect attempt timed out");
+
+    assert!(
+        result.is_err(),
+        "require mode must reject a plaintext (no-TLS) connection"
+    );
+}
+
+/// `allow` mode still serves plaintext clients that skip `SSLRequest`,
+/// so existing non-TLS clients keep working (backward compatibility).
+#[tokio::test]
+async fn tls_allow_still_serves_plaintext() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let data_dir = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = write_test_cert(data_dir.path());
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        data_dir: data_dir.path().to_string_lossy().to_string(),
+        max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
+        tls_mode: galaxdb_wire::tls::TlsMode::Allow,
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(key_path),
+        ..Default::default()
+    };
+    let (addr, _handle) = start(cfg).await.expect("server failed to bind");
+
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=galaxdb dbname=galaxdb sslmode=disable",
+        addr.port()
+    );
+    let (client, connection) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("allow mode must still accept plaintext clients");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .simple_query("CREATE TABLE plain_t (id INTEGER PRIMARY KEY)")
+        .await
+        .expect("plaintext DDL under allow mode must succeed");
 }

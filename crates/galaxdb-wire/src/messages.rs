@@ -27,7 +27,35 @@ pub async fn read_startup<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result
     }
 
     let version = reader.read_i32().await?;
+    read_startup_body(reader, len, version).await
+}
 
+/// Parse a StartupMessage when the 8-byte head (length + protocol
+/// version) has already been read off the wire — used after the TLS/SSL
+/// prologue peek in [`crate::tls::peek_ssl_request`], which consumes those
+/// bytes to tell an `SSLRequest` from a real StartupMessage.
+pub async fn read_startup_after_head<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    length: i32,
+    version: i32,
+) -> io::Result<StartupMessage> {
+    let len = length as usize;
+    if !(8..=10240).contains(&len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid startup message length",
+        ));
+    }
+    read_startup_body(reader, len, version).await
+}
+
+/// Shared body parser for a StartupMessage: reads `len - 8` bytes of
+/// null-terminated key/value parameter pairs.
+async fn read_startup_body<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    len: usize,
+    version: i32,
+) -> io::Result<StartupMessage> {
     // Read remaining bytes as null-terminated key-value pairs
     let remaining = len - 8;
     let mut buf = vec![0u8; remaining];

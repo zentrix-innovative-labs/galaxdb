@@ -63,6 +63,25 @@ async fn main() {
     let trusted_local_user = std::env::var("GALAXDB_TRUSTED_LOCAL_USER")
         .unwrap_or_else(|_| "galaxdb".to_string());
 
+    // Task 7 (Req 2): TLS configuration. Mode comes from --tls-mode or
+    // GALAXDB_TLS_MODE (disable|allow|require, default disable); cert and
+    // key paths from --tls-cert/--tls-key or GALAXDB_TLS_CERT/_KEY.
+    let tls_mode_str = std::env::args()
+        .position(|a| a == "--tls-mode")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .or_else(|| std::env::var("GALAXDB_TLS_MODE").ok())
+        .unwrap_or_else(|| "disable".to_string());
+    let tls_mode = galaxdb_wire::tls::TlsMode::parse(&tls_mode_str)
+        .unwrap_or_else(|e| panic!("invalid --tls-mode: {e}"));
+    let tls_cert_path = std::env::args()
+        .position(|a| a == "--tls-cert")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .or_else(|| std::env::var("GALAXDB_TLS_CERT").ok());
+    let tls_key_path = std::env::args()
+        .position(|a| a == "--tls-key")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .or_else(|| std::env::var("GALAXDB_TLS_KEY").ok());
+
     let cfg = ServerConfig {
         bind_addr: format!("0.0.0.0:{port}"),
         data_dir,
@@ -74,6 +93,9 @@ async fn main() {
         // Read from env in `start()` via resolve_initial_superuser; leave
         // None here so the password never sits in an argv-derived struct.
         initial_superuser: None,
+        tls_mode,
+        tls_cert_path,
+        tls_key_path,
     };
 
     // Task 40.1: start the HTTP observability server (/health + /metrics)

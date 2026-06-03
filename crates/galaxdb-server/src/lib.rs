@@ -16,6 +16,7 @@ use galaxdb_auth::{Authenticator, AuthStep, Role, ScramAuthenticator, SessionCon
 use galaxdb_embedded::Database;
 use galaxdb_wire::messages::*;
 use galaxdb_wire::pg_catalog;
+use galaxdb_wire::tls::{self, Prologue, ReexportedTlsAcceptor as TlsAcceptor, TlsMode};
 
 /// Server configuration.
 #[derive(Debug, Clone)]
@@ -59,6 +60,16 @@ pub struct ServerConfig {
     /// tests; production uses the env vars so the password never lands in
     /// a config file in plaintext.
     pub initial_superuser: Option<(String, String)>,
+    /// TLS negotiation mode (task 7, Req 2). `disable` never offers TLS;
+    /// `allow` (default) offers it on `SSLRequest` but also serves
+    /// plaintext; `require` rejects any connection that does not negotiate
+    /// TLS first.
+    pub tls_mode: TlsMode,
+    /// Path to the PEM server certificate chain (leaf first). Required
+    /// when `tls_mode` is `allow` (to actually offer TLS) or `require`.
+    pub tls_cert_path: Option<String>,
+    /// Path to the PEM server private key (PKCS#8 / SEC1 / PKCS#1).
+    pub tls_key_path: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -72,6 +83,9 @@ impl Default for ServerConfig {
             auth_enabled: false,
             trusted_local_user: "galaxdb".to_string(),
             initial_superuser: None,
+            tls_mode: TlsMode::Disable,
+            tls_cert_path: None,
+            tls_key_path: None,
         }
     }
 }
@@ -193,6 +207,36 @@ pub async fn start(
         trusted_local_user: config.trusted_local_user.clone(),
     };
 
+    // Task 7 (Req 2): build the TLS acceptor when TLS is offered. In
+    // `allow`/`require` modes a cert+key are mandatory; a misconfiguration
+    // is a hard startup error (never silently downgraded to plaintext).
+    let tls_acceptor: Option<TlsAcceptor> = match config.tls_mode {
+        TlsMode::Disable => None,
+        TlsMode::Allow | TlsMode::Require => {
+            let cert = config.tls_cert_path.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "tls_mode is '{}' but no tls_cert_path is configured",
+                    config.tls_mode.label()
+                )
+            });
+            let key = config.tls_key_path.as_deref().unwrap_or_else(|| {
+                panic!(
+                    "tls_mode is '{}' but no tls_key_path is configured",
+                    config.tls_mode.label()
+                )
+            });
+            let server_config = tls::load_server_config(cert, key)
+                .expect("failed to load TLS certificate/key");
+            tracing::info!(
+                mode = config.tls_mode.label(),
+                cert = %cert,
+                "TLS enabled (rustls, TLS 1.2/1.3)"
+            );
+            Some(tls::acceptor(server_config))
+        }
+    };
+    let tls_mode = config.tls_mode;
+
     let active = Arc::new(AtomicUsize::new(0));
     let max_connections = config.max_connections;
 
@@ -228,9 +272,12 @@ pub async fn start(
             let counter = active.clone();
             let metrics = metrics.clone();
             let auth_policy = auth_policy.clone();
+            let tls_acceptor = tls_acceptor.clone();
 
             tokio::spawn(async move {
-                if let Err(e) = handle_connection(stream, db, auth_policy).await {
+                if let Err(e) =
+                    handle_prologue(stream, db, auth_policy, tls_acceptor, tls_mode).await
+                {
                     tracing::debug!(peer = %peer, error = %e, "connection closed");
                 }
                 let new_count = counter.fetch_sub(1, Ordering::Relaxed) - 1;
@@ -242,17 +289,98 @@ pub async fn start(
     Ok((local_addr, handle))
 }
 
-async fn handle_connection(
-    stream: TcpStream,
+/// TCP-level connection prologue (task 7, Req 2): handle the optional
+/// PostgreSQL `SSLRequest`/`GSSENCRequest` negotiation that precedes the
+/// StartupMessage, then hand the (possibly TLS-wrapped) stream to the
+/// generic [`serve_connection`].
+///
+/// The 8-byte prologue is read directly off the raw socket rather than
+/// through a `BufReader`: PostgreSQL clients wait for the server's single
+/// `S`/`N` byte before sending anything further, so there is no pipelined
+/// data to strand in a buffer when we upgrade to TLS.
+async fn handle_prologue(
+    mut stream: TcpStream,
     db: Arc<RwLock<Database>>,
     auth_policy: AuthPolicy,
+    tls_acceptor: Option<TlsAcceptor>,
+    tls_mode: TlsMode,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let (read_half, write_half) = stream.into_split();
+    loop {
+        match tls::peek_ssl_request(&mut stream).await? {
+            Prologue::SslRequest => match &tls_acceptor {
+                Some(acceptor) => {
+                    // Accept TLS: reply 'S', complete the rustls handshake,
+                    // and run the rest of the protocol on the encrypted
+                    // stream (SCRAM therefore runs inside TLS — Req 2 AC6).
+                    tls::write_negotiation_reply(&mut stream, true).await?;
+                    let tls_stream = acceptor.accept(stream).await?;
+                    return serve_connection(tls_stream, None, db, auth_policy).await;
+                }
+                None => {
+                    // TLS not configured: decline with 'N'. The client then
+                    // either continues in plaintext (libpq `sslmode=prefer`)
+                    // or disconnects (`sslmode=require`). Read the fresh
+                    // StartupMessage off the plaintext stream.
+                    tls::write_negotiation_reply(&mut stream, false).await?;
+                    return serve_connection(stream, None, db, auth_policy).await;
+                }
+            },
+            Prologue::GssEncRequest => {
+                // GSSAPI encryption is not supported; decline and read the
+                // next prologue packet (the client falls back to SSLRequest
+                // or a plaintext StartupMessage).
+                tls::write_negotiation_reply(&mut stream, false).await?;
+                continue;
+            }
+            Prologue::StartupHead { length, code } => {
+                // A plaintext StartupMessage arrived with no prior TLS.
+                if tls_mode == TlsMode::Require {
+                    // Req 2 AC3: reject — TLS is mandatory.
+                    let mut writer = BufWriter::new(&mut stream);
+                    write_error_response(
+                        &mut writer,
+                        "08P01",
+                        "TLS is required: reconnect with TLS enabled (e.g. sslmode=require)",
+                    )
+                    .await?;
+                    writer.flush().await?;
+                    return Ok(());
+                }
+                return serve_connection(stream, Some((length, code)), db, auth_policy).await;
+            }
+        }
+    }
+}
+
+/// Serve a client connection over an established byte stream — either a
+/// plaintext `TcpStream` or a `TlsStream<TcpStream>`. Generic over the
+/// stream type so the auth handshake and query loop are written once and
+/// shared by both transports (Req 2 AC describing the generic handler).
+///
+/// `startup_head` carries the 8-byte StartupMessage head (length +
+/// protocol version) when it was already consumed by the plaintext
+/// prologue peek; `None` means read the StartupMessage fresh (the case
+/// after a TLS handshake or a declined `SSLRequest`).
+async fn serve_connection<S>(
+    stream: S,
+    startup_head: Option<(i32, i32)>,
+    db: Arc<RwLock<Database>>,
+    auth_policy: AuthPolicy,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: AsyncReadExt + AsyncWriteExt + Unpin + Send,
+{
+    let (read_half, write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut writer = BufWriter::new(write_half);
 
-    // Startup handshake.
-    let startup = read_startup(&mut reader).await?;
+    // Startup handshake. After a TLS upgrade or a declined SSLRequest the
+    // StartupMessage is read fresh; after a plaintext prologue peek the
+    // 8-byte head was already consumed and is supplied here.
+    let startup = match startup_head {
+        Some((length, code)) => read_startup_after_head(&mut reader, length, code).await?,
+        None => read_startup(&mut reader).await?,
+    };
     if startup.protocol_version != PROTOCOL_VERSION {
         write_error_response(&mut writer, "08P01", "unsupported protocol version").await?;
         writer.flush().await?;
