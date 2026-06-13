@@ -5,6 +5,7 @@ members = [
     "crates/galaxdb-storage",
     "crates/galaxdb-io",
     "crates/galaxdb-crypto",
+    "crates/galaxdb-auth",
     "crates/galaxdb-vector",
     "crates/galaxdb-sql",
     "crates/galaxdb-wire",
@@ -49,6 +50,15 @@ memmap2 = "0.9"
 # Encryption
 aes-gcm = "0.10"
 aegis = "0.9"
+
+# SCRAM-SHA-256 authentication (RFC 5802 / 7677). Pure-Rust RustCrypto
+# stack, no OpenSSL. Versions chosen to match crates already in the graph
+# (hmac 0.13 / sha2 0.11) so no duplicate major versions are introduced.
+hmac = "0.13"
+sha2 = "0.11"
+pbkdf2 = { version = "0.13", default-features = false, features = ["hmac"] }
+base64 = "0.22"
+subtle = "2.6"
 
 # AWS KMS
 aws-sdk-kms = "1"
@@ -108,6 +118,7 @@ galaxdb-common = { path = "crates/galaxdb-common" }
 galaxdb-storage = { path = "crates/galaxdb-storage" }
 galaxdb-io = { path = "crates/galaxdb-io" }
 galaxdb-crypto = { path = "crates/galaxdb-crypto" }
+galaxdb-auth = { path = "crates/galaxdb-auth" }
 galaxdb-vector = { path = "crates/galaxdb-vector" }
 galaxdb-sql = { path = "crates/galaxdb-sql" }
 galaxdb-wire = { path = "crates/galaxdb-wire" }

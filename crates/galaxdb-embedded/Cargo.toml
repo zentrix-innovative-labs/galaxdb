@@ -14,6 +14,7 @@ online-tests = []
 [dependencies]
 galaxdb-common.workspace = true
 galaxdb-sql = { path = "../galaxdb-sql" }
+galaxdb-auth = { path = "../galaxdb-auth" }
 galaxdb-storage = { path = "../galaxdb-storage" }
 galaxdb-vector = { path = "../galaxdb-vector" }
 galaxdb-sidecar = { path = "../galaxdb-sidecar" }

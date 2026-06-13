@@ -19,7 +19,7 @@ fn hll_single_value() {
     let mut hll = HyperLogLog::new();
     hll.add_hash(xxhash_rust::xxh3::xxh3_64(b"hello"));
     let est = hll.estimate();
-    assert!(est >= 1 && est <= 3, "expected ~1, got {}", est);
+    assert!((1..=3).contains(&est), "expected ~1, got {}", est);
 }
 
 #[test]
@@ -132,7 +132,7 @@ fn histogram_single_value() {
 fn histogram_bucket_distribution() {
     // 1000 values, 10 buckets → ~100 values per bucket
     let mut values: Vec<Vec<u8>> = (0..=255u8)
-        .flat_map(|v| std::iter::repeat(vec![v]).take(4))
+        .flat_map(|v| std::iter::repeat_n(vec![v], 4))
         .collect();
     // 1024 values total
     values.sort();

@@ -2,7 +2,6 @@
 
 use crate::messages::*;
 use std::io::Cursor;
-use tokio::io::AsyncWriteExt;
 
 // ── Message encoding tests ─────────────────────────────────────────
 
@@ -85,6 +84,99 @@ async fn write_error_response_contains_sqlstate() {
     assert_eq!(buf[0], b'E');
     // Should contain the SQLSTATE code
     assert!(buf.windows(5).any(|w| w == b"42601"));
+}
+
+// ── SASL / SCRAM message encoding + decoding (task 6) ──────────────
+
+#[tokio::test]
+async fn write_auth_sasl_advertises_mechanism() {
+    let mut buf = Vec::new();
+    write_auth_sasl(&mut buf, &["SCRAM-SHA-256"]).await.unwrap();
+    assert_eq!(buf[0], b'R');
+    // body code 10 (SASL) follows the 4-byte length.
+    assert_eq!(&buf[5..9], &10i32.to_be_bytes());
+    // mechanism name is present, null-terminated, with a final list terminator.
+    assert!(buf.windows(13).any(|w| w == b"SCRAM-SHA-256"));
+    assert_eq!(*buf.last().unwrap(), 0, "mechanism list must end with a 0 byte");
+}
+
+#[tokio::test]
+async fn write_auth_sasl_continue_and_final_carry_code_and_data() {
+    let mut cont = Vec::new();
+    write_auth_sasl_continue(&mut cont, b"r=abc,s=salt,i=4096").await.unwrap();
+    assert_eq!(cont[0], b'R');
+    assert_eq!(&cont[5..9], &11i32.to_be_bytes()); // SASL continue
+    assert!(cont.windows(2).any(|w| w == b"r="));
+
+    let mut fin = Vec::new();
+    write_auth_sasl_final(&mut fin, b"v=serversig").await.unwrap();
+    assert_eq!(fin[0], b'R');
+    assert_eq!(&fin[5..9], &12i32.to_be_bytes()); // SASL final
+    assert!(fin.windows(2).any(|w| w == b"v="));
+}
+
+#[tokio::test]
+async fn read_sasl_initial_response_round_trip() {
+    // Build a frontend `p` SASLInitialResponse: mechanism + Int32 len + data.
+    let mechanism = b"SCRAM-SHA-256\0";
+    let payload = b"n,,n=,r=clientnonce";
+    let mut body = Vec::new();
+    body.extend_from_slice(mechanism);
+    body.extend_from_slice(&(payload.len() as i32).to_be_bytes());
+    body.extend_from_slice(payload);
+
+    let mut msg = Vec::new();
+    msg.push(b'p');
+    msg.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    msg.extend_from_slice(&body);
+
+    let mut cur = Cursor::new(msg);
+    let parsed = read_sasl_initial_response(&mut cur).await.unwrap();
+    assert_eq!(parsed.mechanism, "SCRAM-SHA-256");
+    assert_eq!(parsed.initial_response, payload);
+}
+
+#[tokio::test]
+async fn read_sasl_initial_response_handles_no_initial_data() {
+    // resp_len == -1 means "no initial response".
+    let mechanism = b"SCRAM-SHA-256\0";
+    let mut body = Vec::new();
+    body.extend_from_slice(mechanism);
+    body.extend_from_slice(&(-1i32).to_be_bytes());
+
+    let mut msg = Vec::new();
+    msg.push(b'p');
+    msg.extend_from_slice(&((body.len() + 4) as i32).to_be_bytes());
+    msg.extend_from_slice(&body);
+
+    let mut cur = Cursor::new(msg);
+    let parsed = read_sasl_initial_response(&mut cur).await.unwrap();
+    assert_eq!(parsed.mechanism, "SCRAM-SHA-256");
+    assert!(parsed.initial_response.is_empty());
+}
+
+#[tokio::test]
+async fn read_sasl_response_round_trip() {
+    let payload = b"c=biws,r=combined,p=cHJvb2Y=";
+    let mut msg = Vec::new();
+    msg.push(b'p');
+    msg.extend_from_slice(&((payload.len() + 4) as i32).to_be_bytes());
+    msg.extend_from_slice(payload);
+
+    let mut cur = Cursor::new(msg);
+    let data = read_sasl_response(&mut cur).await.unwrap();
+    assert_eq!(data, payload);
+}
+
+#[tokio::test]
+async fn read_sasl_initial_response_rejects_wrong_message_type() {
+    // A 'Q' message where a 'p' is expected must error, not misparse.
+    let mut msg = Vec::new();
+    msg.push(b'Q');
+    msg.extend_from_slice(&8i32.to_be_bytes());
+    msg.extend_from_slice(b"foo\0");
+    let mut cur = Cursor::new(msg);
+    assert!(read_sasl_initial_response(&mut cur).await.is_err());
 }
 
 // ── Startup message parsing ────────────────────────────────────────

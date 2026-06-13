@@ -61,6 +61,12 @@ pub struct SstBlockIndex {
     pub entries: Vec<BlockIndexEntry>,
 }
 
+impl Default for SstBlockIndex {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SstBlockIndex {
     pub fn new() -> Self {
         Self { entries: Vec::new() }

@@ -452,8 +452,8 @@ async fn recovery_with_corrupt_records() {
     // Recovery should return only the first 2 records (stops at first checksum failure)
     let (records, next_seq) = recover_wal(&wal_path).unwrap();
     assert_eq!(records.len(), 2);
-    assert_eq!(records[0].payload, format!("record-0").into_bytes());
-    assert_eq!(records[1].payload, format!("record-1").into_bytes());
+    assert_eq!(records[0].payload, b"record-0".to_vec());
+    assert_eq!(records[1].payload, b"record-1".to_vec());
     // next_seq should be based on the max seq_no seen (which is 2)
     assert_eq!(next_seq, 3);
 
@@ -476,7 +476,7 @@ async fn recovery_from_nonexistent_file() {
 async fn recovery_from_empty_file() {
     let dir = tempfile::tempdir().unwrap();
     let wal_path = dir.path().join("empty.wal");
-    std::fs::write(&wal_path, &[]).unwrap();
+    std::fs::write(&wal_path, []).unwrap();
 
     let (records, next_seq) = recover_wal(&wal_path).unwrap();
     assert!(records.is_empty());

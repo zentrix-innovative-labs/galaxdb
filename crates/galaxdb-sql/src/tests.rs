@@ -447,3 +447,119 @@ fn parse_where_not_duplicate_composed_with_and() {
     };
     assert!(id.value.eq_ignore_ascii_case("DUPLICATE"));
 }
+
+// ── Role / grant DDL parsing (task 4) ──────────────────────────────
+
+#[test]
+fn parse_create_role_minimal() {
+    let stmts = parse("CREATE ROLE alice").unwrap();
+    match &stmts[0] {
+        AuroraStatement::CreateRole(s) => {
+            assert_eq!(s.name, "alice");
+            assert!(s.password.is_none());
+            assert!(!s.is_superuser);
+        }
+        other => panic!("expected CreateRole, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_create_role_with_password_and_superuser() {
+    let stmts = parse("CREATE ROLE admin PASSWORD 'secret' SUPERUSER").unwrap();
+    match &stmts[0] {
+        AuroraStatement::CreateRole(s) => {
+            assert_eq!(s.name, "admin");
+            assert_eq!(s.password.as_deref(), Some("secret"));
+            assert!(s.is_superuser);
+        }
+        other => panic!("expected CreateRole, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_create_role_password_only() {
+    let stmts = parse("CREATE ROLE bob PASSWORD 'pw123'").unwrap();
+    match &stmts[0] {
+        AuroraStatement::CreateRole(s) => {
+            assert_eq!(s.name, "bob");
+            assert_eq!(s.password.as_deref(), Some("pw123"));
+            assert!(!s.is_superuser);
+        }
+        other => panic!("expected CreateRole, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_drop_role() {
+    match &parse("DROP ROLE alice").unwrap()[0] {
+        AuroraStatement::DropRole { name, if_exists } => {
+            assert_eq!(name, "alice");
+            assert!(!if_exists);
+        }
+        other => panic!("expected DropRole, got {other:?}"),
+    }
+    match &parse("DROP ROLE IF EXISTS ghost").unwrap()[0] {
+        AuroraStatement::DropRole { name, if_exists } => {
+            assert_eq!(name, "ghost");
+            assert!(if_exists);
+        }
+        other => panic!("expected DropRole, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_alter_role_password() {
+    match &parse("ALTER ROLE alice PASSWORD 'newpw'").unwrap()[0] {
+        AuroraStatement::AlterRolePassword { name, password } => {
+            assert_eq!(name, "alice");
+            assert_eq!(password, "newpw");
+        }
+        other => panic!("expected AlterRolePassword, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_grant_and_revoke() {
+    match &parse("GRANT SELECT ON docs TO alice").unwrap()[0] {
+        AuroraStatement::Grant(g) => {
+            assert_eq!(g.privilege, Privilege::Select);
+            assert_eq!(g.table, "docs");
+            assert_eq!(g.role, "alice");
+        }
+        other => panic!("expected Grant, got {other:?}"),
+    }
+    match &parse("REVOKE DELETE ON docs FROM alice").unwrap()[0] {
+        AuroraStatement::Revoke(g) => {
+            assert_eq!(g.privilege, Privilege::Delete);
+            assert_eq!(g.table, "docs");
+            assert_eq!(g.role, "alice");
+        }
+        other => panic!("expected Revoke, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_grant_all_privileges() {
+    for (sql, expect) in [
+        ("GRANT SELECT ON t TO r", Privilege::Select),
+        ("GRANT INSERT ON t TO r", Privilege::Insert),
+        ("GRANT UPDATE ON t TO r", Privilege::Update),
+        ("GRANT DELETE ON t TO r", Privilege::Delete),
+    ] {
+        match &parse(sql).unwrap()[0] {
+            AuroraStatement::Grant(g) => assert_eq!(g.privilege, expect),
+            other => panic!("expected Grant for {sql}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn parse_grant_unknown_privilege_errors() {
+    let err = parse("GRANT TRUNCATE ON t TO r").unwrap_err();
+    assert!(matches!(err, GalaxError::SqlParse { .. }));
+}
+
+#[test]
+fn parse_create_role_without_name_errors() {
+    assert!(parse("CREATE ROLE").is_err());
+}

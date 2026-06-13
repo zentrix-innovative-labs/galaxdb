@@ -27,7 +27,35 @@ pub async fn read_startup<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result
     }
 
     let version = reader.read_i32().await?;
+    read_startup_body(reader, len, version).await
+}
 
+/// Parse a StartupMessage when the 8-byte head (length + protocol
+/// version) has already been read off the wire — used after the TLS/SSL
+/// prologue peek in [`crate::tls::peek_ssl_request`], which consumes those
+/// bytes to tell an `SSLRequest` from a real StartupMessage.
+pub async fn read_startup_after_head<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    length: i32,
+    version: i32,
+) -> io::Result<StartupMessage> {
+    let len = length as usize;
+    if !(8..=10240).contains(&len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid startup message length",
+        ));
+    }
+    read_startup_body(reader, len, version).await
+}
+
+/// Shared body parser for a StartupMessage: reads `len - 8` bytes of
+/// null-terminated key/value parameter pairs.
+async fn read_startup_body<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    len: usize,
+    version: i32,
+) -> io::Result<StartupMessage> {
     // Read remaining bytes as null-terminated key-value pairs
     let remaining = len - 8;
     let mut buf = vec![0u8; remaining];
@@ -86,6 +114,142 @@ pub async fn write_auth_ok<W: AsyncWriteExt + Unpin>(writer: &mut W) -> io::Resu
     writer.write_i32(8).await?; // length
     writer.write_i32(0).await?; // auth ok
     Ok(())
+}
+
+/// Write AuthenticationSASL (R, code 10): advertise the SASL mechanisms
+/// the server offers. Body layout (after the `R` byte + length):
+/// `Int32(10)` then each mechanism name null-terminated, then a final
+/// zero byte terminating the list (PostgreSQL frontend/backend protocol).
+pub async fn write_auth_sasl<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    mechanisms: &[&str],
+) -> io::Result<()> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&10i32.to_be_bytes()); // SASL
+    for m in mechanisms {
+        body.extend_from_slice(m.as_bytes());
+        body.push(0);
+    }
+    body.push(0); // terminate the mechanism list
+    writer.write_u8(b'R').await?;
+    writer.write_i32((body.len() + 4) as i32).await?;
+    writer.write_all(&body).await?;
+    Ok(())
+}
+
+/// Write AuthenticationSASLContinue (R, code 11): carries the server's
+/// SASL challenge (the SCRAM `server-first-message`).
+pub async fn write_auth_sasl_continue<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+) -> io::Result<()> {
+    writer.write_u8(b'R').await?;
+    writer.write_i32((data.len() + 8) as i32).await?;
+    writer.write_i32(11).await?; // SASL continue
+    writer.write_all(data).await?;
+    Ok(())
+}
+
+/// Write AuthenticationSASLFinal (R, code 12): carries the SCRAM
+/// `server-final-message` (the server signature) sent just before
+/// AuthenticationOk.
+pub async fn write_auth_sasl_final<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+) -> io::Result<()> {
+    writer.write_u8(b'R').await?;
+    writer.write_i32((data.len() + 8) as i32).await?;
+    writer.write_i32(12).await?; // SASL final
+    writer.write_all(data).await?;
+    Ok(())
+}
+
+/// A frontend SASL `p` message split into its mechanism (only present on
+/// the initial response) and the SASL payload bytes.
+#[derive(Debug, Clone)]
+pub struct SaslInitialResponse {
+    /// The SASL mechanism the client selected (e.g. `SCRAM-SHA-256`).
+    pub mechanism: String,
+    /// The client's initial SASL response (the SCRAM `client-first-message`).
+    pub initial_response: Vec<u8>,
+}
+
+/// Read a frontend SASLInitialResponse (`p`) message. Layout after the
+/// `p` byte + length: a null-terminated mechanism name, an `Int32`
+/// initial-response length (`-1` = none), then that many payload bytes.
+pub async fn read_sasl_initial_response<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> io::Result<SaslInitialResponse> {
+    let msg_type = reader.read_u8().await?;
+    if msg_type != b'p' {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected SASL 'p' message, got '{}'", msg_type as char),
+        ));
+    }
+    let len = reader.read_i32().await? as usize;
+    if !(5..=1_000_000).contains(&len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid SASL initial-response length",
+        ));
+    }
+    let mut buf = vec![0u8; len - 4];
+    reader.read_exact(&mut buf).await?;
+
+    // Null-terminated mechanism name.
+    let nul = buf
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "SASL: unterminated mechanism"))?;
+    let mechanism = String::from_utf8_lossy(&buf[..nul]).to_string();
+    let rest = &buf[nul + 1..];
+    if rest.len() < 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "SASL: missing initial-response length",
+        ));
+    }
+    let resp_len = i32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    let initial_response = if resp_len < 0 {
+        Vec::new()
+    } else {
+        let n = resp_len as usize;
+        if rest.len() < 4 + n {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SASL: initial-response shorter than declared",
+            ));
+        }
+        rest[4..4 + n].to_vec()
+    };
+    Ok(SaslInitialResponse {
+        mechanism,
+        initial_response,
+    })
+}
+
+/// Read a frontend SASLResponse (`p`) message. The entire payload after
+/// the `p` byte + length is the SASL data (the SCRAM
+/// `client-final-message`).
+pub async fn read_sasl_response<R: AsyncReadExt + Unpin>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let msg_type = reader.read_u8().await?;
+    if msg_type != b'p' {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected SASL 'p' message, got '{}'", msg_type as char),
+        ));
+    }
+    let len = reader.read_i32().await? as usize;
+    if !(4..=1_000_000).contains(&len) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid SASL response length",
+        ));
+    }
+    let mut buf = vec![0u8; len - 4];
+    reader.read_exact(&mut buf).await?;
+    Ok(buf)
 }
 
 /// Write a ParameterStatus (S) message.

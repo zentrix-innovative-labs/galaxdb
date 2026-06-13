@@ -61,6 +61,12 @@ pub struct EmbeddingTracker {
     current_model_version: RwLock<String>,
 }
 
+impl Default for EmbeddingTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EmbeddingTracker {
     pub fn new() -> Self {
         Self {
@@ -124,7 +130,7 @@ impl EmbeddingTracker {
 
     /// Check if a row's embedding is stale.
     pub fn is_stale(&self, table: &str, row_id: u64) -> bool {
-        self.get_meta(table, row_id).map_or(false, |m| m.stale)
+        self.get_meta(table, row_id).is_some_and(|m| m.stale)
     }
 
     /// Get all stale row IDs for a table (for re-embedding queue).
