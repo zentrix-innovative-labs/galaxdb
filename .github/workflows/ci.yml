@@ -124,6 +124,16 @@ jobs:
       - name: Build release server
         run: cargo build --release -p galaxdb-server
 
+      - name: Create and activate a virtualenv
+        # `maturin develop` requires an active virtualenv/conda env to
+        # install the built extension into. `actions/setup-python` gives a
+        # bare interpreter with none, so create one and export it for all
+        # subsequent steps via GITHUB_PATH + VIRTUAL_ENV.
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+
       - name: Install Python test deps
         run: |
           python -m pip install --upgrade pip
