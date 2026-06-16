@@ -1,0 +1,190 @@
+=== rustc/cargo versions ===
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+psql (PostgreSQL) 16.14 (Ubuntu 16.14-0ubuntu0.24.04.1)
+=== uname / cpu / mem ===
+Linux ip-172-31-8-213 6.17.0-1017-aws #17~24.04.1-Ubuntu SMP Tue May 26 21:30:32 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+16
+MemTotal:       32308520 kB
+=== release build: galaxdb-server ===
+=== generating a self-signed TLS cert for the TLS leg ===
+=== starting the real galaxdb-server (--auth, SCRAM, TLS allow, audit log) ===
+=== waiting for the server to report listening ===
+--- server startup log ---
+{"timestamp":"2026-06-16T20:09:05.924414Z","level":"INFO","fields":{"message":"HTTP observability server listening (/health, /metrics)","addr":"0.0.0.0:9090"},"target":"galaxdb_server","filename":"crates/galaxdb-server/src/main.rs","line_number":117,"threadId":"ThreadId(1)"}
+GalaxDB observability listening on 0.0.0.0:9090
+{"timestamp":"2026-06-16T20:09:05.924460Z","level":"INFO","fields":{"message":"GalaxDB server started","addr":"0.0.0.0:5433","data_dir":"/mnt/nvme/live-data"},"target":"galaxdb_server","filename":"crates/galaxdb-server/src/lib.rs","line_number":144,"threadId":"ThreadId(1)"}
+{"timestamp":"2026-06-16T20:09:05.924492Z","level":"INFO","fields":{"message":"security audit log enabled (JSONL)","path":"/mnt/nvme/live-audit.jsonl"},"target":"galaxdb_server","filename":"crates/galaxdb-server/src/lib.rs","line_number":158,"threadId":"ThreadId(1)"}
+{"timestamp":"2026-06-16T20:09:05.924596Z","level":"INFO","fields":{"message":"selected I/O backend","backend":"IoUring"},"target":"galaxdb_io","filename":"crates/galaxdb-io/src/lib.rs","line_number":36,"threadId":"ThreadId(1)"}
+{"timestamp":"2026-06-16T20:09:05.924715Z","level":"INFO","fields":{"message":"IoUringScheduler created with HP and BK queues","queue_depth":256},"target":"galaxdb_io::uring_scheduler","filename":"crates/galaxdb-io/src/uring_scheduler.rs","line_number":150,"threadId":"ThreadId(1)"}
+{"timestamp":"2026-06-16T20:09:05.924726Z","level":"INFO","fields":{"message":"storage engine I/O scheduler selected","backend":"IoUring"},"target":"galaxdb_storage::engine","filename":"crates/galaxdb-storage/src/engine.rs","line_number":257,"threadId":"ThreadId(1)"}
+{"timestamp":"2026-06-16T20:09:05.928345Z","level":"INFO","fields":{"message":"auth enabled: provisioned initial superuser on empty catalog","superuser":"root"},"target":"galaxdb_server","filename":"crates/galaxdb-server/src/lib.rs","line_number":207,"threadId":"ThreadId(19)"}
+{"timestamp":"2026-06-16T20:09:05.928391Z","level":"INFO","fields":{"message":"authentication: SCRAM-SHA-256 required on every connection"},"target":"galaxdb_server","filename":"crates/galaxdb-server/src/lib.rs","line_number":226,"threadId":"ThreadId(1)"}
+{"timestamp":"2026-06-16T20:09:05.928661Z","level":"INFO","fields":{"message":"TLS enabled (rustls, TLS 1.2/1.3)","mode":"allow","cert":"/mnt/nvme/live-server.crt"},"target":"galaxdb_server","filename":"crates/galaxdb-server/src/lib.rs","line_number":263,"threadId":"ThreadId(1)"}
+{"timestamp":"2026-06-16T20:09:05.928680Z","level":"INFO","fields":{"message":"GalaxDB wire-protocol server listening","addr":"0.0.0.0:5433"},"target":"galaxdb_server","filename":"crates/galaxdb-server/src/main.rs","line_number":121,"threadId":"ThreadId(1)"}
+GalaxDB server listening on 0.0.0.0:5433
+
+################ LIVE CRUD WORKLOAD (real psql over TCP) ################
+
+>>> [root/plaintext] CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price FLOAT, city TEXT)
+CREATE TABLE products
+
+>>> [root] INSERT INTO products (id, name, price, city) VALUES (1, 'espresso', 3.50, 'rome')
+OK 1
+
+>>> [root] INSERT INTO products (id, name, price, city) VALUES (2, 'latte', 4.25, 'milan')
+OK 1
+
+>>> [root] INSERT INTO products (id, name, price, city) VALUES (3, 'mocha', 4.75, 'rome')
+OK 1
+
+>>> [root] INSERT INTO products (id, name, price, city) VALUES (4, 'cortado', 3.95, 'madrid')
+OK 1
+
+>>> [root: full scan] SELECT id, name, price, city FROM products
+ id |   name   | price |  city  
+----+----------+-------+--------
+ 1  | espresso | 3.5   | rome
+ 2  | latte    | 4.25  | milan
+ 3  | mocha    | 4.75  | rome
+ 4  | cortado  | 3.95  | madrid
+(4 rows)
+
+
+>>> [root: WHERE filter] SELECT id, name FROM products WHERE price > 4.0
+ id | name  
+----+-------
+ 2  | latte
+ 3  | mocha
+(2 rows)
+
+
+>>> [root: point lookup] SELECT id, name FROM products WHERE id = 2
+ id | name  
+----+-------
+ 2  | latte
+(1 row)
+
+
+>>> [root: UPDATE WHERE] UPDATE products SET price = 9.99 WHERE id = 3
+OK 1
+
+>>> [root: verify update] SELECT id, name, price FROM products WHERE id = 3
+ id | name  | price 
+----+-------+-------
+ 3  | mocha | 9.99
+(1 row)
+
+
+>>> [root: DELETE WHERE] DELETE FROM products WHERE id = 1
+OK 1
+
+>>> [root: verify delete] SELECT id, name FROM products
+ id |  name   
+----+---------
+ 2  | latte
+ 3  | mocha
+ 4  | cortado
+(3 rows)
+
+
+################ SECONDARY INDEX ################
+
+>>> [root: CREATE INDEX] CREATE INDEX idx_city ON products (city)
+CREATE INDEX idx_city ON products (city): 3 rows indexed
+
+>>> [root: index-accelerated SELECT] SELECT id, name, city FROM products WHERE city = 'rome'
+ id | name  | city 
+----+-------+------
+ 3  | mocha | rome
+(1 row)
+
+
+>>> [root: DROP INDEX] DROP INDEX idx_city
+DROP INDEX idx_city
+
+################ TLS leg (sslmode=require, real rustls handshake) ################
+
+>>> [root/TLS: DDL+DML over TLS] CREATE TABLE secure_t (id INTEGER PRIMARY KEY, v TEXT)
+CREATE TABLE secure_t
+
+>>> [root/TLS] INSERT INTO secure_t (id, v) VALUES (1, 'tls-works')
+OK 1
+
+>>> [root/TLS] SELECT id, v FROM secure_t
+ id |     v     
+----+-----------
+ 1  | tls-works
+(1 row)
+
+
+################ RBAC: 42501 denial then GRANT ################
+
+>>> [root: CREATE ROLE alice] CREATE ROLE alice PASSWORD 'alicepw'
+CREATE ROLE alice
+
+>>> [alice: SELECT before grant — expect ERROR 42501]
+ERROR:  permission denied: role 'alice' may not select on table:products
+
+>>> [root: GRANT SELECT] GRANT SELECT ON products TO alice
+GRANT select ON products TO alice
+
+>>> [alice: SELECT after grant — expect rows]
+ id |  name   
+----+---------
+ 2  | latte
+ 3  | mocha
+ 4  | cortado
+(3 rows)
+
+
+>>> [alice: GRANT as non-superuser — expect ERROR 42501]
+ERROR:  permission denied: role 'alice' may not admin on cluster
+
+################ DROP TABLE ################
+
+>>> [root: DROP TABLE products] DROP TABLE products
+DROP TABLE products
+
+>>> [root: DROP TABLE secure_t] DROP TABLE secure_t
+DROP TABLE secure_t
+
+################ AUDIT LOG (JSONL emitted by the running server) ################
+--- /mnt/nvme/live-audit.jsonl ---
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"authz","role":"root","action":"ddl","object":"table:products","outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"authz","role":"root","action":"ddl","object":"table:products","outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"authz","role":"root","action":"ddl","object":"cluster","outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"authz","role":"root","action":"ddl","object":"table:secure_t","outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"authz","role":"root","action":"admin","object":"cluster","outcome":"allowed","detail":null}
+{"kind":"auth","role":"alice","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"authz","role":"alice","action":"select","object":"table:products","outcome":"denied","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"authz","role":"root","action":"admin","object":"cluster","outcome":"allowed","detail":null}
+{"kind":"auth","role":"alice","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"auth","role":"alice","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"authz","role":"alice","action":"admin","object":"cluster","outcome":"denied","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"authz","role":"root","action":"ddl","object":"table:products","outcome":"allowed","detail":null}
+{"kind":"auth","role":"root","action":"login","object":null,"outcome":"allowed","detail":null}
+{"kind":"authz","role":"root","action":"ddl","object":"table:secure_t","outcome":"allowed","detail":null}
+
+=== LIVE SESSION COMPLETE — real server answered every statement ===
