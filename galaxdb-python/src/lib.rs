@@ -202,9 +202,9 @@ impl Connection {
 
         if !rows.is_empty() || !column_names.is_empty() {
             // Even a zero-row result of a SELECT returns a RowDescription.
-            let py_rows = PyList::empty_bound(py);
+            let py_rows = PyList::empty(py);
             for row in &rows {
-                let dict = PyDict::new_bound(py);
+                let dict = PyDict::new(py);
                 for (name, val) in row {
                     dict.set_item(name, val)?;
                 }
@@ -263,9 +263,9 @@ fn connect(connstring: &str) -> PyResult<Connection> {
 fn query_result_to_python(py: Python<'_>, result: RustQueryResult) -> PyResult<PyObject> {
     match result {
         RustQueryResult::Rows(rows) => {
-            let py_rows = PyList::empty_bound(py);
+            let py_rows = PyList::empty(py);
             for row in &rows {
-                let dict = PyDict::new_bound(py);
+                let dict = PyDict::new(py);
                 for (key, value) in &row.values {
                     dict.set_item(key, value)?;
                 }
@@ -287,6 +287,6 @@ fn galaxdb(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Database>()?;
     m.add_class::<Connection>()?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
-    m.add("__version__", "0.1.1")?;
+    m.add("__version__", "0.2.0")?;
     Ok(())
 }
