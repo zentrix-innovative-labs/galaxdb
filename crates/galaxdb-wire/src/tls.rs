@@ -20,6 +20,7 @@ use std::io;
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio_rustls::rustls::pki_types::pem::PemObject;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
@@ -72,11 +73,11 @@ impl TlsMode {
 /// private key on disk (Requirement 2 AC2/AC4).
 ///
 /// The cert file may contain a full chain (leaf first). The key file may
-/// hold a PKCS#8, SEC1, or PKCS#1 private key — `rustls-pemfile` detects
-/// which. Returns a typed error (never a fake/self-signed fallback) if a
-/// file is missing, malformed, or contains no key, so a misconfigured
-/// TLS deployment fails loudly rather than silently serving without the
-/// intended certificate.
+/// hold a PKCS#8, SEC1, or PKCS#1 private key — `rustls-pki-types`'
+/// `PemObject` parser detects which. Returns a typed error (never a
+/// fake/self-signed fallback) if a file is missing, malformed, or
+/// contains no key, so a misconfigured TLS deployment fails loudly rather
+/// than silently serving without the intended certificate.
 pub fn load_server_config(
     cert_path: &str,
     key_path: &str,
@@ -94,7 +95,8 @@ pub fn load_server_config(
         )
     })?;
 
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut &cert_bytes[..])
+    // Parse the (possibly multi-cert) chain via rustls-pki-types' PemObject.
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_bytes)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| {
             io::Error::new(
@@ -109,19 +111,12 @@ pub fn load_server_config(
         ));
     }
 
-    let key: PrivateKeyDer<'static> = rustls_pemfile::private_key(&mut &key_bytes[..])
-        .map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("TLS: malformed private key PEM in '{key_path}': {e}"),
-            )
-        })?
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("TLS: no private key found in '{key_path}'"),
-            )
-        })?;
+    let key: PrivateKeyDer<'static> = PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("TLS: no usable private key in '{key_path}': {e}"),
+        )
+    })?;
 
     // rustls' default builder offers only TLS 1.2 and 1.3 (AC5) and uses
     // the process default crypto provider. No client-cert auth in this

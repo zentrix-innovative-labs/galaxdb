@@ -108,6 +108,18 @@ ignore = [
     # runtime data-path exposure. Remove when `indicatif 0.18+` drops
     # the dep (already in flight upstream).
     { id = "RUSTSEC-2025-0119", reason = "CLI progress-bar formatting only; pulled by hf-hub/tokenizers; tracked upstream" },
+    # pyo3 v0.24.2: GIL-detach closure soundness (RUSTSEC-2026-0176) and
+    # `Sync` bound on closures (RUSTSEC-2026-0177), both fixed in pyo3
+    # 0.29. Pulled ONLY by `galaxdb-python`, the optional PyO3 extension
+    # module that is excluded from every shipped build (`--exclude
+    # galaxdb-python`) due to a known pyo3 linker issue. The thin sync FFI
+    # never detaches the GIL inside a closure, so there is no real-world
+    # exposure in the core engine/server. The pyo3 0.24→0.29 migration is
+    # a breaking change bundled with the galaxdb-python linker fix and is
+    # tracked as its own task. Remove these when galaxdb-python moves to
+    # pyo3 0.29+.
+    { id = "RUSTSEC-2026-0176", reason = "pyo3 only via build-excluded galaxdb-python; no GIL-detach-in-closure usage; 0.29 migration tracked" },
+    { id = "RUSTSEC-2026-0177", reason = "pyo3 only via build-excluded galaxdb-python; thin sync FFI, no Sync-closure usage; 0.29 migration tracked" },
 ]
 
 [sources]
