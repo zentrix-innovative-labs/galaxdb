@@ -23,6 +23,9 @@ jobs:
         with:
           components: clippy
 
+      - name: Install native build deps (protoc, cmake)
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
+
       - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
@@ -106,6 +109,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install native build deps (protoc, cmake)
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -146,6 +152,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native build deps (protoc, cmake)
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
 
       - name: Cache cargo
         uses: actions/cache@v4
