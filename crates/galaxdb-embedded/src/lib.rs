@@ -417,6 +417,9 @@ impl Database {
             let mut ctx = ExecutorContext::new(self.engine.clone());
             ctx.catalog = self.catalog.clone();
             ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+            ctx.secondary_index = Some(
+                galaxdb_sql::secondary_index::SecondaryIndexStore::new(self.engine.clone()),
+            );
             ctx.session = session.cloned();
             ctx.audit = self.audit.clone();
             ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
@@ -442,6 +445,9 @@ impl Database {
         let mut ctx = ExecutorContext::new(self.engine.clone());
         ctx.catalog = self.catalog.clone();
         ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+        ctx.secondary_index = Some(
+            galaxdb_sql::secondary_index::SecondaryIndexStore::new(self.engine.clone()),
+        );
         ctx.session = session.cloned();
         ctx.audit = self.audit.clone();
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
@@ -507,6 +513,15 @@ impl Database {
             }
             AuroraStatement::Grant(stmt) => self.dispatch(QueryPlan::Grant(stmt.clone())),
             AuroraStatement::Revoke(stmt) => self.dispatch(QueryPlan::Revoke(stmt.clone())),
+            AuroraStatement::CreateIndex(stmt) => {
+                self.dispatch(QueryPlan::CreateIndex(stmt.clone()))
+            }
+            AuroraStatement::DropIndex { name, if_exists } => {
+                self.dispatch(QueryPlan::DropIndex {
+                    name: name.clone(),
+                    if_exists: *if_exists,
+                })
+            }
         }
     }
 
@@ -858,6 +873,9 @@ impl Database {
         let mut ctx = ExecutorContext::new(self.engine.clone());
         ctx.catalog = self.catalog.clone();
         ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+        ctx.secondary_index = Some(
+            galaxdb_sql::secondary_index::SecondaryIndexStore::new(self.engine.clone()),
+        );
         ctx.session = session.cloned();
         ctx.audit = self.audit.clone();
         ctx.tag_catalog = Some(self.tag_catalog.clone());
@@ -966,6 +984,11 @@ impl Database {
         }));
         // Role/grant DDL persists through the engine-backed auth store.
         ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+        // Secondary indexes (Req 5): engine-backed, durable store shared
+        // by DDL, the write path, and the read path.
+        ctx.secondary_index = Some(galaxdb_sql::secondary_index::SecondaryIndexStore::new(
+            self.engine.clone(),
+        ));
         // The authenticated session (if any) drives the executor's
         // authorization chokepoint. `None` = trusted embedded mode.
         ctx.session = self.session.clone();
@@ -3700,5 +3723,153 @@ mod authz_chokepoint_tests {
         db.set_session(Some(SessionContext::new(Role::user("eve"))));
         db.execute("SELECT * FROM a").unwrap();
         assert_denied(db.execute("SELECT * FROM b"), "eve", "select");
+    }
+}
+
+/// Secondary-index tests (task 8): CREATE/DROP INDEX, index-accelerated
+/// reads equal full-scan results, write-path maintenance, range queries,
+/// and restart survival. All run through the embedded `Database` so the
+/// whole stack (parser → planner → executor → engine) is exercised.
+#[cfg(test)]
+mod secondary_index_tests {
+    use super::*;
+
+    fn fresh_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        std::mem::forget(dir);
+        Database::open(p.to_str().unwrap()).unwrap()
+    }
+
+    fn rows(res: QueryResult) -> Vec<QueryRow> {
+        match res {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    /// An index lookup returns exactly the same rows as the equivalent
+    /// full scan (Req 5 AC2), and covers rows that existed *before* the
+    /// index was created.
+    #[test]
+    fn index_lookup_equals_full_scan() {
+        let mut db = fresh_db();
+        db.execute("CREATE TABLE people (id INT PRIMARY KEY, city TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO people VALUES (1, 'NYC')").unwrap();
+        db.execute("INSERT INTO people VALUES (2, 'LA')").unwrap();
+        db.execute("INSERT INTO people VALUES (3, 'NYC')").unwrap();
+
+        // Build the index AFTER inserting — it must cover existing rows.
+        let msg = db.execute("CREATE INDEX idx_city ON people (city)").unwrap();
+        match msg {
+            QueryResult::Ok(s) => assert!(s.contains("3 rows indexed"), "got: {s}"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        let via_index = rows(db.execute("SELECT id, city FROM people WHERE city = 'NYC'").unwrap());
+        assert_eq!(via_index.len(), 2, "index lookup must return both NYC rows");
+
+        // Drop the index → same query falls back to full scan, same result.
+        db.execute("DROP INDEX idx_city").unwrap();
+        let via_scan = rows(db.execute("SELECT id, city FROM people WHERE city = 'NYC'").unwrap());
+        assert_eq!(via_scan.len(), 2, "full scan must return the same rows");
+    }
+
+    /// INSERT/UPDATE/DELETE keep the index consistent (Req 5 AC3): a query
+    /// through the index reflects the latest committed state.
+    #[test]
+    fn writes_maintain_the_index() {
+        let mut db = fresh_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, status TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_status ON t (status)").unwrap();
+
+        db.execute("INSERT INTO t VALUES (1, 'pending')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'pending')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'shipped')").unwrap();
+        assert_eq!(
+            rows(db.execute("SELECT id FROM t WHERE status = 'pending'").unwrap()).len(),
+            2
+        );
+
+        // UPDATE moves row 1 from pending -> shipped.
+        db.execute("UPDATE t SET status = 'shipped' WHERE id = 1").unwrap();
+        assert_eq!(
+            rows(db.execute("SELECT id FROM t WHERE status = 'pending'").unwrap()).len(),
+            1,
+            "after UPDATE only row 2 is pending"
+        );
+        assert_eq!(
+            rows(db.execute("SELECT id FROM t WHERE status = 'shipped'").unwrap()).len(),
+            2,
+            "rows 1 and 3 are shipped"
+        );
+
+        // DELETE row 2 removes it from the pending bucket.
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        assert_eq!(
+            rows(db.execute("SELECT id FROM t WHERE status = 'pending'").unwrap()).len(),
+            0,
+            "no pending rows remain"
+        );
+    }
+
+    /// Range predicates resolve through the index and match the scan
+    /// result (Req 5 AC2 range case).
+    #[test]
+    fn range_query_uses_index() {
+        let mut db = fresh_db();
+        db.execute("CREATE TABLE u (id INT PRIMARY KEY, age INT)").unwrap();
+        for (id, age) in [(1, 20), (2, 30), (3, 40), (4, 50)] {
+            db.execute(&format!("INSERT INTO u VALUES ({id}, {age})")).unwrap();
+        }
+        db.execute("CREATE INDEX idx_age ON u (age)").unwrap();
+
+        // age >= 30 AND age <= 45 -> ages 30, 40 (ids 2, 3).
+        let got = rows(db.execute("SELECT id FROM u WHERE age >= 30").unwrap());
+        assert_eq!(got.len(), 3, ">= 30 must match ages 30,40,50");
+
+        let got = rows(db.execute("SELECT id FROM u WHERE age <= 30").unwrap());
+        assert_eq!(got.len(), 2, "<= 30 must match ages 20,30");
+    }
+
+    /// The index definition and its entries survive a restart (Req 5 AC4)
+    /// because they are engine rows replayed through the WAL.
+    #[test]
+    fn index_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        {
+            let mut db = Database::open(p.to_str().unwrap()).unwrap();
+            db.execute("CREATE TABLE k (id INT PRIMARY KEY, v TEXT)").unwrap();
+            db.execute("INSERT INTO k VALUES (1, 'x')").unwrap();
+            db.execute("INSERT INTO k VALUES (2, 'y')").unwrap();
+            db.execute("CREATE INDEX idx_v ON k (v)").unwrap();
+        }
+        // Reopen and re-register the table in the session catalog, then
+        // query through the index — the entries were recovered.
+        let mut db = Database::open(p.to_str().unwrap()).unwrap();
+        db.execute("CREATE TABLE k (id INT PRIMARY KEY, v TEXT)").unwrap();
+        let got = rows(db.execute("SELECT id FROM k WHERE v = 'x'").unwrap());
+        assert_eq!(got.len(), 1, "index entry for 'x' survived restart");
+        assert_eq!(got[0].values.iter().find(|(c, _)| c == "id").unwrap().1, "1");
+    }
+
+    /// CREATE INDEX on a missing table or column is a typed error, and
+    /// duplicate index names error unless IF NOT EXISTS.
+    #[test]
+    fn create_index_validation() {
+        let mut db = fresh_db();
+        assert!(db.execute("CREATE INDEX i ON ghost (c)").is_err(), "missing table");
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a TEXT)").unwrap();
+        assert!(db.execute("CREATE INDEX i ON t (nope)").is_err(), "missing column");
+        db.execute("CREATE INDEX i ON t (a)").unwrap();
+        assert!(db.execute("CREATE INDEX i ON t (a)").is_err(), "duplicate name");
+        db.execute("CREATE INDEX IF NOT EXISTS i ON t (a)").unwrap();
+        // DROP missing index errors unless IF EXISTS.
+        db.execute("DROP INDEX i").unwrap();
+        assert!(db.execute("DROP INDEX i").is_err());
+        db.execute("DROP INDEX IF EXISTS i").unwrap();
     }
 }

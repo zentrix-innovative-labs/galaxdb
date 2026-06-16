@@ -115,6 +115,10 @@ pub enum QueryPlan {
     Grant(crate::ast::GrantStmt),
     /// REVOKE privilege ON table FROM role.
     Revoke(crate::ast::GrantStmt),
+    /// CREATE INDEX (Req 5).
+    CreateIndex(crate::ast::CreateIndexStmt),
+    /// DROP INDEX.
+    DropIndex { name: String, if_exists: bool },
 }
 
 /// Search strategy chosen by the adaptive planner (Req 22).

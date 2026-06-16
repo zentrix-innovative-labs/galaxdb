@@ -6,6 +6,7 @@ pub mod executor;
 pub mod parser;
 pub mod planner;
 pub mod row_codec;
+pub mod secondary_index;
 pub mod transaction;
 
 pub use auth_store::{AuthStore, RoleRecord};

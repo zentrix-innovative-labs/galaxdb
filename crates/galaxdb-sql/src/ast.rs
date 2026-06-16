@@ -33,6 +33,10 @@ pub enum AuroraStatement {
     Grant(GrantStmt),
     /// REVOKE priv ON table FROM role.
     Revoke(GrantStmt),
+    /// CREATE INDEX name ON table (column).
+    CreateIndex(CreateIndexStmt),
+    /// DROP INDEX name.
+    DropIndex { name: String, if_exists: bool },
 }
 
 /// A privilege that can be granted on a table.
@@ -61,6 +65,19 @@ pub struct GrantStmt {
     pub privilege: Privilege,
     pub table: String,
     pub role: String,
+}
+
+/// CREATE INDEX statement (Req 5): a single-column secondary index.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndexStmt {
+    /// Index name (unique across the database).
+    pub name: String,
+    /// Table the index is defined on.
+    pub table: String,
+    /// Column being indexed.
+    pub column: String,
+    /// `CREATE INDEX IF NOT EXISTS` — don't error if it already exists.
+    pub if_not_exists: bool,
 }
 
 /// Column definition with optional embedding annotation.

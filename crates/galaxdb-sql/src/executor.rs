@@ -295,6 +295,15 @@ pub struct ExecutorContext {
     /// [`galaxdb_auth::NoOpAuditSink`]. The server/embedded layer supplies
     /// a real sink when one is configured.
     pub audit: Option<Arc<dyn galaxdb_auth::AuditSink>>,
+
+    /// Secondary-index store (Req 5). When set, `CREATE/DROP INDEX` manage
+    /// definitions here, the write path (`exec_insert`/`update`/`delete`)
+    /// maintains entries in the same logical write, and the read path uses
+    /// it to resolve indexed predicates without a full scan. `None`
+    /// disables secondary indexes (DDL returns a typed error); the
+    /// embedded/server layer always supplies a real store backed by the
+    /// engine.
+    pub secondary_index: Option<crate::secondary_index::SecondaryIndexStore>,
 }
 
 impl ExecutorContext {
@@ -314,6 +323,7 @@ impl ExecutorContext {
             session: None,
             authorizer: None,
             audit: None,
+            secondary_index: None,
         }
     }
 }
@@ -474,6 +484,8 @@ fn plan_kind_str(plan: &QueryPlan) -> &'static str {
         QueryPlan::AlterRolePassword { .. } => "alter_role_password",
         QueryPlan::Grant(_) => "grant",
         QueryPlan::Revoke(_) => "revoke",
+        QueryPlan::CreateIndex(_) => "create_index",
+        QueryPlan::DropIndex { .. } => "drop_index",
     }
 }
 
@@ -517,6 +529,9 @@ fn plan_authz_target(plan: &QueryPlan) -> (galaxdb_auth::Action, galaxdb_auth::O
         QueryPlan::DropTable { name, .. } => (Action::Ddl, ObjectRef::Table(name.clone())),
         QueryPlan::Analyze { table } => (Action::Ddl, ObjectRef::Table(table.clone())),
         QueryPlan::CreateVersionTag(_) => (Action::Ddl, ObjectRef::Cluster),
+        // CREATE/DROP INDEX are schema changes scoped to their table.
+        QueryPlan::CreateIndex(stmt) => (Action::Ddl, ObjectRef::Table(stmt.table.clone())),
+        QueryPlan::DropIndex { .. } => (Action::Ddl, ObjectRef::Cluster),
         // SHOW EMBEDDING HEALTH reads health for a table (or the whole
         // server when no table is named): a table-scoped read, or a
         // cluster-scoped read needing superuser when global.
@@ -746,6 +761,9 @@ pub fn execute_with_context(
         }
         QueryPlan::Grant(stmt) => exec_grant(stmt, false, ctx),
         QueryPlan::Revoke(stmt) => exec_grant(stmt, true, ctx),
+
+        QueryPlan::CreateIndex(stmt) => exec_create_index(stmt, ctx),
+        QueryPlan::DropIndex { name, if_exists } => exec_drop_index(name, *if_exists, ctx),
     }
 }
 
@@ -835,6 +853,13 @@ fn exec_insert(
         .put_sync(key.clone(), value_bytes)
         .map_err(|e| GalaxError::Internal(format!("engine put failed: {}", e)))?;
 
+    // Secondary-index maintenance (Req 5 AC3): add an entry for every
+    // index on this table in the same logical write. The index store is
+    // engine-backed, so its entries are durable through the same WAL.
+    if let Some(idx) = ctx.secondary_index.as_ref() {
+        idx.on_row_inserted(table, &ordered, &key)?;
+    }
+
     // Async sidecar embedding trigger for tables with an embedding column.
     // This is best-effort: if the sidecar is down the request is queued on
     // the sidecar's backlog (Req 19.5). Failure here does NOT roll back
@@ -920,6 +945,10 @@ fn exec_update(
             }
         }
 
+        // Keep the pre-update column values so secondary indexes can
+        // remove the stale entries after the new row is written.
+        let old_cols = cols.clone();
+
         // Apply assignments.
         for (col_name, new_value) in assignments {
             if let Some(slot) = cols.iter_mut().find(|(k, _)| k == col_name) {
@@ -931,8 +960,16 @@ fn exec_update(
 
         let new_bytes = row_codec::encode_row(&cols);
         ctx.engine
-            .put_sync(key, new_bytes)
+            .put_sync(key.clone(), new_bytes)
             .map_err(|e| GalaxError::Internal(format!("engine put failed: {}", e)))?;
+
+        // Secondary-index maintenance (Req 5 AC3): the primary key is
+        // unchanged by UPDATE, so for each index whose column changed we
+        // move the entry from the old value to the new one.
+        if let Some(idx) = ctx.secondary_index.as_ref() {
+            idx.on_row_updated(table, &old_cols, &cols, &key)?;
+        }
+
         updated += 1;
     }
 
@@ -958,19 +995,23 @@ fn exec_delete(
     }
 
     // Collect the keys first so we don't mutate storage while scanning.
+    // Buffer the decoded columns too so secondary-index entries can be
+    // removed (Req 5 AC3).
     let mut doomed: Vec<Vec<u8>> = Vec::new();
+    let mut doomed_rows: Vec<BufferedRow> = Vec::new();
     let prefix = format!("{}:", table);
     for (key, value_bytes) in ctx.engine.scan_all() {
         if !String::from_utf8_lossy(&key).starts_with(&prefix) {
             continue;
         }
+        let cols = row_codec::decode_row(&value_bytes);
         if let Some(f) = filter {
-            let cols = row_codec::decode_row(&value_bytes);
             if !row_codec::filter_matches(&cols, f) {
                 continue;
             }
         }
-        doomed.push(key);
+        doomed.push(key.clone());
+        doomed_rows.push((key, cols));
     }
 
     let mut deleted = 0u64;
@@ -984,6 +1025,14 @@ fn exec_delete(
                     e
                 )));
             }
+        }
+    }
+
+    // Secondary-index maintenance (Req 5 AC3): remove the index entries
+    // for every deleted row, using the columns buffered before deletion.
+    if let Some(idx) = ctx.secondary_index.as_ref() {
+        for (key, cols) in &doomed_rows {
+            idx.on_row_deleted(table, cols, key)?;
         }
     }
 
@@ -1060,17 +1109,64 @@ fn exec_full_scan(
     let dedup = filter.map(filter_has_not_duplicate).unwrap_or(false);
     let mut buffered: Vec<BufferedRow> = Vec::new();
 
-    for (key, value_bytes) in ctx.engine.scan_all_with_prefix(Some(prefix_bytes)) {
-        if !key.starts_with(prefix_bytes) {
-            continue;
+    // Access-path selection (Req 5 AC2/AC5/AC6): if a secondary index
+    // covers the filter's column with an equality or range predicate, use
+    // it to fetch only the matching primary keys instead of scanning the
+    // whole table. The exact `filter_matches` re-check below still runs on
+    // each fetched row, so an index that returns a superset (e.g. the
+    // exclusive-bound approximation) stays correct. `NOT DUPLICATE` needs
+    // the full row set, so it always takes the scan path. When no index
+    // covers the predicate we fall back to the zone-map-pruned scan — a
+    // correctness-preserving path, not an error (AC6).
+    let index_pks = if dedup {
+        None
+    } else {
+        filter.and_then(|f| {
+            ctx.secondary_index
+                .as_ref()
+                .and_then(|idx| crate::secondary_index::index_pk_set(idx, table, f))
+        })
+    };
+
+    if let Some(pk_set) = index_pks {
+        tracing::debug!(
+            table = %table,
+            access_path = "secondary_index",
+            candidates = pk_set.len(),
+            "planner chose secondary-index lookup",
+        );
+        // Fetch only the candidate rows by primary key, then apply the
+        // exact filter (the index may return a superset for range bounds).
+        for pk in pk_set.keys() {
+            let Some(value_bytes) = ctx.engine.get(pk) else {
+                continue; // entry referenced a since-deleted row
+            };
+            let cols = row_codec::decode_row(&value_bytes);
+            if let Some(f) = filter {
+                if !row_codec::filter_matches(&cols, f) {
+                    continue;
+                }
+            }
+            buffered.push((pk.clone(), cols));
         }
-        let cols = row_codec::decode_row(&value_bytes);
-        if let Some(f) = filter {
-            if !row_codec::filter_matches(&cols, f) {
+    } else {
+        tracing::debug!(
+            table = %table,
+            access_path = "full_scan",
+            "planner chose zone-map-pruned full scan",
+        );
+        for (key, value_bytes) in ctx.engine.scan_all_with_prefix(Some(prefix_bytes)) {
+            if !key.starts_with(prefix_bytes) {
                 continue;
             }
+            let cols = row_codec::decode_row(&value_bytes);
+            if let Some(f) = filter {
+                if !row_codec::filter_matches(&cols, f) {
+                    continue;
+                }
+            }
+            buffered.push((key, cols));
         }
-        buffered.push((key, cols));
     }
 
     if dedup {
@@ -1592,6 +1688,78 @@ fn exec_grant(
             stmt.role
         )))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Secondary indexes (Req 5)
+// ---------------------------------------------------------------------------
+
+fn require_secondary_index(
+    ctx: &ExecutorContext,
+) -> GalaxResult<&crate::secondary_index::SecondaryIndexStore> {
+    ctx.secondary_index.as_ref().ok_or(GalaxError::NotYetAvailable {
+        task: "8",
+        feature: "secondary indexes without a configured index store",
+    })
+}
+
+fn exec_create_index(
+    stmt: &crate::ast::CreateIndexStmt,
+    ctx: &mut ExecutorContext,
+) -> GalaxResult<ExecuteResult> {
+    // The target table must exist (the index references its column).
+    let table_entry = ctx
+        .catalog
+        .get_table(&stmt.table)
+        .cloned()
+        .ok_or_else(|| GalaxError::TableNotFound(stmt.table.clone()))?;
+    if !table_entry.columns.iter().any(|c| c.name == stmt.column) {
+        return Err(GalaxError::ColumnNotFound(format!(
+            "{}.{}",
+            stmt.table, stmt.column
+        )));
+    }
+
+    let store = require_secondary_index(ctx)?;
+    if store.get_def(&stmt.name).is_some() {
+        if stmt.if_not_exists {
+            return Ok(ExecuteResult::Ok(format!(
+                "CREATE INDEX {} (already exists)",
+                stmt.name
+            )));
+        }
+        return Err(GalaxError::Internal(format!(
+            "index '{}' already exists",
+            stmt.name
+        )));
+    }
+
+    let def = crate::secondary_index::IndexDef {
+        name: stmt.name.clone(),
+        table: stmt.table.clone(),
+        column: stmt.column.clone(),
+    };
+    store.create_def(&def)?;
+    // Populate from existing rows so the index covers the current table
+    // contents immediately, not only future writes (Req 5 AC2).
+    let indexed = store.build_from_table(&def)?;
+    Ok(ExecuteResult::Ok(format!(
+        "CREATE INDEX {} ON {} ({}): {} rows indexed",
+        stmt.name, stmt.table, stmt.column, indexed
+    )))
+}
+
+fn exec_drop_index(
+    name: &str,
+    if_exists: bool,
+    ctx: &mut ExecutorContext,
+) -> GalaxResult<ExecuteResult> {
+    let store = require_secondary_index(ctx)?;
+    let existed = store.drop_index(name)?;
+    if !existed && !if_exists {
+        return Err(GalaxError::Internal(format!("index '{}' does not exist", name)));
+    }
+    Ok(ExecuteResult::Ok(format!("DROP INDEX {}", name)))
 }
 
 fn exec_create_version_tag(
@@ -2211,6 +2379,10 @@ pub fn execute_legacy(plan: &QueryPlan, catalog: &mut Catalog) -> ExecuteResult 
         | QueryPlan::Grant(_)
         | QueryPlan::Revoke(_) => ExecuteResult::Error(
             "role/grant DDL requires a storage-backed auth store; use execute_with_context"
+                .to_string(),
+        ),
+        QueryPlan::CreateIndex(_) | QueryPlan::DropIndex { .. } => ExecuteResult::Error(
+            "CREATE/DROP INDEX requires a storage-backed index store; use execute_with_context"
                 .to_string(),
         ),
     }

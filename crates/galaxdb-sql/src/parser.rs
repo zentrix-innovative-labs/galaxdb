@@ -64,6 +64,12 @@ pub fn parse(sql: &str) -> GalaxResult<Vec<AuroraStatement>> {
     if upper.starts_with("REVOKE ") {
         return Ok(vec![parse_grant(trimmed, true)?]);
     }
+    if upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX") {
+        return Ok(vec![parse_create_index(trimmed)?]);
+    }
+    if upper.starts_with("DROP INDEX") {
+        return Ok(vec![parse_drop_index(trimmed)?]);
+    }
 
     // Try standard sqlparser, then post-process for extensions
     // If CREATE TABLE contains EMBEDDING, pre-process to strip it before sqlparser
@@ -321,6 +327,101 @@ fn split_on_keyword<'a>(s: &'a str, keyword: &str) -> Option<(&'a str, &'a str)>
         search_from = pos + ku.len();
     }
     None
+}
+
+/// Parse `CREATE [UNIQUE] INDEX [IF NOT EXISTS] name ON table (column)`.
+///
+/// The `UNIQUE` keyword is accepted for PostgreSQL syntax compatibility
+/// but uniqueness enforcement is not part of this phase; the index is
+/// built as a non-unique secondary index regardless (a uniqueness
+/// constraint check is a separate, larger feature). Only a single column
+/// is supported.
+fn parse_create_index(sql: &str) -> GalaxResult<AuroraStatement> {
+    let upper = sql.to_uppercase();
+    // Locate the INDEX keyword (after optional UNIQUE).
+    let after_index = {
+        let pos = upper.find("INDEX").ok_or_else(|| GalaxError::SqlParse {
+            position: 0,
+            message: "expected INDEX in CREATE INDEX".to_string(),
+        })?;
+        trim_stmt(&sql[pos + "INDEX".len()..])
+    };
+
+    // Optional IF NOT EXISTS.
+    let au = after_index.to_uppercase();
+    let (if_not_exists, after_ine) = if au.starts_with("IF NOT EXISTS") {
+        (true, after_index["IF NOT EXISTS".len()..].trim_start())
+    } else {
+        (false, after_index)
+    };
+
+    // name ON table (column)
+    let (name, after_name) =
+        take_ident(after_ine).ok_or_else(|| GalaxError::SqlParse {
+            position: 0,
+            message: "CREATE INDEX requires an index name".to_string(),
+        })?;
+
+    let (_before_on, after_on) =
+        split_on_keyword(after_name, "ON").ok_or_else(|| GalaxError::SqlParse {
+            position: 0,
+            message: "CREATE INDEX requires ON <table> (<column>)".to_string(),
+        })?;
+
+    // table (column)
+    let paren = after_on.find('(').ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "CREATE INDEX requires a parenthesised column, e.g. ON t (col)".to_string(),
+    })?;
+    let (table, _) = take_ident(after_on[..paren].trim()).ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "CREATE INDEX requires a table name".to_string(),
+    })?;
+    let close = after_on.find(')').ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "CREATE INDEX column list is missing a closing ')'".to_string(),
+    })?;
+    if close < paren {
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: "CREATE INDEX has malformed parentheses".to_string(),
+        });
+    }
+    let inner = after_on[paren + 1..close].trim();
+    if inner.contains(',') {
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: "multi-column indexes are not supported in this phase; index one column"
+                .to_string(),
+        });
+    }
+    let (column, _) = take_ident(inner).ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "CREATE INDEX requires a column name in parentheses".to_string(),
+    })?;
+
+    Ok(AuroraStatement::CreateIndex(CreateIndexStmt {
+        name,
+        table,
+        column,
+        if_not_exists,
+    }))
+}
+
+/// Parse `DROP INDEX [IF EXISTS] name`.
+fn parse_drop_index(sql: &str) -> GalaxResult<AuroraStatement> {
+    let rest = trim_stmt(&sql[ "DROP INDEX".len()..]); // skip "DROP INDEX"
+    let upper = rest.to_uppercase();
+    let (if_exists, name_part) = if upper.starts_with("IF EXISTS") {
+        (true, rest["IF EXISTS".len()..].trim_start())
+    } else {
+        (false, rest)
+    };
+    let (name, _) = take_ident(name_part).ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "DROP INDEX requires an index name".to_string(),
+    })?;
+    Ok(AuroraStatement::DropIndex { name, if_exists })
 }
 
 /// Parse CREATE VERSION TAG 'name' [FOR TRAINING [WITH TRAINING PRECISION ...] [TRAINING SEED n]].

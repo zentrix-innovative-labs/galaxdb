@@ -563,3 +563,54 @@ fn parse_grant_unknown_privilege_errors() {
 fn parse_create_role_without_name_errors() {
     assert!(parse("CREATE ROLE").is_err());
 }
+
+#[test]
+fn parse_create_index_basic() {
+    match &parse("CREATE INDEX idx_city ON people (city)").unwrap()[0] {
+        AuroraStatement::CreateIndex(s) => {
+            assert_eq!(s.name, "idx_city");
+            assert_eq!(s.table, "people");
+            assert_eq!(s.column, "city");
+            assert!(!s.if_not_exists);
+        }
+        other => panic!("expected CreateIndex, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_create_index_if_not_exists_and_unique() {
+    // UNIQUE is accepted for syntax compatibility; IF NOT EXISTS parsed.
+    match &parse("CREATE UNIQUE INDEX IF NOT EXISTS idx_age ON u (age)").unwrap()[0] {
+        AuroraStatement::CreateIndex(s) => {
+            assert_eq!(s.name, "idx_age");
+            assert_eq!(s.table, "u");
+            assert_eq!(s.column, "age");
+            assert!(s.if_not_exists);
+        }
+        other => panic!("expected CreateIndex, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_drop_index_with_if_exists() {
+    match &parse("DROP INDEX IF EXISTS idx_city").unwrap()[0] {
+        AuroraStatement::DropIndex { name, if_exists } => {
+            assert_eq!(name, "idx_city");
+            assert!(*if_exists);
+        }
+        other => panic!("expected DropIndex, got {other:?}"),
+    }
+    match &parse("DROP INDEX idx_city").unwrap()[0] {
+        AuroraStatement::DropIndex { name, if_exists } => {
+            assert_eq!(name, "idx_city");
+            assert!(!*if_exists);
+        }
+        other => panic!("expected DropIndex, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_create_index_multicolumn_errors() {
+    // Multi-column indexes are explicitly rejected in this phase.
+    assert!(parse("CREATE INDEX i ON t (a, b)").is_err());
+}
