@@ -123,6 +123,38 @@ cargo run --release -p galaxdb-chaos-tests
 
 ---
 
+## Security & v2-Phase 1 Features — Live Verification (AWS c6id.4xlarge)
+
+The v2-phase1 security and access-control surface is verified by starting the real
+`galaxdb-server` binary on the AWS instance and driving it with a real PostgreSQL client
+(`psql`, libpq SCRAM-SHA-256) over TCP — not unit tests. The captured transcript is committed
+under `bench-results/live-session-*/live-session.log`.
+
+The live workload exercises, against the running server:
+
+- **SCRAM-SHA-256 authentication** on every connection (initial superuser provisioned from env).
+- **CRUD** — `CREATE TABLE`, `INSERT`, `SELECT`, `WHERE` filtering, point lookup, `UPDATE … WHERE`,
+  `DELETE … WHERE` (each verified by a follow-up read).
+- **Secondary index** — `CREATE INDEX` (rebuilds from existing rows), index-accelerated equality
+  `SELECT`, `DROP INDEX`.
+- **TLS 1.2/1.3** — a second connection with `sslmode=require` completes a real rustls handshake and
+  runs DDL+DML over the encrypted channel.
+- **RBAC** — a non-privileged role is denied `SELECT` with SQLSTATE `42501`, succeeds after `GRANT`,
+  and is denied an admin `GRANT` of its own — all on a live connection with no restart.
+- **Audit log** — the server writes a JSONL record for every authentication, authorization, DDL, and
+  admin event.
+
+**Reproducing the live session** (starts the instance, runs the workload, always stops the instance):
+
+```bash
+GALAXDB_AWS_INSTANCE_ID=i-... GALAXDB_SSH_KEY=~/.ssh/your-key.pem \
+    bash scripts/aws-live-session.sh
+```
+
+This run also confirms the `io_uring` storage backend is selected automatically on Linux.
+
+---
+
 ## Competitive Comparison
 
 A direct comparison against hnswlib on the same hardware and dataset is in progress. The harness is at `benchmarks/tools/hnswlib_recall.py`. Numbers will be published here once both systems have been run on the same machine against the same SIFT-1M dataset.
