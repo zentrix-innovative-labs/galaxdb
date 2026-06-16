@@ -2736,6 +2736,67 @@ mod tests {
         );
     }
 
+    /// Req 11 AC5: write rows, force a flush to SST, then update — a
+    /// historical `AT VERSION` query must return the pre-update values
+    /// *from the flushed SST*, not only from the memtable. This is the
+    /// test that would fail against a memtable-only implementation.
+    #[test]
+    fn at_version_reads_pre_update_values_from_sst() {
+        use galaxdb_versioning::{MerkleRoot, TrainingTagMetadata};
+
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'v1')").unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (2, 'w1')").unwrap();
+        let tag_ts = db.engine.next_ts_for_tests() - 1;
+        {
+            let mut tc = db.tag_catalog.lock().unwrap();
+            tc.create_tag(
+                "snap".to_string(),
+                tag_ts,
+                MerkleRoot { hash: 0xABCD },
+                tag_ts,
+                vec![],
+                false,
+                None::<TrainingTagMetadata>,
+            )
+            .expect("create tag");
+        }
+
+        // Force the active memtable to disk. After this the pre-update
+        // rows live ONLY in an SST file, so the AT VERSION query below
+        // exercises the SST read path, not the memtable.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(db.engine.flush_memtable())
+            .expect("flush to SST");
+
+        // Update both rows — new versions land in the fresh memtable at a
+        // timestamp after the tag.
+        db.execute("UPDATE t SET name = 'v2' WHERE id = 1").unwrap();
+        db.execute("UPDATE t SET name = 'w2' WHERE id = 2").unwrap();
+
+        // Current read sees the new values.
+        let now = rows_of(db.execute("SELECT id, name FROM t").unwrap());
+        assert_eq!(now.len(), 2);
+
+        // Historical read at the tag must return v1/w1 from the SST.
+        let hist = rows_of(
+            db.execute("SELECT id, name FROM t AT VERSION 'snap'")
+                .unwrap(),
+        );
+        let mut names: Vec<String> = hist.iter().map(|r| r.values[1].1.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["v1".to_string(), "w1".to_string()],
+            "AT VERSION must return pre-update values recovered from the flushed SST",
+        );
+    }
+
     #[test]
     fn at_version_unknown_tag_errors() {
         let mut db = test_db();
