@@ -118,9 +118,24 @@ pub fn load_server_config(
         )
     })?;
 
-    // rustls' default builder offers only TLS 1.2 and 1.3 (AC5) and uses
-    // the process default crypto provider. No client-cert auth in this
-    // phase (server auth + SCRAM inside the channel).
+    // rustls 0.23 needs a process-wide `CryptoProvider`. `ServerConfig::
+    // builder()` only auto-installs one when exactly one crypto feature is
+    // compiled in; the workspace's dependency graph enables both `aws_lc_rs`
+    // and `ring` transitively, so auto-selection fails and the builder
+    // *panics* ("Could not automatically determine the process-level
+    // CryptoProvider"). The TLS integration tests sidestep this by calling
+    // `install_default` in their setup — but the real `galaxdb-server`
+    // binary did not, so starting it with `--tls-mode allow|require` would
+    // crash on the first TLS config build. Install aws-lc-rs explicitly and
+    // idempotently here (in the centralized TLS path) so the production
+    // binary and every caller get a working provider. `install_default`
+    // returns `Err` if a provider is already installed; that is benign and
+    // intentionally ignored.
+    let _ = tokio_rustls::rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // rustls' default builder offers only TLS 1.2 and 1.3 (AC5). No
+    // client-cert auth in this phase (server auth + SCRAM inside the
+    // channel).
     let config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
@@ -259,5 +274,33 @@ mod tests {
         let mut n = Vec::new();
         write_negotiation_reply(&mut n, false).await.unwrap();
         assert_eq!(n, b"N");
+    }
+
+    /// Regression for the "Could not automatically determine the
+    /// process-level CryptoProvider" panic: `load_server_config` must
+    /// build a usable `ServerConfig` on its own, WITHOUT any caller having
+    /// installed a rustls crypto provider first. The server-crate TLS
+    /// integration tests call `install_default` in their setup, which
+    /// masked the fact that the real `galaxdb-server` binary never did —
+    /// so starting it with `--tls-mode allow|require` panicked on the
+    /// first config build. No test in THIS crate installs a provider, so a
+    /// green result here proves `load_server_config` self-installs one.
+    #[test]
+    fn load_server_config_installs_crypto_provider_and_builds() {
+        let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()])
+            .expect("self-signed cert generation");
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("c.pem");
+        let key_path = dir.path().join("k.pem");
+        std::fs::write(&cert_path, cert.cert.pem()).unwrap();
+        std::fs::write(&key_path, cert.key_pair.serialize_pem()).unwrap();
+
+        let cfg = load_server_config(
+            cert_path.to_str().unwrap(),
+            key_path.to_str().unwrap(),
+        )
+        .expect("load_server_config must build a ServerConfig without a pre-installed provider");
+        // The acceptor must be constructible from the loaded config.
+        let _acceptor = acceptor(cfg);
     }
 }
