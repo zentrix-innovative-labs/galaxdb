@@ -1,0 +1,320 @@
+=== rustc/cargo versions ===
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+=== uname / cpu / mem ===
+Linux ip-172-31-8-213 6.17.0-1013-aws #13~24.04.1-Ubuntu SMP Fri Apr 24 21:50:45 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+16
+MemTotal:       32308668 kB
+=== release build (workspace, excluding galaxdb-python pyo3 linker) ===
+=== feature lib tests (--release): auth, sql, embedded, wire ===
+
+running 29 tests
+test audit::tests::audit_event_builder_sets_fields ... ok
+test audit::tests::noop_sink_discards ... ok
+test authn::tests::role_id_roundtrips_and_displays ... ok
+test audit::tests::file_sink_appends_across_reopen ... ok
+test audit::tests::file_sink_appends_json_lines ... ok
+test authn::tests::session_context_reports_superuser ... ok
+test authn::tests::superuser_and_user_roles_differ_in_privilege ... ok
+test authn::tests::trusted_local_authenticates_as_superuser_in_one_step ... ok
+test authz::tests::action_and_object_labels_are_stable ... ok
+test authz::tests::non_superuser_denied_admin_but_allowed_data ... ok
+test authz::tests::superuser_may_administer ... ok
+test authz::tests::table_grant_denies_admin_and_ddl_to_non_superuser ... ok
+test authz::tests::table_grant_non_superuser_needs_matching_grant ... ok
+test authz::tests::table_grant_superuser_bypasses_everything ... ok
+test providers::tests::default_bundle_authenticates_and_authorizes_end_to_end ... ok
+test providers::tests::default_bundle_is_all_open_source ... ok
+test scram::tests::generated_nonce_has_no_comma ... ok
+test providers::tests::bundle_accepts_custom_implementations ... ok
+test scram::tests::username_escaping_roundtrips ... ok
+test scram::tests::malformed_messages_are_rejected ... ok
+test authn::tests::scram_authenticator_rejects_unknown_role ... ok
+test scram::tests::verifier_stores_no_plaintext ... ok
+test scram::tests::full_exchange_succeeds_with_correct_password ... ok
+test authn::tests::scram_authenticator_rejects_wrong_password ... ok
+test authn::tests::scram_authenticator_assigns_superuser_flag ... ok
+test scram::tests::wrong_password_fails_verification ... ok
+test scram::tests::verifier_byte_roundtrip ... ok
+test scram::tests::verifier_derivation_is_deterministic ... ok
+test authn::tests::scram_authenticator_succeeds_with_correct_password ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 55 tests
+test role_grant_tests::alter_unknown_role_errors ... ok
+test authz_chokepoint_tests::role_admin_is_superuser_only ... ok
+test role_grant_tests::create_duplicate_role_errors ... ok
+test role_grant_tests::create_superuser_role ... ok
+test role_grant_tests::create_role_persists_verifier_via_ddl ... ok
+test authz_chokepoint_tests::grants_are_table_scoped ... ok
+test role_grant_tests::grant_to_unknown_role_errors ... ok
+test role_grant_tests::alter_role_password_replaces_verifier ... ok
+test tests::at_version_unknown_tag_errors ... ok
+test authz_chokepoint_tests::non_privileged_role_is_denied_then_granted_select ... ok
+test role_grant_tests::drop_role_removes_it ... ok
+test tests::create_drop ... ok
+test authz_chokepoint_tests::revoke_takes_effect_without_restart ... ok
+test authz_chokepoint_tests::no_session_skips_authorization ... ok
+test tests::at_version_tag_resolves_through_tag_catalog ... ok
+test tests::duplicate_create_fails ... ok
+test secondary_index_tests::create_index_validation ... ok
+test tests::extensions_work ... ok
+test tests::at_version_timestamp_returns_historical_snapshot ... ok
+test role_grant_tests::roles_and_grants_survive_reopen_via_ddl ... ok
+test tests::select_nonexistent_fails ... ok
+test tests::compactor_pins_tagged_timestamps ... ok
+test authz_chokepoint_tests::write_privileges_are_distinct ... ok
+test tests::create_insert_select_roundtrip ... ok
+test tests::at_version_reads_pre_update_values_from_sst ... ok
+test tests::training_dataset_unknown_tag_errors ... ok
+test secondary_index_tests::index_survives_restart ... ok
+test role_grant_tests::grant_and_revoke_persist ... ok
+test tests::training_dataset_rejects_non_training_tag ... ok
+test tests::delete_where_affects_only_matching_rows ... ok
+test tests::select_projection_restricts_columns ... ok
+test tests::select_where_id_equals_returns_single_row ... ok
+test tests::select_where_price_filters_rows ... ok
+test tests::restore_aborts_on_corrupted_sst ... ok
+test tests::backup_restore_round_trip_preserves_rows ... ok
+test tests::version_tag_for_training ... ok
+test tests::repeat_backup_is_byte_identical_without_intervening_writes ... ok
+test tests::delete_without_where_clears_table ... ok
+test secondary_index_tests::range_query_uses_index ... ok
+test tests::version_tag_creation_and_pinning ... ok
+test tests::training_export_lineage_row_lands_in_system_table ... ok
+test tests::training_export_content_hash_is_stable_across_repeats ... ok
+test tests::where_and_or_combine ... ok
+test tests::training_exports_table_allows_insert ... ok
+test tests::training_exports_table_rejects_delete ... ok
+test tests::update_where_affects_only_matching_rows ... ok
+test tests::where_column_on_right_side_is_flipped ... ok
+test tests::training_exports_table_rejects_update ... ok
+test tests::training_dataset_writes_real_lance_dataset ... ok
+test secondary_index_tests::index_lookup_equals_full_scan ... ok
+test tests::where_not_duplicate_composes_with_and_over_sql ... ok
+test tests::where_text_equality ... ok
+test secondary_index_tests::writes_maintain_the_index ... ok
+test tests::insert_10_rows_and_count ... ok
+test tests::where_not_duplicate_keeps_one_per_group_over_sql ... ok
+
+test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+
+running 150 tests
+test executor_tests::catalog_create_and_get ... ok
+test executor_tests::catalog_drop_removes_table ... ok
+test executor_tests::catalog_table_names_iterates ... ok
+test executor_tests::catalog_starts_empty ... ok
+test auth_store::tests::role_record_byte_roundtrip_with_and_without_verifier ... ok
+test executor_tests::context_hybrid_search_hnsw_strategy ... ok
+test executor_tests::context_point_lookup_missing_key_returns_no_rows ... ok
+test executor_tests::context_delete_missing_table_fails ... ok
+test executor_tests::context_create_version_tag_without_catalog_fails ... ok
+test executor_tests::context_backup_copies_files_to_target ... ok
+test executor_tests::context_create_version_tag_with_catalog_succeeds ... ok
+test executor_tests::context_hybrid_search_brute_force_strategy ... ok
+test executor_tests::context_semantic_search_backend_failure_propagates ... ok
+test executor_tests::context_semantic_search_without_backend_returns_sidecar_unavailable ... ok
+test executor_tests::context_show_embedding_health_without_sidecar ... ok
+test executor_tests::context_restore_validates_and_copies ... ok
+test executor_tests::context_update_rejects_embedding_source_column ... ok
+test executor_tests::filter_has_not_duplicate_walks_tree ... ok
+test executor_tests::context_insert_and_select_round_trip ... ok
+test executor_tests::insert_with_policy_but_missing_table_errors ... ok
+test executor_tests::is_text_column_handles_varchar_and_char_sizes ... ok
+test executor_tests::legacy_create_duplicate_table_fails ... ok
+test executor_tests::legacy_create_table_succeeds ... ok
+test executor_tests::legacy_drop_if_exists_is_idempotent ... ok
+test executor_tests::legacy_drop_missing_table_fails ... ok
+test executor_tests::legacy_drop_table_succeeds ... ok
+test executor_tests::legacy_insert_column_count_mismatch_errors ... ok
+test executor_tests::legacy_insert_into_missing_table_errors ... ok
+test executor_tests::legacy_insert_succeeds_but_defers_storage ... ok
+test executor_tests::context_point_lookup_returns_single_row ... ok
+test executor_tests::executor_emits_query_spans_on_insert_and_select ... ok
+test executor_tests::insert_without_policy_persists_but_no_sink_writes ... ok
+test executor_tests::minhash_policy_handles_multiple_text_columns ... ok
+test executor_tests::context_semantic_search_returns_results ... ok
+test executor_tests::context_update_changes_value ... ok
+test executor_tests::minhash_policy_runs_on_insert_with_real_storage ... ok
+test executor_tests::context_analyze_returns_row_count ... ok
+test planner_tests::choose_brute_force_for_low_cardinality ... ok
+test planner_tests::choose_brute_force_under_1000_rows ... ok
+test planner_tests::choose_hnsw_at_1000_rows ... ok
+test planner_tests::choose_hnsw_for_high_cardinality ... ok
+test planner_tests::near_duplicate_group_column_name_is_stable ... ok
+test planner_tests::plan_create_table_produces_correct_plan ... ok
+test planner_tests::plan_delete_with_filter ... ok
+test planner_tests::plan_drop_table_with_if_exists ... ok
+test planner_tests::plan_hybrid_search_with_stats ... ok
+test planner_tests::plan_insert_produces_correct_plan ... ok
+test planner_tests::plan_select_carries_composed_not_duplicate_predicate ... ok
+test planner_tests::plan_select_carries_not_duplicate_predicate ... ok
+test planner_tests::plan_select_full_scan ... ok
+test planner_tests::plan_semantic_search_without_filter ... ok
+test planner_tests::plan_update_with_assignments ... ok
+test executor_tests::context_bulk_insert_writes_real_rows ... ok
+test executor_tests::context_update_non_embedding_column_on_embedding_table_succeeds ... ok
+test planner_tests::planner_stats_cardinality_estimation ... ok
+test executor_tests::context_insert_multiple_rows_and_project_columns ... ok
+test row_codec::tests::align_mismatch_errors ... ok
+test row_codec::tests::align_named_reorder ... ok
+test row_codec::tests::align_positional ... ok
+test row_codec::tests::encode_decode_roundtrip ... ok
+test row_codec::tests::filter_and_or ... ok
+test row_codec::tests::filter_eq_matches ... ok
+test row_codec::tests::filter_missing_column_is_false ... ok
+test row_codec::tests::pipe_in_text_is_escaped ... ok
+test row_codec::tests::primary_key_falls_back_to_first_value ... ok
+test row_codec::tests::primary_key_prefers_pk_column ... ok
+test secondary_index::tests::index_def_byte_roundtrip ... ok
+test secondary_index::tests::index_value_encoding_preserves_float_order ... ok
+test secondary_index::tests::index_value_encoding_preserves_integer_order ... ok
+test secondary_index::tests::index_value_encoding_preserves_text_order ... ok
+test secondary_index::tests::pk_extraction_handles_zero_bytes_in_value ... ok
+test executor_tests::minhash_policy_skips_non_text_columns ... ok
+test tests::multiple_statements ... ok
+test tests::parse_alter_role_password ... ok
+test tests::parse_analyze_table ... ok
+test tests::parse_analyze_with_semicolon ... ok
+test tests::parse_analyze_without_table_returns_error ... ok
+test tests::parse_at_version_tag ... ok
+test tests::parse_at_version_timestamp ... ok
+test tests::parse_at_version_with_row_snapshot ... ok
+test tests::parse_at_version_with_semantic_fresh ... ok
+test tests::parse_backup_to ... ok
+test tests::parse_backup_without_path_returns_error ... ok
+test tests::parse_bulk_insert_basic ... ok
+test tests::parse_bulk_insert_mismatched_cols_errors ... ok
+test tests::parse_bulk_insert_multirow ... ok
+test tests::parse_create_index_basic ... ok
+test executor_tests::context_select_with_filter ... ok
+test tests::parse_create_index_if_not_exists_and_unique ... ok
+test tests::parse_create_index_multicolumn_errors ... ok
+test tests::parse_create_role_minimal ... ok
+test tests::parse_create_role_password_only ... ok
+test tests::parse_create_role_with_password_and_superuser ... ok
+test tests::parse_create_role_without_name_errors ... ok
+test tests::parse_create_version_tag_float32 ... ok
+test tests::parse_create_version_tag_for_training ... ok
+test tests::parse_create_version_tag_rabitq ... ok
+test tests::parse_create_version_tag_simple ... ok
+test tests::parse_create_version_tag_with_precision_and_seed ... ok
+test tests::parse_drop_index_with_if_exists ... ok
+test tests::parse_drop_role ... ok
+test tests::parse_empty_sql_returns_error ... ok
+test tests::parse_grant_all_privileges ... ok
+test tests::parse_grant_and_revoke ... ok
+test tests::parse_grant_unknown_privilege_errors ... ok
+test tests::parse_invalid_sql_returns_error_with_position ... ok
+test tests::parse_restore_from ... ok
+test tests::parse_semantic_match_expr ... ok
+test tests::parse_semantic_match_invalid_args ... ok
+test tests::parse_semantic_match_not_semantic_match ... ok
+test tests::parse_semantic_match_with_spaces ... ok
+test tests::parse_show_embedding_health_no_table ... ok
+test tests::parse_show_embedding_health_with_table ... ok
+test tests::parse_standard_create_table ... ok
+test executor_tests::minhash_policy_skips_null_text ... ok
+test tests::parse_standard_delete ... ok
+test tests::parse_standard_drop_table ... ok
+test tests::parse_standard_insert ... ok
+test tests::parse_standard_select ... ok
+test tests::parse_standard_update ... ok
+test tests::parse_where_not_duplicate_bare ... ok
+test tests::parse_where_not_duplicate_composed_with_and ... ok
+test tests::standard_sql_roundtrip_join ... ok
+test tests::standard_sql_roundtrip_select ... ok
+test transaction::tests::active_snapshot_count ... ok
+test tests::standard_sql_roundtrip_subquery ... ok
+test transaction::tests::concurrent_transactions_different_keys_no_conflict ... ok
+test transaction::tests::begin_assigns_monotonic_timestamps ... ok
+test transaction::tests::no_dirty_reads ... ok
+test transaction::tests::no_non_repeatable_reads ... ok
+test transaction::tests::oldest_active_snapshot_tracks_correctly ... ok
+test transaction::tests::same_transaction_can_reacquire_own_lock ... ok
+test transaction::tests::snapshot_record_write ... ok
+test transaction::tests::snapshot_visibility ... ok
+test transaction::tests::write_lock_released_on_abort ... ok
+test transaction::tests::write_lock_released_on_commit ... ok
+test transaction::tests::write_skew_is_possible ... ok
+test transaction::tests::write_write_conflict_detected ... ok
+test executor_tests::context_delete_removes_row ... ok
+test auth_store::tests::put_get_drop_role ... ok
+test auth_store::tests::roles_survive_reopen ... ok
+test executor_tests::where_not_duplicate_passes_rows_without_group_column ... ok
+test executor_tests::where_not_duplicate_composes_with_and ... ok
+test auth_store::tests::grant_check_revoke ... ok
+test executor_tests::where_not_duplicate_keeps_one_representative_per_group ... ok
+test secondary_index::tests::entries_survive_reopen ... ok
+test secondary_index::tests::update_maintains_entries ... ok
+test auth_store::tests::drop_role_cascades_grants ... ok
+test secondary_index::tests::range_lookup_returns_values_in_bounds ... ok
+test secondary_index::tests::create_lookup_drop_roundtrip ... ok
+
+test result: ok. 150 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+
+running 37 tests
+test pg_catalog::tests::case_insensitive_detection ... ok
+test pg_catalog::tests::non_pg_catalog_returns_none ... ok
+test pg_catalog::tests::pg_class_query_returns_result ... ok
+test pg_catalog::tests::pg_attribute_query_returns_result ... ok
+test pg_catalog::tests::pg_database_returns_galaxdb ... ok
+test pg_catalog::tests::pg_namespace_returns_public_schema ... ok
+test pg_catalog::tests::pg_type_returns_basic_types ... ok
+test pg_catalog::tests::unsupported_pg_catalog_returns_empty ... ok
+test tests::column_desc_int4_has_correct_oid ... ok
+test tests::column_desc_text_has_correct_oid ... ok
+test tests::error_response_flow ... ok
+test tests::full_startup_handshake_response ... ok
+test tests::query_response_flow ... ok
+test tests::read_query_message ... ok
+test tests::read_query_wrong_message_type ... ok
+test tests::read_sasl_initial_response_rejects_wrong_message_type ... ok
+test tests::read_sasl_initial_response_handles_no_initial_data ... ok
+test tests::read_sasl_initial_response_round_trip ... ok
+test tests::read_sasl_response_round_trip ... ok
+test tests::wire_server_tracks_connection_count ... ok
+test tests::write_backend_key_data_produces_correct_bytes ... ok
+test tests::write_command_complete_select ... ok
+test tests::write_auth_ok_produces_correct_bytes ... ok
+test tls::tests::peek_recognizes_gss_request ... ok
+test tests::write_data_row_with_values ... ok
+test tests::write_ready_for_query_idle ... ok
+test tests::write_row_description_multiple_columns ... ok
+test tests::write_row_description_single_column ... ok
+test tests::read_startup_message ... ok
+test tests::write_error_response_contains_sqlstate ... ok
+test tls::tests::negotiation_reply_writes_single_byte ... ok
+test tests::write_auth_sasl_continue_and_final_carry_code_and_data ... ok
+test tls::tests::peek_recognizes_ssl_request ... ok
+test tls::tests::peek_preserves_startup_head ... ok
+test tests::write_auth_sasl_advertises_mechanism ... ok
+test tests::write_parameter_status_produces_correct_bytes ... ok
+test tls::tests::tls_mode_parses_and_defaults ... ok
+
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+=== networked integration (--release): SCRAM + TLS + authz + audit over real TCP ===
+
+running 13 tests
+test release_binary_size_under_70mb_when_built ... ok
+test tls_require_rejects_plaintext_startup ... ok
+test tls_allow_still_serves_plaintext ... ok
+test scram_correct_password_connects ... ok
+test scram_unknown_role_is_rejected_28p01 ... ok
+test wire_server_accepts_sql_commenter_traceparent ... ok
+test scram_wrong_password_is_rejected_28p01 ... ok
+test wire_authz_denied_then_granted ... ok
+test crud_round_trip_over_wire ... ok
+test http_observability_starts_alongside_wire_server ... ok
+test tls_require_connects_over_encrypted_channel ... ok
+test audit_log_records_auth_authz_and_admin_events ... ok
+test many_concurrent_inserts_do_not_panic ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+
+=== ALL FEATURE TESTS PASSED ON REAL HARDWARE ===

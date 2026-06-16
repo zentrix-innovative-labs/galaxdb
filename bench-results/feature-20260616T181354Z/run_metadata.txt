@@ -1,0 +1,5 @@
+commit: 650ac49214c9136b910dbab158f660d0398770ee
+instance_id: i-0b2dec9226f62db65
+instance_type: c6id.4xlarge
+region: us-east-1
+run_kind: v2-phase1 feature integration (auth/TLS/authz/audit/secondary-index/AT-VERSION)
