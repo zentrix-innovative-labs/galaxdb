@@ -403,15 +403,11 @@ impl TableStatistics {
             return 0.0;
         }
         match self.columns.get(column) {
-            Some(stats) => {
-                if !stats.histogram.buckets.is_empty() {
-                    stats.histogram.estimate_range(low, high)
-                } else {
-                    // Default: 33% for range queries without statistics
-                    0.33
-                }
+            Some(stats) if !stats.histogram.buckets.is_empty() => {
+                stats.histogram.estimate_range(low, high)
             }
-            None => 0.33,
+            // Default: 33% for range queries without statistics
+            _ => 0.33,
         }
     }
 

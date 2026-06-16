@@ -819,7 +819,7 @@ impl Engine {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    for (k, v) in keys.into_iter().zip(vals.into_iter()) {
+                    for (k, v) in keys.into_iter().zip(vals) {
                         if let Some(prefix) = key_prefix {
                             if !k.starts_with(prefix) {
                                 continue;
@@ -915,7 +915,7 @@ impl Engine {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    for (k, v) in keys.into_iter().zip(vals.into_iter()) {
+                    for (k, v) in keys.into_iter().zip(vals) {
                         // Merge by taking the latest visible version.
                         let existing_ts = out.get(&k).map(|(_, ts)| *ts).unwrap_or(0);
                         if block_ts >= existing_ts {
