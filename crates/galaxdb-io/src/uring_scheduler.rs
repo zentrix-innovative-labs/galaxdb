@@ -216,10 +216,13 @@ impl IoScheduler for IoUringScheduler {
         Box::pin(async move {
             let start = Instant::now();
 
-            // Open/create the file
+            // Open/create the file. This is a positioned write (we seek to
+            // `offset` per chunk), so we must NOT truncate — existing data
+            // outside the written range has to be preserved.
             let f = OpenOptions::new()
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(file)?;
             let fd = f.as_raw_fd();
 
