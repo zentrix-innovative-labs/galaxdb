@@ -5,7 +5,7 @@
 set -euo pipefail
 
 REPO="zentrix-innovative-labs/galaxdb"
-VERSION="v1.0.0-beta.1"
+VERSION="v0.2.0"
 INSTALL_DIR="${GALAXDB_INSTALL_DIR:-/usr/local/bin}"
 
 detect_platform() {

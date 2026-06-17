@@ -1,37 +1,53 @@
 class Galaxdb < Formula
   desc "AI-native database — SQL + vector search + training exports in one system"
   homepage "https://github.com/zentrix-innovative-labs/galaxdb"
-  version "1.0.0-beta.1"
+  version "0.2.0"
   license "Apache-2.0"
 
   on_macos do
     on_intel do
-      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v1.0.0-beta.1/galaxdb-server-macos-x86_64"
-      sha256 "d8c544abae0b4659a869db68cecd1bf0436f73b014f019b40543b79922bc55a8"
+      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.2.0/galaxdb-server-macos-x86_64"
+      # sha256 updated after the release workflow uploads the binary
+      sha256 :no_check
+    end
+
+    on_arm do
+      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.2.0/galaxdb-server-macos-arm64"
+      sha256 :no_check
     end
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v1.0.0-beta.1/galaxdb-server-linux-x86_64"
-      sha256 "346633fdd3db375195986357f05a92a51f62038f11e3edaef331a2a11a83c9c1"
+      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.2.0/galaxdb-server-linux-x86_64"
+      sha256 :no_check
+    end
+
+    on_arm do
+      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.2.0/galaxdb-server-linux-aarch64"
+      sha256 :no_check
     end
   end
 
   def install
-    bin.install stable.url.split("/").last => "galaxdb-server"
+    binary_name = stable.url.split("/").last
+    bin.install binary_name => "galaxdb-server"
   end
 
   def caveats
     <<~EOS
       To start GalaxDB:
-        galaxdb-server --data-dir ~/galaxdb-data --port 5433
+        galaxdb-server --data-dir ~/galaxdb-data --port 5433 --auth
 
-      For embedding support, also download the sidecar:
-        https://github.com/zentrix-innovative-labs/galaxdb/releases/latest
+      Python client (pip):
+        pip install galaxdb-client
 
-      Then start with:
-        galaxdb-server --data-dir ~/galaxdb-data --sidecar galaxdb-sidecar --model sentence-transformers/all-MiniLM-L6-v2
+      For embedding support, also download the sidecar from the same release
+      and start with:
+        galaxdb-server --data-dir ~/galaxdb-data --sidecar galaxdb-sidecar \\
+                       --model sentence-transformers/all-MiniLM-L6-v2
+
+      Docs: https://github.com/zentrix-innovative-labs/galaxdb
     EOS
   end
 

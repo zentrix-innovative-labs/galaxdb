@@ -1,24 +1,105 @@
 name: Publish to PyPI
 
+# Triggered automatically when a GitHub Release is published (which the
+# release.yml workflow creates on every v* tag), or manually via
+# workflow_dispatch.
+#
+# Builds Python wheels for 5 targets + a source distribution, then
+# publishes everything to PyPI using trusted publishing (no token needed).
+
 on:
   release:
     types: [published]
-  workflow_dispatch:  # allow manual trigger
+  workflow_dispatch:
 
 jobs:
-  build-wheels:
-    name: Build wheels (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  # -----------------------------------------------------------------------
+  # Linux wheels (manylinux via maturin cross-compilation matrix)
+  # -----------------------------------------------------------------------
+  build-linux:
+    name: "Wheel · Linux ${{ matrix.target }}"
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Install protoc + cmake (needed by build scripts in transitive deps)
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
+
+      - name: Build manylinux wheel (${{ matrix.target }})
+        run: |
+          maturin build --release \
+            --manylinux 2_28 \
+            --target ${{ matrix.target }}-unknown-linux-gnu \
+            -m galaxdb-python/Cargo.toml
+        env:
+          PROTOC: /usr/bin/protoc
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: target/wheels/*.whl
+
+  # -----------------------------------------------------------------------
+  # macOS wheels
+  # -----------------------------------------------------------------------
+  build-macos:
+    name: "Wheel · macOS ${{ matrix.target }}"
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64
-          - os: macos-14        # Apple Silicon arm64 (M1/M2/M3)
-            target: aarch64
-          - os: windows-latest  # Windows x86_64
-            target: x86_64
+          - target: aarch64
+            runner: macos-14        # Apple Silicon — builds arm64 natively
+          - target: x86_64
+            runner: macos-14        # cross-compile for Intel on the same runner
 
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}-apple-darwin
+
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin + protoc
+        run: |
+          pip install maturin
+          brew install protobuf cmake
+
+      - name: Build wheel (${{ matrix.target }})
+        run: |
+          maturin build --release \
+            --target ${{ matrix.target }}-apple-darwin \
+            -m galaxdb-python/Cargo.toml
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: target/wheels/*.whl
+
+  # -----------------------------------------------------------------------
+  # Windows wheel
+  # -----------------------------------------------------------------------
+  build-windows:
+    name: "Wheel · Windows x86_64"
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -30,77 +111,59 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install maturin
-        run: pip install maturin
+      - name: Install maturin + protoc
+        run: |
+          pip install maturin
+          choco install protoc cmake --yes
 
-      - name: Install protoc (Linux)
-        if: runner.os == 'Linux'
-        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler libprotobuf-dev
-
-      - name: Install protoc (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf
-
-      - name: Install protoc (Windows)
-        if: runner.os == 'Windows'
-        run: choco install protoc --yes
-
-      - name: Build wheel (Linux)
-        if: runner.os == 'Linux'
-        run: maturin build --release --manylinux off -m galaxdb-python/Cargo.toml
-        env:
-          PROTOC: /usr/bin/protoc
-
-      - name: Build wheel (macOS / Windows)
-        if: runner.os != 'Linux'
+      - name: Build wheel
         run: maturin build --release -m galaxdb-python/Cargo.toml
 
-      - name: Upload wheel artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: wheels-${{ matrix.os }}-${{ matrix.target }}
+          name: wheels-windows-x86_64
           path: target/wheels/*.whl
 
+  # -----------------------------------------------------------------------
+  # Source distribution — fallback for platforms without a pre-built wheel.
+  # pip will compile from source (requires Rust on the user's machine).
+  # -----------------------------------------------------------------------
   build-sdist:
-    # Source distribution — fallback for Linux aarch64, FreeBSD, or any
-    # platform without a pre-built wheel. pip will compile from source
-    # (requires Rust on the user's machine).
-    name: Build source distribution
+    name: "Source distribution"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Install protoc
-        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler libprotobuf-dev
+      - name: Install Python + maturin + protoc
+        run: |
+          pip install maturin
+          sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
 
       - name: Build sdist
         run: maturin sdist -m galaxdb-python/Cargo.toml
         env:
           PROTOC: /usr/bin/protoc
 
-      - name: Upload sdist artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: sdist
           path: target/wheels/*.tar.gz
 
+  # -----------------------------------------------------------------------
+  # Publish all wheels + sdist to PyPI via trusted publishing.
+  # No PYPI_TOKEN needed — set up the "pypi" environment in repo settings
+  # and add the trusted publisher on pypi.org (owner: zentrix-innovative-labs,
+  # repo: galaxdb, workflow: publish-pypi.yml).
+  # -----------------------------------------------------------------------
   publish:
-    name: Publish to PyPI
-    needs: [build-wheels, build-sdist]
+    name: "Publish to PyPI"
+    needs: [build-linux, build-macos, build-windows, build-sdist]
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/project/galaxdb-client/
     permissions:
-      id-token: write  # required for trusted publishing (no token needed)
+      id-token: write   # required for trusted publishing
 
     steps:
       - name: Download all wheels
@@ -119,7 +182,7 @@ jobs:
       - name: List distributions
         run: ls -lh dist/
 
-      - name: Publish to PyPI (Trusted Publisher — no token needed)
+      - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/

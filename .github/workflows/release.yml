@@ -1,0 +1,264 @@
+name: Release
+
+# Triggered by a version tag (e.g. v0.2.0).
+# Builds the server binary for all four platforms in parallel, then creates
+# a GitHub Release and attaches the binaries.  The "published" release event
+# then automatically triggers publish-pypi.yml.
+#
+# To cut a release:
+#   git tag v0.2.0 && git push origin v0.2.0
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]*"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # -----------------------------------------------------------------------
+  # Linux x86_64 — runs natively on ubuntu-latest
+  # -----------------------------------------------------------------------
+  build-linux-x86_64:
+    name: "Build · Linux x86_64"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native build deps
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build server (release)
+        run: cargo build --release -p galaxdb-server
+
+      - name: Strip binary
+        run: strip target/release/galaxdb-server
+
+      - name: Rename artifact
+        run: cp target/release/galaxdb-server galaxdb-server-linux-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: galaxdb-server-linux-x86_64
+          path: galaxdb-server-linux-x86_64
+
+  # -----------------------------------------------------------------------
+  # Linux aarch64 — cross-compiled via cross-rs
+  # -----------------------------------------------------------------------
+  build-linux-aarch64:
+    name: "Build · Linux aarch64"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install cross
+        run: cargo install --locked cross
+
+      - name: Install protoc (host, needed for prost build scripts)
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build server (release, cross)
+        run: cross build --release -p galaxdb-server --target aarch64-unknown-linux-gnu
+
+      - name: Rename artifact
+        run: cp target/aarch64-unknown-linux-gnu/release/galaxdb-server galaxdb-server-linux-aarch64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: galaxdb-server-linux-aarch64
+          path: galaxdb-server-linux-aarch64
+
+  # -----------------------------------------------------------------------
+  # macOS arm64 (Apple Silicon) — native on macos-14
+  # -----------------------------------------------------------------------
+  build-macos-arm64:
+    name: "Build · macOS arm64"
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        run: brew install protobuf cmake
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build server (release)
+        run: cargo build --release -p galaxdb-server
+
+      - name: Strip binary
+        run: strip target/release/galaxdb-server
+
+      - name: Rename artifact
+        run: cp target/release/galaxdb-server galaxdb-server-macos-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: galaxdb-server-macos-arm64
+          path: galaxdb-server-macos-arm64
+
+  # -----------------------------------------------------------------------
+  # macOS x86_64 (Intel) — cross-compiled on macos-14
+  # -----------------------------------------------------------------------
+  build-macos-x86_64:
+    name: "Build · macOS x86_64"
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+
+      - name: Install protoc
+        run: brew install protobuf cmake
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build server (release, x86_64)
+        run: cargo build --release -p galaxdb-server --target x86_64-apple-darwin
+
+      - name: Strip binary
+        run: strip target/x86_64-apple-darwin/release/galaxdb-server
+
+      - name: Rename artifact
+        run: cp target/x86_64-apple-darwin/release/galaxdb-server galaxdb-server-macos-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: galaxdb-server-macos-x86_64
+          path: galaxdb-server-macos-x86_64
+
+  # -----------------------------------------------------------------------
+  # Create the GitHub Release and attach all four binaries.
+  # The release event triggers publish-pypi.yml automatically.
+  # -----------------------------------------------------------------------
+  github-release:
+    name: "GitHub Release"
+    needs:
+      - build-linux-x86_64
+      - build-linux-aarch64
+      - build-macos-arm64
+      - build-macos-x86_64
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to create the release
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: ls -lh dist/
+
+      - name: Compute SHA256 checksums
+        run: |
+          cd dist
+          sha256sum galaxdb-server-linux-x86_64    > galaxdb-server-linux-x86_64.sha256
+          sha256sum galaxdb-server-linux-aarch64   > galaxdb-server-linux-aarch64.sha256
+          sha256sum galaxdb-server-macos-arm64     > galaxdb-server-macos-arm64.sha256
+          sha256sum galaxdb-server-macos-x86_64    > galaxdb-server-macos-x86_64.sha256
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          gh release create "${TAG}" \
+            --title "GalaxDB ${TAG}" \
+            --notes "## GalaxDB ${TAG}
+
+          ### What's new
+          See [ROADMAP.md](https://github.com/zentrix-innovative-labs/galaxdb/blob/main/ROADMAP.md) for the full list of shipped features.
+
+          ### Install
+
+          **One-liner (Linux / macOS):**
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/zentrix-innovative-labs/galaxdb/main/install.sh | bash
+          \`\`\`
+
+          **Homebrew (macOS / Linux):**
+          \`\`\`bash
+          brew tap zentrix-innovative-labs/galaxdb https://github.com/zentrix-innovative-labs/galaxdb
+          brew install galaxdb
+          \`\`\`
+
+          **Python client (pip):**
+          \`\`\`bash
+          pip install galaxdb-client==${TAG#v}
+          \`\`\`
+
+          **Docker:**
+          \`\`\`bash
+          docker pull ghcr.io/zentrix-innovative-labs/galaxdb:${TAG}
+          \`\`\`
+
+          ### Direct download
+          | Platform | Binary |
+          |---|---|
+          | Linux x86_64  | \`galaxdb-server-linux-x86_64\`   |
+          | Linux aarch64 | \`galaxdb-server-linux-aarch64\`  |
+          | macOS arm64   | \`galaxdb-server-macos-arm64\`    |
+          | macOS x86_64  | \`galaxdb-server-macos-x86_64\`   |
+
+          SHA256 checksums are attached as \`.sha256\` files.
+          " \
+            dist/galaxdb-server-linux-x86_64 \
+            dist/galaxdb-server-linux-x86_64.sha256 \
+            dist/galaxdb-server-linux-aarch64 \
+            dist/galaxdb-server-linux-aarch64.sha256 \
+            dist/galaxdb-server-macos-arm64 \
+            dist/galaxdb-server-macos-arm64.sha256 \
+            dist/galaxdb-server-macos-x86_64 \
+            dist/galaxdb-server-macos-x86_64.sha256
