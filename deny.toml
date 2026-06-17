@@ -43,6 +43,15 @@ deny = [
     { name = "azure_identity" },
     { name = "azure_storage" },
     { name = "azure_security_keyvault" },
+    # Enterprise crates must never appear in the OSS dependency graph.
+    # They are distributed separately and linked in only via the
+    # Providers extension seam (crates/galaxdb-cluster). If any build
+    # accidentally pulls them in, cargo-deny hard-fails so the leak is
+    # caught before it reaches CI.
+    { name = "galaxdb-enterprise" },
+    { name = "galaxdb-enterprise-cluster" },
+    { name = "galaxdb-enterprise-auth" },
+    { name = "galaxdb-enterprise-crypto" },
 ]
 
 # Never warn on `rand`, `ring`, etc. being present in multiple versions —

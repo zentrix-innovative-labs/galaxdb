@@ -103,6 +103,9 @@ async fn main() {
         tls_cert_path,
         tls_key_path,
         audit_log_path,
+        // Task 16: OSS binary always uses the single-node default.
+        // Enterprise editions construct a Providers bundle and pass it here.
+        providers: None,
     };
 
     // Task 40.1: start the HTTP observability server (/health + /metrics)

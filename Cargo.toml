@@ -12,6 +12,7 @@ members = [
     "crates/galaxdb-versioning",
     "crates/galaxdb-sidecar",
     "crates/galaxdb-observe",
+    "crates/galaxdb-cluster",
     "crates/galaxdb-server",
     "crates/galaxdb-embedded",
     "galaxdb-python",
@@ -125,6 +126,7 @@ galaxdb-wire = { path = "crates/galaxdb-wire" }
 galaxdb-versioning = { path = "crates/galaxdb-versioning" }
 galaxdb-sidecar = { path = "crates/galaxdb-sidecar" }
 galaxdb-observe = { path = "crates/galaxdb-observe" }
+galaxdb-cluster = { path = "crates/galaxdb-cluster" }
 galaxdb-server = { path = "crates/galaxdb-server" }
 galaxdb-embedded = { path = "crates/galaxdb-embedded" }
 
