@@ -1,0 +1,24 @@
+# cross-rs configuration for cross-compilation targets.
+# Used by `cross build` in the release workflow (scripts/aws-live-session.sh
+# and .github/workflows/release.yml).
+#
+# Docs: https://github.com/cross-rs/cross/wiki/Configuration
+
+[target.aarch64-unknown-linux-gnu]
+# Install aarch64 openssl dev headers inside the cross Docker container.
+# openssl-sys needs them for the TLS/rustls dependency chain.
+pre-build = [
+    "dpkg --add-architecture arm64",
+    "apt-get update -q",
+    "apt-get install -y --no-install-recommends libssl-dev:arm64 libssl3:arm64",
+]
+
+[target.aarch64-unknown-linux-gnu.env]
+# Tell openssl-sys where to find the cross-compiled openssl and to link
+# statically so the produced binary has no runtime dependency on libssl.
+passthrough = [
+    "OPENSSL_STATIC",
+    "OPENSSL_DIR",
+    "PKG_CONFIG_ALLOW_CROSS",
+    "PKG_CONFIG_PATH",
+]

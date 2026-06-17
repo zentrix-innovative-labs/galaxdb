@@ -415,10 +415,15 @@ pub fn select_default_quantizer(dim: usize, calibration_vectors: &[&[f32]]) -> B
 
     #[cfg(target_arch = "aarch64")]
     {
+        // FP16 is the preferred quantizer on ARM64 (NEON native FP16).
+        // `calibration_vectors` is not needed for FP16 but is kept in the
+        // signature for API uniformity.
+        let _ = calibration_vectors;
         return Box::new(Fp16Quantizer::new(dim));
     }
 
-    // Fallback
+    // Fallback for x86 without AVX2 and any other arch.
+    #[allow(unreachable_code)]
     Box::new(Sq8Quantizer::calibrate(calibration_vectors, dim))
 }
 
