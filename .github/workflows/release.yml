@@ -57,24 +57,19 @@ jobs:
           path: galaxdb-server-linux-x86_64
 
   # -----------------------------------------------------------------------
-  # Linux aarch64 — cross-compiled via cross-rs
+  # Linux aarch64 — native arm64 runner (no cross-compilation or Docker)
   # -----------------------------------------------------------------------
   build-linux-aarch64:
     name: "Build · Linux aarch64"
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm   # GitHub-hosted native arm64 runner
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
 
-      - name: Install cross
-        run: cargo install --locked cross
-
-      - name: Install protoc (host, needed for prost build scripts)
-        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
+      - name: Install native build deps
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake libssl-dev pkg-config
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -85,16 +80,14 @@ jobs:
             target
           key: linux-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build server (release, cross)
-        run: cross build --release -p galaxdb-server --target aarch64-unknown-linux-gnu
-        env:
-          # Tell openssl-sys to link statically so the binary has no
-          # runtime dependency on the host's libssl version.
-          OPENSSL_STATIC: "1"
-          PKG_CONFIG_ALLOW_CROSS: "1"
+      - name: Build server (release)
+        run: cargo build --release -p galaxdb-server
+
+      - name: Strip binary
+        run: strip target/release/galaxdb-server
 
       - name: Rename artifact
-        run: cp target/aarch64-unknown-linux-gnu/release/galaxdb-server galaxdb-server-linux-aarch64
+        run: cp target/release/galaxdb-server galaxdb-server-linux-aarch64
 
       - uses: actions/upload-artifact@v4
         with:
