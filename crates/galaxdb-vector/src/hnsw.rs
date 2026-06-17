@@ -88,14 +88,17 @@ impl PartialEq for Candidate {
     fn eq(&self, other: &Self) -> bool { self.dist == other.dist && self.id == other.id }
 }
 impl Eq for Candidate {}
-impl PartialOrd for Candidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        other.dist.partial_cmp(&self.dist)
-    }
-}
 impl Ord for Candidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        // Reverse ordering on distance so a max-`BinaryHeap` of
+        // `Candidate` behaves as a min-heap by distance (nearest first).
+        // `dist` is f32 (only PartialOrd), so NaN collapses to Equal.
+        other.dist.partial_cmp(&self.dist).unwrap_or(Ordering::Equal)
+    }
+}
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -108,14 +111,17 @@ impl PartialEq for MaxCandidate {
     fn eq(&self, other: &Self) -> bool { self.dist == other.dist && self.id == other.id }
 }
 impl Eq for MaxCandidate {}
-impl PartialOrd for MaxCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.dist.partial_cmp(&other.dist)
-    }
-}
 impl Ord for MaxCandidate {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.partial_cmp(other).unwrap_or(Ordering::Equal)
+        // Normal ordering on distance: a max-`BinaryHeap` of
+        // `MaxCandidate` keeps the farthest result on top so it can be
+        // evicted when the result set exceeds `ef`.
+        self.dist.partial_cmp(&other.dist).unwrap_or(Ordering::Equal)
+    }
+}
+impl PartialOrd for MaxCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -135,6 +141,14 @@ impl<T> ConcurrentVec<T> {
     fn as_mut_slice(&mut self) -> &mut [T] {
         self.inner.get_mut().as_mut_slice()
     }
+    /// Returns a mutable slice into the interior buffer from a shared
+    /// reference. This is deliberate interior mutability: `ConcurrentVec`
+    /// hands out disjoint mutable slices to different node ranges from
+    /// parallel build threads, with per-node `RwLock`s (in `HnswGraph`)
+    /// serialising writes to any given node. The clippy lint flags the
+    /// `&self -> &mut` shape, which is exactly the intended (unsafe)
+    /// contract here.
+    #[allow(clippy::mut_from_ref)]
     unsafe fn get_slice_mut(&self, start: usize, len: usize) -> &mut [T] {
         unsafe { std::slice::from_raw_parts_mut((*self.inner.get()).as_mut_ptr().add(start), len) }
     }
@@ -209,19 +223,24 @@ impl HnswGraph {
     }
 
     pub fn get_neighbors(&self, id: u32, layer: usize) -> Vec<u32> {
+        // Take the per-node read lock for BOTH layers. `neighbors0_counts`
+        // is a non-atomic `ConcurrentVec<u16>`; the writers
+        // (`set_neighbors`, `add_edge_bidirectional`) mutate the slots and
+        // the count under the per-node WRITE lock. A reader without the
+        // lock can observe a torn count + stale slots and dereference a
+        // garbage node id during parallel build — undefined behavior. This
+        // read lock pairs with the writers' write lock so there is exactly
+        // one synchronized neighbor-access path (layer 0 and upper).
+        let guards = self.node_locks.read();
+        let _lock = guards[id as usize].read();
+
         if layer == 0 {
-            // Lock-free read for layer 0: fixed-size pre-allocated slots.
-            // Safe because writes only overwrite within the pre-allocated m0 slots
-            // and atomically update the count.
             let m0 = self.config.m0;
             let count = unsafe { *self.neighbors0_counts.as_mut_ptr().add(id as usize) } as usize;
             if count == 0 { return Vec::new(); }
             let slice = unsafe { self.neighbors0.get_slice_mut(id as usize * m0, count) };
             slice.to_vec()
         } else {
-            // Upper layers use Vec<u32> which requires locking for safe concurrent access
-            let guards = self.node_locks.read();
-            let _lock = guards[id as usize].read();
             let upper = unsafe { &*self.neighbors_upper.as_mut_ptr().add(id as usize) };
             if layer - 1 < upper.len() {
                 upper[layer - 1].clone()
@@ -262,44 +281,28 @@ impl HnswGraph {
         results.push(MaxCandidate { id: entry_point, dist: ep_dist });
         visited.mark_visited(entry_point);
 
-        let m0 = self.config.m0;
-
         while let Some(c) = candidates.pop() {
             let farthest_dist = results.peek().unwrap().dist;
             if results.len() >= ef && c.dist > farthest_dist {
                 break;
             }
 
-            // Inline neighbor access to avoid Vec allocation in hot path
-            if layer == 0 {
-                let count = unsafe { *self.neighbors0_counts.as_mut_ptr().add(c.id as usize) } as usize;
-                let nb_slice = unsafe { self.neighbors0.get_slice_mut(c.id as usize * m0, count) };
-                for i in 0..count {
-                    let nb = nb_slice[i];
-                    if !visited.mark_visited(nb) {
-                        let d = cosine_distance_normalized(query, self.get_vector(nb).unwrap());
-                        let farthest_dist = results.peek().unwrap().dist;
-                        if results.len() < ef || d < farthest_dist {
-                            candidates.push(Candidate { id: nb, dist: d });
-                            results.push(MaxCandidate { id: nb, dist: d });
-                            if results.len() > ef {
-                                results.pop();
-                            }
-                        }
-                    }
-                }
-            } else {
-                let neighbors = self.get_neighbors(c.id, layer);
-                for &nb in &neighbors {
-                    if !visited.mark_visited(nb) {
-                        let d = cosine_distance_normalized(query, self.get_vector(nb).unwrap());
-                        let farthest_dist = results.peek().unwrap().dist;
-                        if results.len() < ef || d < farthest_dist {
-                            candidates.push(Candidate { id: nb, dist: d });
-                            results.push(MaxCandidate { id: nb, dist: d });
-                            if results.len() > ef {
-                                results.pop();
-                            }
+            // Single synchronized neighbor-access path for all layers.
+            // `get_neighbors` takes the per-node read lock, which pairs
+            // with the writers' write lock during parallel build — the
+            // previous inlined lock-free layer-0 fast path could read a
+            // torn count + stale slots and dereference a garbage node id
+            // (data race / UB). Correctness over the micro-optimization.
+            let neighbors = self.get_neighbors(c.id, layer);
+            for &nb in &neighbors {
+                if !visited.mark_visited(nb) {
+                    let d = cosine_distance_normalized(query, self.get_vector(nb).unwrap());
+                    let farthest_dist = results.peek().unwrap().dist;
+                    if results.len() < ef || d < farthest_dist {
+                        candidates.push(Candidate { id: nb, dist: d });
+                        results.push(MaxCandidate { id: nb, dist: d });
+                        if results.len() > ef {
+                            results.pop();
                         }
                     }
                 }
@@ -653,5 +656,85 @@ impl HnswGraph {
         final_results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
         final_results.truncate(k);
         final_results
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Deterministic pseudo-random unit-ish vectors for a build test.
+    fn make_vectors(n: usize, dim: usize) -> Vec<(u64, Vec<f32>)> {
+        let mut rng = SmallRng::seed_from_u64(0xC0FFEE);
+        (0..n)
+            .map(|i| {
+                let v: Vec<f32> = (0..dim).map(|_| rng.gen_range(-1.0..1.0)).collect();
+                (i as u64, v)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parallel_build_then_search_is_race_free_and_returns_neighbors() {
+        // This exercises the path the layer-0 locking fix protects:
+        // `insert_parallel` runs `insert_internal` across Rayon threads,
+        // which concurrently calls `get_neighbors` (reader) and
+        // `add_edge_bidirectional` (writer) on overlapping nodes. The
+        // count field (`neighbors0_counts`) is a non-atomic u16, so the
+        // reader MUST hold the per-node lock or it can observe a torn
+        // count + stale slots and dereference a garbage node id. A build
+        // large enough to spill past the 1000-node sequential seed forces
+        // the parallel phase.
+        let dim = 16;
+        let n = 1500;
+        let config = HnswConfig::new(dim)
+            .with_m(8)
+            .with_ef_construction(64)
+            .with_max_elements(n);
+        let mut graph = HnswGraph::new(config);
+
+        let entries = make_vectors(n, dim);
+        graph.insert_parallel(&entries);
+
+        assert_eq!(graph.len(), n, "every entry must be inserted");
+
+        // A query equal to a known inserted vector must return that vector
+        // as (or near) the top result — proving the graph is navigable and
+        // no neighbor list was corrupted during the parallel build.
+        let mut found_self = 0usize;
+        for probe in [0usize, 7, 123, 999, 1001, 1499] {
+            let q = &entries[probe].1;
+            let results = graph.search(q, 5, 64);
+            assert!(!results.is_empty(), "search must return results");
+            if results.iter().any(|(ext, _)| *ext == probe as u64) {
+                found_self += 1;
+            }
+        }
+        // The exact-match query should recover itself for the large
+        // majority of probes (HNSW is approximate, so we allow slack but
+        // require strong self-recall).
+        assert!(
+            found_self >= 5,
+            "expected exact-match self-recall on >=5/6 probes, got {found_self}"
+        );
+    }
+
+    #[test]
+    fn sequential_insert_builds_searchable_graph() {
+        let dim = 8;
+        let config = HnswConfig::new(dim).with_m(8).with_max_elements(100);
+        let mut graph = HnswGraph::new(config);
+        for i in 0..50u64 {
+            let mut v = vec![0.0f32; dim];
+            v[(i as usize) % dim] = 1.0 + (i as f32) * 0.01;
+            graph.insert(i, v);
+        }
+        assert_eq!(graph.len(), 50);
+        let results = graph.search(&{
+            let mut v = vec![0.0f32; dim];
+            v[0] = 1.0;
+            v
+        }, 3, 32);
+        assert_eq!(results.len(), 3, "k=3 must return 3 neighbors from a 50-node graph");
     }
 }

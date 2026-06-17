@@ -76,6 +76,21 @@ pub enum GalaxError {
     #[error("write-write conflict on key; transaction aborted")]
     WriteConflict,
 
+    // -- Authorization errors --
+    /// A role attempted an action it lacks the privilege for. Rendered to
+    /// PostgreSQL SQLSTATE `42501` (insufficient_privilege) on the wire,
+    /// raised by the executor authorization chokepoint *before* any data
+    /// is read or written (Requirement 3, AC3).
+    #[error("permission denied: role '{role}' may not {action} on {object}")]
+    InsufficientPrivilege {
+        /// The role that was denied.
+        role: String,
+        /// The action it attempted (`select`/`insert`/`update`/`delete`/`ddl`/`admin`).
+        action: &'static str,
+        /// The object it targeted (e.g. `table:docs` or `cluster`).
+        object: String,
+    },
+
     // -- Versioning errors --
     /// The requested version tag does not exist.
     #[error("version tag not found: {0}")]
@@ -130,4 +145,51 @@ pub enum GalaxError {
     /// An internal error that doesn't fit other categories.
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl GalaxError {
+    /// The PostgreSQL SQLSTATE code that best describes this error, used
+    /// by the wire protocol's `ErrorResponse`. Codes follow the
+    /// PostgreSQL error-code appendix so standard clients
+    /// (`psql`, `tokio-postgres`, JDBC, …) classify failures correctly.
+    ///
+    /// Errors without a more specific class fall back to `XX000`
+    /// (internal_error) rather than a misleading syntax-error code.
+    pub fn sqlstate(&self) -> &'static str {
+        match self {
+            // Class 42 — syntax error or access rule violation.
+            GalaxError::SqlParse { .. } => "42601", // syntax_error
+            GalaxError::InsufficientPrivilege { .. } => "42501", // insufficient_privilege
+            GalaxError::TableNotFound(_) => "42P01", // undefined_table
+            GalaxError::TableAlreadyExists(_) => "42P07", // duplicate_table
+            GalaxError::ColumnNotFound(_) => "42703", // undefined_column
+
+            // Class 53 — insufficient resources.
+            GalaxError::TooManyConnections => "53300", // too_many_connections
+            GalaxError::DiskFull => "53100",           // disk_full
+            GalaxError::BackPressure => "53200",       // out_of_memory (back-pressure)
+
+            // Class 40 — transaction rollback.
+            GalaxError::WriteConflict => "40001", // serialization_failure
+
+            // Class 0A — feature not supported.
+            GalaxError::SemanticSnapshotNotSupported
+            | GalaxError::SemanticConsistencyRequired
+            | GalaxError::NotYetAvailable { .. } => "0A000", // feature_not_supported
+
+            // Class 42 — restricted/generated column update (the embedding
+            // source column behaves like a GENERATED ALWAYS column).
+            GalaxError::EmbeddingSourceUpdate { .. } => "428C9", // generated_always
+
+            // Class 58 — system error (I/O, corruption).
+            GalaxError::Io(_)
+            | GalaxError::ChecksumMismatch { .. }
+            | GalaxError::InvalidMagic(_)
+            | GalaxError::CorruptWalRecord { .. } => "58030", // io_error
+
+            // Everything else (Internal, AppendOnlyTable, Encryption, Kms,
+            // Sidecar, Embedding, Backup, Version tag): internal error.
+            _ => "XX000",
+        }
+    }
 }

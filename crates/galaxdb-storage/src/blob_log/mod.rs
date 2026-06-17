@@ -467,17 +467,11 @@ impl BlobLog {
             let (live_bytes, live_count) = live_by_file.get(&file_id).copied().unwrap_or((0, 0));
 
             // Estimate total count from file size (approximate)
-            let avg_entry_size = if live_count > 0 {
-                live_bytes / live_count
-            } else {
+            let avg_entry_size = live_bytes.checked_div(live_count).unwrap_or(
                 // Rough estimate
-                BLOB_ENTRY_HEADER_SIZE as u64 + 2048 + BLOB_ENTRY_FOOTER_SIZE as u64
-            };
-            let total_count = if avg_entry_size > 0 {
-                total_bytes / avg_entry_size
-            } else {
-                0
-            };
+                BLOB_ENTRY_HEADER_SIZE as u64 + 2048 + BLOB_ENTRY_FOOTER_SIZE as u64,
+            );
+            let total_count = total_bytes.checked_div(avg_entry_size).unwrap_or(0);
 
             stats.push(BlobFileStats {
                 live_bytes,

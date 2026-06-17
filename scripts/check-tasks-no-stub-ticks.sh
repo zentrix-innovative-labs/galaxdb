@@ -14,9 +14,16 @@ set -euo pipefail
 
 TASKS=".kiro/specs/galaxdb-v1-engine/tasks.md"
 
+# The spec tree under `.kiro/` is intentionally gitignored, so it is not
+# present on a fresh CI checkout. When the tracker is absent we skip the
+# tick-consistency checks (they have nothing to compare against) but still
+# run the production-code stub tripwires below — those grep `crates/`,
+# which IS tracked, and are the part of this gate that protects shipped
+# code. Locally (where `.kiro/` exists) every check runs.
+HAVE_TASKS=1
 if [[ ! -f "$TASKS" ]]; then
-  echo "ERROR: $TASKS not found"
-  exit 2
+  echo "NOTE: $TASKS not present (gitignored spec tree); running production-code tripwires only."
+  HAVE_TASKS=0
 fi
 
 fail=0
@@ -28,6 +35,8 @@ check_stub_tick() {
   local stub_pattern="$2"
   shift 2
   local files=("$@")
+
+  [[ "$HAVE_TASKS" -eq 1 ]] || return 0
 
   if grep -E "^\s*- \[x\] $task_pattern" "$TASKS" >/dev/null 2>&1; then
     for f in "${files[@]}"; do
@@ -51,6 +60,7 @@ check_stub_tick '37\.\d' 'task: "37"' crates/galaxdb-sql/src/executor.rs
 # We look for the exact phrase the Phase B entry used to carry
 # (`[ ] B6.1: Deferred.`) rather than a loose substring, so "closed by
 # Phase B6" references in later entries don't false-positive.
+if [[ "$HAVE_TASKS" -eq 1 ]]; then
 for tid in '32\.3' '32\.4' '32\.6'; do
   if grep -E "^\s*- \[x\] $tid" "$TASKS" >/dev/null 2>&1; then
     if grep -q '^\s*-\s*\[\s\]\s*B6\.1: Deferred\.' docs/CONSOLIDATION.md; then
@@ -69,6 +79,7 @@ for tid in '10\.5' '33\.5'; do
     fi
   fi
 done
+fi
 
 # Forbid 'In the full implementation' anywhere in crates/ (Phase B tripwire)
 if grep -rn 'In the full implementation' crates/ 2>/dev/null | grep -v -E '^\s*#|//.*deleted'; then

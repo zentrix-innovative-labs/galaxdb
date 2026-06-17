@@ -1,0 +1,7 @@
+# Pin the toolchain so local builds, CI, and release builds all use the
+# same rustc/clippy. This prevents the class of failure where a newer
+# clippy on CI flags lints the dev machine's older clippy never saw.
+# CI's `dtolnay/rust-toolchain@stable` resolves to the same channel.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

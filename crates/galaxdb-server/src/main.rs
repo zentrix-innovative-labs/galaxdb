@@ -14,7 +14,6 @@
 //! graceful shutdown on SIGTERM/SIGINT.
 
 use galaxdb_server::{start, ServerConfig};
-use galaxdb_observe;
 
 #[tokio::main]
 async fn main() {
@@ -53,12 +52,57 @@ async fn main() {
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9090);
 
+    // Task 6 (Req 1): authentication mode. SCRAM-SHA-256 auth is enabled
+    // with `--auth` or `GALAXDB_AUTH=1`. When enabled the server provisions
+    // the initial superuser from GALAXDB_INITIAL_SUPERUSER[_PASSWORD] on a
+    // fresh catalog and refuses to start if neither is set (never ships a
+    // default password). Without it the server runs in trusted-local mode
+    // (v1-compatible) and logs a warning that auth is disabled.
+    let auth_enabled = std::env::args().any(|a| a == "--auth")
+        || matches!(std::env::var("GALAXDB_AUTH").as_deref(), Ok("1") | Ok("true"));
+    let trusted_local_user = std::env::var("GALAXDB_TRUSTED_LOCAL_USER")
+        .unwrap_or_else(|_| "galaxdb".to_string());
+
+    // Task 7 (Req 2): TLS configuration. Mode comes from --tls-mode or
+    // GALAXDB_TLS_MODE (disable|allow|require, default disable); cert and
+    // key paths from --tls-cert/--tls-key or GALAXDB_TLS_CERT/_KEY.
+    let tls_mode_str = std::env::args()
+        .position(|a| a == "--tls-mode")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .or_else(|| std::env::var("GALAXDB_TLS_MODE").ok())
+        .unwrap_or_else(|| "disable".to_string());
+    let tls_mode = galaxdb_wire::tls::TlsMode::parse(&tls_mode_str)
+        .unwrap_or_else(|e| panic!("invalid --tls-mode: {e}"));
+    let tls_cert_path = std::env::args()
+        .position(|a| a == "--tls-cert")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .or_else(|| std::env::var("GALAXDB_TLS_CERT").ok());
+    let tls_key_path = std::env::args()
+        .position(|a| a == "--tls-key")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .or_else(|| std::env::var("GALAXDB_TLS_KEY").ok());
+
+    // Task 4 (Req 4): optional JSONL security audit log.
+    let audit_log_path = std::env::args()
+        .position(|a| a == "--audit-log")
+        .and_then(|i| std::env::args().nth(i + 1))
+        .or_else(|| std::env::var("GALAXDB_AUDIT_LOG").ok());
+
     let cfg = ServerConfig {
         bind_addr: format!("0.0.0.0:{port}"),
         data_dir,
         max_connections: 1000,
         sidecar_binary,
         model_id,
+        auth_enabled,
+        trusted_local_user,
+        // Read from env in `start()` via resolve_initial_superuser; leave
+        // None here so the password never sits in an argv-derived struct.
+        initial_superuser: None,
+        tls_mode,
+        tls_cert_path,
+        tls_key_path,
+        audit_log_path,
     };
 
     // Task 40.1: start the HTTP observability server (/health + /metrics)

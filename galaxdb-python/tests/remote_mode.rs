@@ -24,8 +24,7 @@ fn start_test_server(rt: &tokio::runtime::Runtime) -> (String, tempfile::TempDir
         max_connections: 16,
         sidecar_binary: None,
         model_id: None,
-    };
-        max_connections: 16,
+        ..Default::default()
     };
     let (addr, _handle) = rt.block_on(async {
         tokio::time::timeout(Duration::from_secs(5), start(cfg))

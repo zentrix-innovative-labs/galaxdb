@@ -22,6 +22,7 @@ async fn start_server() -> (String, tempfile::TempDir) {
         max_connections: 16,
         sidecar_binary: None,
         model_id: None,
+        ..Default::default()
     };
 
     let (addr, _handle) = start(cfg).await.expect("server failed to bind");
@@ -30,6 +31,29 @@ async fn start_server() -> (String, tempfile::TempDir) {
         addr.port()
     );
     (conn_str, data_dir)
+}
+
+/// Start a server with SCRAM-SHA-256 authentication enabled and an
+/// initial superuser provisioned from config. Returns the bound port and
+/// the tempdir (kept alive by the caller).
+async fn start_auth_server(
+    superuser: &str,
+    password: &str,
+) -> (u16, tempfile::TempDir) {
+    let data_dir = tempfile::tempdir().unwrap();
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        data_dir: data_dir.path().to_string_lossy().to_string(),
+        max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
+        auth_enabled: true,
+        trusted_local_user: "galaxdb".to_string(),
+        initial_superuser: Some((superuser.to_string(), password.to_string())),
+        ..Default::default()
+    };
+    let (addr, _handle) = start(cfg).await.expect("auth server failed to bind");
+    (addr.port(), data_dir)
 }
 
 #[tokio::test]
@@ -364,4 +388,496 @@ async fn http_observability_starts_alongside_wire_server() {
         .to_str()
         .unwrap();
     assert!(ct.contains("text/plain"), "/metrics must return Prometheus text format");
+}
+
+// ---------------------------------------------------------------------------
+// Task 6: SCRAM-SHA-256 authentication over the wire (Req 1)
+// ---------------------------------------------------------------------------
+
+/// A correct password authenticates and can run statements; the role is
+/// the provisioned superuser so it may create tables and roles.
+#[tokio::test]
+async fn scram_correct_password_connects() {
+    let (port, _td) = start_auth_server("admin", "s3cr3t").await;
+    let conn_str = format!(
+        "host=127.0.0.1 port={port} user=admin password=s3cr3t dbname=galaxdb sslmode=disable"
+    );
+
+    let (client, connection) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("SCRAM connect with correct password must succeed");
+
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // The authenticated superuser can run DDL + DML.
+    client
+        .simple_query("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .await
+        .expect("superuser DDL must succeed");
+    client
+        .simple_query("INSERT INTO t (id, n) VALUES (1, 10)")
+        .await
+        .expect("superuser INSERT must succeed");
+    let msgs = client.simple_query("SELECT id, n FROM t").await.unwrap();
+    let rows: Vec<_> = msgs
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1);
+}
+
+/// A wrong password is rejected with SQLSTATE `28P01` and no session is
+/// established.
+#[tokio::test]
+async fn scram_wrong_password_is_rejected_28p01() {
+    let (port, _td) = start_auth_server("admin", "right-password").await;
+    let conn_str = format!(
+        "host=127.0.0.1 port={port} user=admin password=WRONG-password dbname=galaxdb sslmode=disable"
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect attempt timed out");
+
+    let err = match result {
+        Ok(_) => panic!("wrong password must fail to connect"),
+        Err(e) => e,
+    };
+    // tokio-postgres surfaces the server's ErrorResponse; its SQLSTATE
+    // must be 28P01 (invalid_password).
+    let code = err
+        .as_db_error()
+        .map(|e| e.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "28P01", "wrong password must map to SQLSTATE 28P01, got {code:?} ({err})");
+}
+
+/// An unknown role is rejected with `28P01` (and the message does not
+/// distinguish "no such role" from "wrong password", so it can't be used
+/// to enumerate roles).
+#[tokio::test]
+async fn scram_unknown_role_is_rejected_28p01() {
+    let (port, _td) = start_auth_server("admin", "pw").await;
+    let conn_str = format!(
+        "host=127.0.0.1 port={port} user=ghost password=anything dbname=galaxdb sslmode=disable"
+    );
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect attempt timed out");
+
+    let err = match result {
+        Ok(_) => panic!("unknown role must fail to connect"),
+        Err(e) => e,
+    };
+    let code = err
+        .as_db_error()
+        .map(|e| e.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "28P01", "unknown role must map to SQLSTATE 28P01, got {code:?} ({err})");
+}
+
+/// End-to-end authorization over the wire (task 5 + 6 together): the
+/// superuser creates a non-privileged role and a table; that role is
+/// denied SELECT with `42501` until granted, then succeeds — all without
+/// a server restart. This is the wire-path half of task 5.6.
+#[tokio::test]
+async fn wire_authz_denied_then_granted() {
+    let (port, _td) = start_auth_server("root", "rootpw").await;
+
+    // 1. Superuser sets up the table, a row, and a plain role with a
+    //    password.
+    let admin_dsn = format!(
+        "host=127.0.0.1 port={port} user=root password=rootpw dbname=galaxdb sslmode=disable"
+    );
+    let (admin, admin_conn) = tokio_postgres::connect(&admin_dsn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = admin_conn.await;
+    });
+    admin
+        .simple_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .await
+        .unwrap();
+    admin
+        .simple_query("INSERT INTO docs (id, body) VALUES (1, 'hello')")
+        .await
+        .unwrap();
+    admin
+        .simple_query("CREATE ROLE alice PASSWORD 'alicepw'")
+        .await
+        .unwrap();
+
+    // 2. alice connects (auth succeeds — she has a verifier) but has no
+    //    grant on docs, so SELECT is denied with 42501.
+    let alice_dsn = format!(
+        "host=127.0.0.1 port={port} user=alice password=alicepw dbname=galaxdb sslmode=disable"
+    );
+    let (alice, alice_conn) = tokio_postgres::connect(&alice_dsn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = alice_conn.await;
+    });
+    let denied = alice.simple_query("SELECT id, body FROM docs").await;
+    let err = denied.expect_err("alice without a grant must be denied");
+    let code = err
+        .as_db_error()
+        .map(|e| e.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "42501", "ungranted SELECT must map to 42501, got {code:?} ({err})");
+
+    // 3. Superuser grants SELECT.
+    admin
+        .simple_query("GRANT SELECT ON docs TO alice")
+        .await
+        .unwrap();
+
+    // 4. alice can now SELECT — the grant took effect with no restart and
+    //    on the same live connection.
+    let msgs = alice
+        .simple_query("SELECT id, body FROM docs")
+        .await
+        .expect("after GRANT, alice's SELECT must succeed");
+    let rows: Vec<_> = msgs
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1, "alice must see the one row after GRANT");
+
+    // 5. A non-superuser cannot administer roles/grants.
+    let denied = alice.simple_query("GRANT SELECT ON docs TO alice").await;
+    let err = denied.expect_err("alice may not GRANT");
+    let code = err
+        .as_db_error()
+        .map(|e| e.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "42501", "non-superuser GRANT must map to 42501, got {code:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Task 7: TLS transport encryption (Req 2)
+// ---------------------------------------------------------------------------
+
+/// Generate a self-signed cert+key for `localhost`, write them to PEM
+/// files in `dir`, and return the two paths. Test-only: the cert is not
+/// from a real CA, so the client below uses an accept-any verifier.
+fn write_test_cert(dir: &std::path::Path) -> (String, String) {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .expect("generate self-signed cert");
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+    let cert_path = dir.join("server.crt");
+    let key_path = dir.join("server.key");
+    std::fs::write(&cert_path, cert_pem).unwrap();
+    std::fs::write(&key_path, key_pem).unwrap();
+    (
+        cert_path.to_string_lossy().to_string(),
+        key_path.to_string_lossy().to_string(),
+    )
+}
+
+/// A rustls client config that accepts any server certificate. TEST ONLY —
+/// it disables authentication of the server, which is acceptable here
+/// because the test only verifies that the TLS *channel* is established
+/// and that SCRAM runs inside it, not that PKI validation works.
+fn insecure_tls_connector() -> tokio_postgres_rustls::MakeRustlsConnect {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+
+    #[derive(Debug)]
+    struct AcceptAny;
+    impl ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAny))
+        .with_no_client_auth();
+    tokio_postgres_rustls::MakeRustlsConnect::new(config)
+}
+
+/// `sslmode=require` against a TLS-enabled server: the client negotiates
+/// TLS, completes the handshake, and runs SQL over the encrypted channel.
+#[tokio::test]
+async fn tls_require_connects_over_encrypted_channel() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let data_dir = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = write_test_cert(data_dir.path());
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        data_dir: data_dir.path().to_string_lossy().to_string(),
+        max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
+        tls_mode: galaxdb_wire::tls::TlsMode::Require,
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(key_path),
+        ..Default::default()
+    };
+    let (addr, _handle) = start(cfg).await.expect("tls server failed to bind");
+
+    let conn_str = format!(
+        "host=localhost port={} user=galaxdb dbname=galaxdb sslmode=require",
+        addr.port()
+    );
+    let connector = insecure_tls_connector();
+    let (client, connection) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, connector),
+    )
+    .await
+    .expect("TLS connect timed out")
+    .expect("TLS connect with sslmode=require must succeed");
+
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // Run real SQL over the TLS channel.
+    client
+        .simple_query("CREATE TABLE secure_t (id INTEGER PRIMARY KEY, v TEXT)")
+        .await
+        .expect("DDL over TLS must succeed");
+    client
+        .simple_query("INSERT INTO secure_t (id, v) VALUES (1, 'tls-works')")
+        .await
+        .expect("INSERT over TLS must succeed");
+    let msgs = client
+        .simple_query("SELECT id, v FROM secure_t")
+        .await
+        .unwrap();
+    let rows: Vec<_> = msgs
+        .into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("v"), Some("tls-works"));
+}
+
+/// `require` mode must reject a plaintext StartupMessage that arrives
+/// without a prior `SSLRequest` (Req 2 AC3). `tokio-postgres` with
+/// `NoTls` + `sslmode=disable` sends a plaintext startup, which the server
+/// must refuse.
+#[tokio::test]
+async fn tls_require_rejects_plaintext_startup() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let data_dir = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = write_test_cert(data_dir.path());
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        data_dir: data_dir.path().to_string_lossy().to_string(),
+        max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
+        tls_mode: galaxdb_wire::tls::TlsMode::Require,
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(key_path),
+        ..Default::default()
+    };
+    let (addr, _handle) = start(cfg).await.expect("tls server failed to bind");
+
+    // sslmode=disable forces a plaintext StartupMessage with no SSLRequest.
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=galaxdb dbname=galaxdb sslmode=disable",
+        addr.port()
+    );
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect attempt timed out");
+
+    assert!(
+        result.is_err(),
+        "require mode must reject a plaintext (no-TLS) connection"
+    );
+}
+
+/// `allow` mode still serves plaintext clients that skip `SSLRequest`,
+/// so existing non-TLS clients keep working (backward compatibility).
+#[tokio::test]
+async fn tls_allow_still_serves_plaintext() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let data_dir = tempfile::tempdir().unwrap();
+    let (cert_path, key_path) = write_test_cert(data_dir.path());
+
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        data_dir: data_dir.path().to_string_lossy().to_string(),
+        max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
+        tls_mode: galaxdb_wire::tls::TlsMode::Allow,
+        tls_cert_path: Some(cert_path),
+        tls_key_path: Some(key_path),
+        ..Default::default()
+    };
+    let (addr, _handle) = start(cfg).await.expect("server failed to bind");
+
+    let conn_str = format!(
+        "host=127.0.0.1 port={} user=galaxdb dbname=galaxdb sslmode=disable",
+        addr.port()
+    );
+    let (client, connection) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("allow mode must still accept plaintext clients");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    client
+        .simple_query("CREATE TABLE plain_t (id INTEGER PRIMARY KEY)")
+        .await
+        .expect("plaintext DDL under allow mode must succeed");
+}
+
+// ---------------------------------------------------------------------------
+// Req 4: security audit sink wired end-to-end (JSONL file)
+// ---------------------------------------------------------------------------
+
+/// With an audit log configured, the server records authentication
+/// outcomes, authorization denials, and role/grant changes to the JSONL
+/// file. This proves the AuditSink seam is actually wired into the running
+/// server (auth path + executor chokepoint), not just defined.
+#[tokio::test]
+async fn audit_log_records_auth_authz_and_admin_events() {
+    let data_dir = tempfile::tempdir().unwrap();
+    let audit_path = data_dir.path().join("audit.jsonl");
+    let cfg = ServerConfig {
+        bind_addr: "127.0.0.1:0".to_string(),
+        data_dir: data_dir.path().to_string_lossy().to_string(),
+        max_connections: 16,
+        sidecar_binary: None,
+        model_id: None,
+        auth_enabled: true,
+        trusted_local_user: "galaxdb".to_string(),
+        initial_superuser: Some(("root".to_string(), "rootpw".to_string())),
+        audit_log_path: Some(audit_path.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let (addr, _handle) = start(cfg).await.expect("server failed to bind");
+    let port = addr.port();
+
+    // Superuser creates a table (DDL → Allowed admin/ddl event), a role,
+    // and grants nothing yet.
+    let admin_dsn =
+        format!("host=127.0.0.1 port={port} user=root password=rootpw dbname=galaxdb sslmode=disable");
+    let (admin, admin_conn) = tokio_postgres::connect(&admin_dsn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = admin_conn.await;
+    });
+    admin
+        .simple_query("CREATE TABLE docs (id INTEGER PRIMARY KEY, body TEXT)")
+        .await
+        .unwrap();
+    admin
+        .simple_query("CREATE ROLE alice PASSWORD 'alicepw'")
+        .await
+        .unwrap();
+
+    // A wrong-password login (Denied auth event).
+    let bad_dsn =
+        format!("host=127.0.0.1 port={port} user=alice password=WRONG dbname=galaxdb sslmode=disable");
+    let _ = tokio_postgres::connect(&bad_dsn, NoTls).await;
+
+    // alice logs in (Allowed auth event) and is denied SELECT (Denied
+    // authz event).
+    let alice_dsn =
+        format!("host=127.0.0.1 port={port} user=alice password=alicepw dbname=galaxdb sslmode=disable");
+    let (alice, alice_conn) = tokio_postgres::connect(&alice_dsn, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = alice_conn.await;
+    });
+    let _ = alice.simple_query("SELECT id FROM docs").await; // denied 42501
+
+    // Give the file writes a moment to flush (synchronous, but the bad
+    // login closes async).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let contents = std::fs::read_to_string(&audit_path).expect("audit log must exist");
+    let events: Vec<serde_json::Value> = contents
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each audit line is valid JSON"))
+        .collect();
+    assert!(!events.is_empty(), "audit log must contain events");
+
+    let has = |kind: &str, action: &str, outcome: &str| {
+        events.iter().any(|e| {
+            e["kind"] == kind && e["action"] == action && e["outcome"] == outcome
+        })
+    };
+
+    // Auth: root + alice logged in (allowed); alice's wrong password denied.
+    assert!(has("auth", "login", "allowed"), "expected an allowed login event");
+    assert!(has("auth", "login", "denied"), "expected a denied login event");
+    // Authz: DDL by superuser allowed; alice's SELECT without a grant denied.
+    assert!(has("authz", "ddl", "allowed"), "expected an allowed DDL event");
+    assert!(
+        has("authz", "admin", "allowed"),
+        "expected an allowed admin event (CREATE ROLE)"
+    );
+    assert!(
+        has("authz", "select", "denied"),
+        "expected a denied SELECT event for alice"
+    );
 }

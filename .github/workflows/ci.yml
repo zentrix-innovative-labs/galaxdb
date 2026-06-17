@@ -23,6 +23,9 @@ jobs:
         with:
           components: clippy
 
+      - name: Install native build deps (protoc, cmake)
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
+
       - name: Cache cargo registry & build
         uses: actions/cache@v4
         with:
@@ -106,6 +109,9 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install native build deps (protoc, cmake)
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -118,10 +124,20 @@ jobs:
       - name: Build release server
         run: cargo build --release -p galaxdb-server
 
+      - name: Create and activate a virtualenv
+        # `maturin develop` requires an active virtualenv/conda env to
+        # install the built extension into. `actions/setup-python` gives a
+        # bare interpreter with none, so create one and export it for all
+        # subsequent steps via GITHUB_PATH + VIRTUAL_ENV.
+        run: |
+          python -m venv .venv
+          echo "$PWD/.venv/bin" >> "$GITHUB_PATH"
+          echo "VIRTUAL_ENV=$PWD/.venv" >> "$GITHUB_ENV"
+
       - name: Install Python test deps
         run: |
           python -m pip install --upgrade pip
-          pip install maturin pytest lance pyarrow torch --extra-index-url https://download.pytorch.org/whl/cpu
+          pip install maturin pytest pylance pyarrow torch psycopg2-binary sqlalchemy --extra-index-url https://download.pytorch.org/whl/cpu
 
       - name: Build & install galaxdb wheel
         run: maturin develop --release -m galaxdb-python/Cargo.toml
@@ -146,6 +162,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native build deps (protoc, cmake)
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
 
       - name: Cache cargo
         uses: actions/cache@v4

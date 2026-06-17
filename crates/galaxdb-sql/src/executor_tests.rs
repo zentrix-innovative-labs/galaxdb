@@ -619,9 +619,9 @@ fn context_restore_validates_and_copies() {
         use tracing_subscriber::layer::{Context, Layer};
         use tracing_subscriber::prelude::*;
 
-        /// Thread-local + global bucket. Any spans the layer sees get
-        /// routed to the current thread's bucket if one is set,
-        /// otherwise dropped.
+        // Thread-local + global bucket. Any spans the layer sees get
+        // routed to the current thread's bucket if one is set,
+        // otherwise dropped.
         thread_local! {
             static CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<String>>>>> =
                 const { std::cell::RefCell::new(None) };
@@ -834,6 +834,9 @@ impl VectorSearchBackend for StubVectorBackend {
 struct FailingVectorBackend;
 
 impl FailingVectorBackend {
+    // Returns a trait object rather than Self by design: tests want a
+    // ready-to-inject `Arc<dyn VectorSearchBackend>`.
+    #[allow(clippy::new_ret_no_self)]
     fn new() -> Arc<dyn VectorSearchBackend> {
         Arc::new(Self)
     }

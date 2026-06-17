@@ -105,6 +105,20 @@ pub enum QueryPlan {
     Analyze { table: String },
     /// SHOW EMBEDDING HEALTH.
     ShowEmbeddingHealth { table: Option<String> },
+    /// CREATE ROLE (Req 3).
+    CreateRole(crate::ast::CreateRoleStmt),
+    /// DROP ROLE.
+    DropRole { name: String, if_exists: bool },
+    /// ALTER ROLE ... PASSWORD.
+    AlterRolePassword { name: String, password: String },
+    /// GRANT privilege ON table TO role.
+    Grant(crate::ast::GrantStmt),
+    /// REVOKE privilege ON table FROM role.
+    Revoke(crate::ast::GrantStmt),
+    /// CREATE INDEX (Req 5).
+    CreateIndex(crate::ast::CreateIndexStmt),
+    /// DROP INDEX.
+    DropIndex { name: String, if_exists: bool },
 }
 
 /// Search strategy chosen by the adaptive planner (Req 22).

@@ -1,12 +1,15 @@
 //! GalaxDB SQL — SQL Parser, Query Planner, Query Executor, Transaction Manager.
 
 pub mod ast;
+pub mod auth_store;
 pub mod executor;
 pub mod parser;
 pub mod planner;
 pub mod row_codec;
+pub mod secondary_index;
 pub mod transaction;
 
+pub use auth_store::{AuthStore, RoleRecord};
 pub use executor::{
     execute_legacy, execute_with_context, is_text_column, Catalog, CatalogColumn, ExecuteResult,
     ExecutorContext, InMemorySystemColumnSink, MinHashPolicy, Row, SystemColumnSink,

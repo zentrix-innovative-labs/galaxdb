@@ -26,8 +26,16 @@ management (local, environment, external command, HashiCorp Vault).
 construction.
 
 **AI-native SQL** — `EMBEDDING MODEL` columns with a local embedding sidecar (any HuggingFace model),
-`SEMANTIC_MATCH`, `AT VERSION` time-travel, version tags, MinHash near-duplicate detection
-(`WHERE NOT DUPLICATE`), `FOR TRAINING` Lance export to PyTorch, and EU AI Act Article 13 data lineage.
+`SEMANTIC_MATCH`, `AT VERSION` time-travel (including over flushed on-disk/SST data), version tags, MinHash
+near-duplicate detection (`WHERE NOT DUPLICATE`), `FOR TRAINING` Lance export to PyTorch, and EU AI Act
+Article 13 data lineage. Single-column secondary indexes (`CREATE INDEX` / `DROP INDEX`) accelerate
+equality and range lookups on non-primary-key columns, with a transparent full-scan fallback.
+
+**Security** — SCRAM-SHA-256 wire authentication, TLS 1.2/1.3 transport encryption (rustls, no OpenSSL),
+role-based access control with table-level `GRANT` / `REVOKE` (unauthorized statements map to SQLSTATE
+`42501`), and a JSONL security audit log recording authentication, authorization, and admin events.
+AES-256-GCM encryption at rest with pluggable key management (local file, environment, external command,
+HashiCorp Vault).
 
 **Interfaces** — PostgreSQL wire protocol, Python client (embedded and remote), `pg_catalog` compatibility,
 local backup/restore, and full observability (`/health`, `/metrics`, tracing).
@@ -39,20 +47,15 @@ local backup/restore, and full observability (`/health`, `/metrics`, tracing).
 Completing the open-source engine for production and managed-cloud use. Follow the linked issues for status.
 
 ### Security
-- Wire authentication — SCRAM-SHA-256
-- TLS transport encryption
-- Roles, privileges, and table-level `GRANT` / `REVOKE`
 - Native cloud KMS key providers (AWS KMS, GCP KMS, Azure Key Vault)
 
 ### PostgreSQL compatibility
-- Secondary (B-tree) indexes for non-primary-key lookups
 - Extended query protocol and prepared statements (ORM and connection-pooler support)
 - Faster single-row INSERT throughput
 - `COPY` protocol for bulk ingestion
 
 ### Durability and completeness
 - Backup and restore to object storage (S3, GCS, Azure Blob, S3-compatible)
-- `AT VERSION` time-travel over on-disk data
 - Embedding columns included in `FOR TRAINING` exports
 - Automatic memory and configuration tuning
 

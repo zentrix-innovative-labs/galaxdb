@@ -693,7 +693,7 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
 fn base64_encode(bytes: &[u8]) -> String {
     const TABLE: &[u8; 64] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(((bytes.len() + 2) / 3) * 4);
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
     let chunks = bytes.chunks(3);
     for chunk in chunks {
         let (b0, b1, b2) = match chunk.len() {
@@ -853,7 +853,7 @@ mod tests {
     fn local_key_provider_from_file_wrong_size() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bad_key");
-        std::fs::write(&path, &[0u8; 16]).unwrap();
+        std::fs::write(&path, [0u8; 16]).unwrap();
         assert!(LocalKeyProvider::from_file(&path).is_err());
     }
 
@@ -861,7 +861,7 @@ mod tests {
     fn local_key_provider_from_file_valid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("good_key");
-        std::fs::write(&path, &[0xAAu8; 32]).unwrap();
+        std::fs::write(&path, [0xAAu8; 32]).unwrap();
         let provider = LocalKeyProvider::from_file(&path).unwrap();
 
         let (pt, enc) = provider.generate_data_key().unwrap();
@@ -964,7 +964,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let master_path = dir.path().join("master.key");
-        std::fs::write(&master_path, &[0xA5u8; 32]).unwrap();
+        std::fs::write(&master_path, [0xA5u8; 32]).unwrap();
 
         let wrapper = dir.path().join("kms_wrapper.py");
         // The wrapper accepts `generate` or `decrypt`. For `generate`

@@ -36,7 +36,7 @@ impl UringQueue {
     fn new() -> io::Result<Self> {
         let ring = IoUring::builder()
             .build(QUEUE_DEPTH)
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("io_uring init: {}", e)))?;
+            .map_err(|e| io::Error::other(format!("io_uring init: {}", e)))?;
         Ok(Self { ring })
     }
 
@@ -52,13 +52,13 @@ impl UringQueue {
             self.ring
                 .submission()
                 .push(&read_op)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring submission full"))?;
+                .map_err(|_| io::Error::other("io_uring submission full"))?;
         }
 
         self.ring.submit_and_wait(1)?;
 
         let cqe = self.ring.completion().next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no io_uring completion"))?;
+            .ok_or_else(|| io::Error::other("no io_uring completion"))?;
 
         let result = cqe.result();
         if result < 0 {
@@ -79,13 +79,13 @@ impl UringQueue {
             self.ring
                 .submission()
                 .push(&write_op)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring submission full"))?;
+                .map_err(|_| io::Error::other("io_uring submission full"))?;
         }
 
         self.ring.submit_and_wait(1)?;
 
         let cqe = self.ring.completion().next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no io_uring completion"))?;
+            .ok_or_else(|| io::Error::other("no io_uring completion"))?;
 
         let result = cqe.result();
         if result < 0 {
@@ -105,13 +105,13 @@ impl UringQueue {
             self.ring
                 .submission()
                 .push(&fsync_op)
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "io_uring submission full"))?;
+                .map_err(|_| io::Error::other("io_uring submission full"))?;
         }
 
         self.ring.submit_and_wait(1)?;
 
         let cqe = self.ring.completion().next()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "no io_uring completion"))?;
+            .ok_or_else(|| io::Error::other("no io_uring completion"))?;
 
         let result = cqe.result();
         if result < 0 {
@@ -216,10 +216,13 @@ impl IoScheduler for IoUringScheduler {
         Box::pin(async move {
             let start = Instant::now();
 
-            // Open/create the file
+            // Open/create the file. This is a positioned write (we seek to
+            // `offset` per chunk), so we must NOT truncate — existing data
+            // outside the written range has to be preserved.
             let f = OpenOptions::new()
                 .write(true)
                 .create(true)
+                .truncate(false)
                 .open(file)?;
             let fd = f.as_raw_fd();
 

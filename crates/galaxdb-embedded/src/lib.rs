@@ -121,6 +121,20 @@ pub struct Database {
     /// catalog. Carried here so `&self` read-only methods
     /// (`table_exists`, `table_count`) don't need to rebuild it.
     catalog: galaxdb_sql::executor::Catalog,
+    /// The authenticated session this database handle runs statements
+    /// under, if any (Req 3). `None` is trusted in-process embedded use:
+    /// no authenticated principal, so the executor skips authorization
+    /// (today's behavior, preserved for direct PyO3/Rust callers). The
+    /// wire server sets this to the role established by the SCRAM
+    /// handshake (task 6) via [`Database::with_session`] so every
+    /// networked statement is authorization-checked at the executor
+    /// chokepoint (Req 3, AC7).
+    session: Option<galaxdb_auth::SessionContext>,
+    /// Security audit sink (Req 4). When set, the executor records
+    /// authorization denials and role/grant/DDL changes. `None` discards
+    /// events (no-op). The server attaches a real sink (e.g. a JSONL file)
+    /// when one is configured.
+    audit: Option<Arc<dyn galaxdb_auth::AuditSink>>,
 }
 
 impl Database {
@@ -146,6 +160,8 @@ impl Database {
             tag_catalog: Arc::new(Mutex::new(TagCatalog::new())),
             vector_indexes: Arc::new(RwLock::new(HashMap::new())),
             catalog: galaxdb_sql::executor::Catalog::new(),
+            session: None,
+            audit: None,
         })
     }
 
@@ -198,6 +214,105 @@ impl Database {
         Ok(db)
     }
 
+    /// Attach an authenticated session to this database handle so every
+    /// statement it executes is authorization-checked against the role's
+    /// privileges at the executor chokepoint (Req 3, AC7).
+    ///
+    /// The wire server calls this after a successful SCRAM handshake
+    /// (task 6) so a networked client runs under its authenticated role.
+    /// Without a session (the default), the handle is trusted in-process
+    /// embedded mode and skips authorization — there is no authenticated
+    /// principal and the caller already holds the engine directly.
+    ///
+    /// Consumes and returns `self` for builder-style use.
+    pub fn with_session(mut self, session: galaxdb_auth::SessionContext) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    /// Set (or clear) the authenticated session on an existing handle.
+    /// See [`Database::with_session`].
+    pub fn set_session(&mut self, session: Option<galaxdb_auth::SessionContext>) {
+        self.session = session;
+    }
+
+    /// Attach a security audit sink (Req 4) so authorization denials and
+    /// role/grant/DDL changes are recorded. Without one, audit events are
+    /// discarded (no-op). Builder-style; consumes and returns `self`.
+    pub fn with_audit_sink(mut self, sink: Arc<dyn galaxdb_auth::AuditSink>) -> Self {
+        self.audit = Some(sink);
+        self
+    }
+
+    /// Set (or clear) the audit sink on an existing handle.
+    pub fn set_audit_sink(&mut self, sink: Option<Arc<dyn galaxdb_auth::AuditSink>>) {
+        self.audit = sink;
+    }
+
+    /// The role this handle runs statements under, if a session is
+    /// attached.
+    pub fn session_role(&self) -> Option<&galaxdb_auth::Role> {
+        self.session.as_ref().map(|s| &s.role)
+    }
+
+    /// An [`AuthStore`](galaxdb_sql::auth_store::AuthStore) over this
+    /// database's engine, for looking up role verifiers and superuser
+    /// flags during the wire SCRAM handshake and for provisioning the
+    /// initial superuser at startup (task 6). Cheap to construct (holds an
+    /// `Arc<Engine>`).
+    pub fn auth_store(&self) -> galaxdb_sql::auth_store::AuthStore {
+        galaxdb_sql::auth_store::AuthStore::new(self.engine.clone())
+    }
+
+    /// Whether any role exists in the auth catalog. Used at startup to
+    /// decide whether to provision the initial superuser (task 6, Req 1
+    /// AC7).
+    pub fn any_role_exists(&self) -> bool {
+        self.auth_store().any_role_exists()
+    }
+
+    /// Provision an initial superuser from a plaintext password. Used once
+    /// at first startup when auth is enabled and the catalog is empty
+    /// (Req 1 AC7). The plaintext is consumed to build the SCRAM verifier
+    /// and never stored. Returns an error if a role with that name already
+    /// exists.
+    pub fn provision_superuser(&self, name: &str, password: &str) -> GalaxResult<()> {
+        let store = self.auth_store();
+        if store.get_role(name).is_some() {
+            return Err(GalaxError::Internal(format!(
+                "cannot provision initial superuser: role '{name}' already exists"
+            )));
+        }
+        store.put_role(&galaxdb_sql::auth_store::RoleRecord {
+            name: name.to_string(),
+            is_superuser: true,
+            verifier: Some(galaxdb_auth::ScramVerifier::from_password(password)),
+        })
+    }
+
+    /// Execute a write-capable statement under an explicit per-call
+    /// session, overriding [`Database::session`] for the duration of this
+    /// call only (task 6). The wire server uses this so each connection
+    /// runs its statements under the role established by that connection's
+    /// SCRAM handshake, even though all connections share one `Database`
+    /// behind an `RwLock`.
+    ///
+    /// Safe because the caller holds the database exclusively (`&mut self`
+    /// / a write lock): the session is set, the statement runs
+    /// synchronously, and the previous session is restored before
+    /// returning. There is no reentrancy.
+    pub fn execute_with_session(
+        &mut self,
+        sql: &str,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        let prev = self.session.take();
+        self.session = session;
+        let result = self.execute(sql);
+        self.session = prev;
+        result
+    }
+
     /// Synchronous execute — for embedded Rust callers and the Python
     /// FFI.
     pub fn execute(&mut self, sql: &str) -> GalaxResult<QueryResult> {
@@ -229,10 +344,22 @@ impl Database {
     /// callers holding the database behind an `RwLock` that want to
     /// allow concurrent reads.
     pub fn execute_readonly(&self, sql: &str) -> GalaxResult<QueryResult> {
+        self.execute_readonly_with_session(sql, self.session.clone())
+    }
+
+    /// `&self` read path under an explicit per-call session (task 6). The
+    /// wire server uses this on the shared-read lock so each connection's
+    /// SELECTs are authorization-checked under that connection's role
+    /// without mutating the shared `Database`.
+    pub fn execute_readonly_with_session(
+        &self,
+        sql: &str,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
         // AT VERSION on the read path: same intercept as `execute`, but
         // we don't need `&mut self` because the plan only scans storage.
         if let Some((stripped, at)) = split_at_version(sql)? {
-            return self.select_at_version_readonly(&stripped, at);
+            return self.select_at_version_readonly(&stripped, at, session.as_ref());
         }
 
         let stmts = parser::parse(sql)?;
@@ -241,7 +368,7 @@ impl Database {
             match stmt {
                 AuroraStatement::Standard(s) => {
                     if let sqlparser::ast::Statement::Query(q) = s.as_ref() {
-                        last = self.select_readonly(q)?;
+                        last = self.select_readonly(q, session.as_ref())?;
                     } else {
                         return Err(GalaxError::Internal(
                             "execute_readonly only supports SELECT and SHOW; \
@@ -272,7 +399,11 @@ impl Database {
         Ok(last)
     }
 
-    fn select_readonly(&self, q: &sqlparser::ast::Query) -> GalaxResult<QueryResult> {
+    fn select_readonly(
+        &self,
+        q: &sqlparser::ast::Query,
+        session: Option<&galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
         // Detect SEMANTIC_MATCH in WHERE and route to vector search.
         if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
             let table = extract_table(q);
@@ -285,6 +416,12 @@ impl Database {
             );
             let mut ctx = ExecutorContext::new(self.engine.clone());
             ctx.catalog = self.catalog.clone();
+            ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+            ctx.secondary_index = Some(
+                galaxdb_sql::secondary_index::SecondaryIndexStore::new(self.engine.clone()),
+            );
+            ctx.session = session.cloned();
+            ctx.audit = self.audit.clone();
             ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
                 sidecar: self.sidecar.clone(),
                 indexes: self.vector_indexes.clone(),
@@ -307,6 +444,12 @@ impl Database {
 
         let mut ctx = ExecutorContext::new(self.engine.clone());
         ctx.catalog = self.catalog.clone();
+        ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+        ctx.secondary_index = Some(
+            galaxdb_sql::secondary_index::SecondaryIndexStore::new(self.engine.clone()),
+        );
+        ctx.session = session.cloned();
+        ctx.audit = self.audit.clone();
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
             sidecar: self.sidecar.clone(),
             indexes: self.vector_indexes.clone(),
@@ -355,6 +498,30 @@ impl Database {
                 task: "B6",
                 feature: "AT VERSION planner wiring (consolidation Phase B6 deferred)",
             }),
+            AuroraStatement::CreateRole(stmt) => {
+                self.dispatch(QueryPlan::CreateRole(stmt.clone()))
+            }
+            AuroraStatement::DropRole { name, if_exists } => self.dispatch(QueryPlan::DropRole {
+                name: name.clone(),
+                if_exists: *if_exists,
+            }),
+            AuroraStatement::AlterRolePassword { name, password } => {
+                self.dispatch(QueryPlan::AlterRolePassword {
+                    name: name.clone(),
+                    password: password.clone(),
+                })
+            }
+            AuroraStatement::Grant(stmt) => self.dispatch(QueryPlan::Grant(stmt.clone())),
+            AuroraStatement::Revoke(stmt) => self.dispatch(QueryPlan::Revoke(stmt.clone())),
+            AuroraStatement::CreateIndex(stmt) => {
+                self.dispatch(QueryPlan::CreateIndex(stmt.clone()))
+            }
+            AuroraStatement::DropIndex { name, if_exists } => {
+                self.dispatch(QueryPlan::DropIndex {
+                    name: name.clone(),
+                    if_exists: *if_exists,
+                })
+            }
         }
     }
 
@@ -672,6 +839,7 @@ impl Database {
         &self,
         stripped_sql: &str,
         at: galaxdb_sql::ast::AtVersionExpr,
+        session: Option<&galaxdb_auth::SessionContext>,
     ) -> GalaxResult<QueryResult> {
         let stmts = parser::parse(stripped_sql)?;
         let Some(stmt) = stmts.first() else {
@@ -704,6 +872,12 @@ impl Database {
 
         let mut ctx = ExecutorContext::new(self.engine.clone());
         ctx.catalog = self.catalog.clone();
+        ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+        ctx.secondary_index = Some(
+            galaxdb_sql::secondary_index::SecondaryIndexStore::new(self.engine.clone()),
+        );
+        ctx.session = session.cloned();
+        ctx.audit = self.audit.clone();
         ctx.tag_catalog = Some(self.tag_catalog.clone());
         ctx.merkle_dag = Some(self.merkle_dag.clone());
         ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
@@ -788,11 +962,18 @@ impl Database {
 
     /// Build a fresh `ExecutorContext` that shares this database's
     /// engine, sidecar, tag catalog, merkle DAG, and vector backend.
-    /// The context's catalog is moved in from `self.catalog` and moved
-    /// back after the executor runs so DDL mutations are preserved.
+    ///
+    /// The context's catalog is **cloned** from `self.catalog` (not moved)
+    /// so that if `execute_with_context` returns an error — for example
+    /// the authorization chokepoint rejecting a statement before it runs —
+    /// the caller's early `?` return cannot strand the catalog inside the
+    /// dropped context. On success the caller writes the (possibly DDL-
+    /// mutated) catalog back via `self.catalog = std::mem::take(&mut
+    /// ctx.catalog)`. The clone is cheap: the catalog holds only table
+    /// metadata, not row data.
     fn context(&mut self) -> ExecutorContext {
         let mut ctx = ExecutorContext::new(self.engine.clone());
-        ctx.catalog = std::mem::take(&mut self.catalog);
+        ctx.catalog = self.catalog.clone();
         ctx.sidecar = self.sidecar.clone();
         ctx.merkle_dag = Some(self.merkle_dag.clone());
         ctx.tag_catalog = Some(self.tag_catalog.clone());
@@ -801,6 +982,17 @@ impl Database {
             indexes: self.vector_indexes.clone(),
             engine: self.engine.clone(),
         }));
+        // Role/grant DDL persists through the engine-backed auth store.
+        ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+        // Secondary indexes (Req 5): engine-backed, durable store shared
+        // by DDL, the write path, and the read path.
+        ctx.secondary_index = Some(galaxdb_sql::secondary_index::SecondaryIndexStore::new(
+            self.engine.clone(),
+        ));
+        // The authenticated session (if any) drives the executor's
+        // authorization chokepoint. `None` = trusted embedded mode.
+        ctx.session = self.session.clone();
+        ctx.audit = self.audit.clone();
         ctx
     }
 
@@ -864,7 +1056,7 @@ impl Database {
                 deterministic_order: true,
             }),
         )
-        .map_err(|e| GalaxError::Internal(format!("{e}")))?;
+        .map_err(|e| GalaxError::Internal(e.to_string()))?;
         Ok(tag_ts)
     }
 
@@ -1625,7 +1817,7 @@ fn extract_projection_and_filter_no_semantic(
     let filter = s
         .selection
         .as_ref()
-        .and_then(|e| filter_from_expr_no_semantic(e));
+        .and_then(filter_from_expr_no_semantic);
     (columns, filter)
 }
 
@@ -2544,6 +2736,67 @@ mod tests {
         );
     }
 
+    /// Req 11 AC5: write rows, force a flush to SST, then update — a
+    /// historical `AT VERSION` query must return the pre-update values
+    /// *from the flushed SST*, not only from the memtable. This is the
+    /// test that would fail against a memtable-only implementation.
+    #[test]
+    fn at_version_reads_pre_update_values_from_sst() {
+        use galaxdb_versioning::{MerkleRoot, TrainingTagMetadata};
+
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (1, 'v1')").unwrap();
+        db.execute("INSERT INTO t (id, name) VALUES (2, 'w1')").unwrap();
+        let tag_ts = db.engine.next_ts_for_tests() - 1;
+        {
+            let mut tc = db.tag_catalog.lock().unwrap();
+            tc.create_tag(
+                "snap".to_string(),
+                tag_ts,
+                MerkleRoot { hash: 0xABCD },
+                tag_ts,
+                vec![],
+                false,
+                None::<TrainingTagMetadata>,
+            )
+            .expect("create tag");
+        }
+
+        // Force the active memtable to disk. After this the pre-update
+        // rows live ONLY in an SST file, so the AT VERSION query below
+        // exercises the SST read path, not the memtable.
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(db.engine.flush_memtable())
+            .expect("flush to SST");
+
+        // Update both rows — new versions land in the fresh memtable at a
+        // timestamp after the tag.
+        db.execute("UPDATE t SET name = 'v2' WHERE id = 1").unwrap();
+        db.execute("UPDATE t SET name = 'w2' WHERE id = 2").unwrap();
+
+        // Current read sees the new values.
+        let now = rows_of(db.execute("SELECT id, name FROM t").unwrap());
+        assert_eq!(now.len(), 2);
+
+        // Historical read at the tag must return v1/w1 from the SST.
+        let hist = rows_of(
+            db.execute("SELECT id, name FROM t AT VERSION 'snap'")
+                .unwrap(),
+        );
+        let mut names: Vec<String> = hist.iter().map(|r| r.values[1].1.clone()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["v1".to_string(), "w1".to_string()],
+            "AT VERSION must return pre-update values recovered from the flushed SST",
+        );
+    }
+
     #[test]
     fn at_version_unknown_tag_errors() {
         let mut db = test_db();
@@ -3240,5 +3493,444 @@ mod tests {
              got a={a:?}, b={b:?}"
         );
         assert!(!a.is_empty(), "backup must include at least one SST");
+    }
+}
+
+#[cfg(test)]
+mod role_grant_tests {
+    use super::*;
+    use galaxdb_sql::auth_store::AuthStore;
+    use galaxdb_sql::auth_store::PrivilegeAction as Action;
+
+    fn test_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        std::mem::forget(dir);
+        Database::open(p.to_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn create_role_persists_verifier_via_ddl() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE alice PASSWORD 'secret'").unwrap();
+
+        // Inspect the persisted state through a fresh AuthStore over the
+        // same engine — proves the DDL wrote through to storage.
+        let store = AuthStore::new(db.engine.clone());
+        let role = store.get_role("alice").expect("role persisted");
+        assert!(!role.is_superuser);
+        assert!(role.verifier.is_some(), "password must produce a verifier");
+        // The plaintext must not be recoverable from the stored bytes.
+        let v = role.verifier.unwrap();
+        assert!(!v.salt.windows(6).any(|w| w == b"secret"));
+    }
+
+    #[test]
+    fn create_superuser_role() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE admin PASSWORD 'pw' SUPERUSER").unwrap();
+        let store = AuthStore::new(db.engine.clone());
+        assert!(store.is_superuser("admin"));
+    }
+
+    #[test]
+    fn create_duplicate_role_errors() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE alice PASSWORD 'pw'").unwrap();
+        let err = db.execute("CREATE ROLE alice PASSWORD 'pw2'");
+        assert!(err.is_err(), "duplicate role must error");
+    }
+
+    #[test]
+    fn alter_role_password_replaces_verifier() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE alice PASSWORD 'old'").unwrap();
+        let store = AuthStore::new(db.engine.clone());
+        let v_old = store.verifier_for("alice").unwrap();
+
+        db.execute("ALTER ROLE alice PASSWORD 'new'").unwrap();
+        let v_new = store.verifier_for("alice").unwrap();
+        // A new salt+keys must be derived (overwhelmingly different).
+        assert_ne!(v_old.stored_key, v_new.stored_key);
+    }
+
+    #[test]
+    fn alter_unknown_role_errors() {
+        let mut db = test_db();
+        assert!(db.execute("ALTER ROLE ghost PASSWORD 'x'").is_err());
+    }
+
+    #[test]
+    fn drop_role_removes_it() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE alice PASSWORD 'pw'").unwrap();
+        db.execute("DROP ROLE alice").unwrap();
+        let store = AuthStore::new(db.engine.clone());
+        assert!(store.get_role("alice").is_none());
+        // DROP of a missing role errors unless IF EXISTS.
+        assert!(db.execute("DROP ROLE alice").is_err());
+        db.execute("DROP ROLE IF EXISTS alice").unwrap();
+    }
+
+    #[test]
+    fn grant_and_revoke_persist() {
+        let mut db = test_db();
+        db.execute("CREATE ROLE alice PASSWORD 'pw'").unwrap();
+        db.execute("GRANT SELECT ON docs TO alice").unwrap();
+        db.execute("GRANT INSERT ON docs TO alice").unwrap();
+
+        let store = AuthStore::new(db.engine.clone());
+        assert!(store.has_grant("alice", "docs", Action::Select));
+        assert!(store.has_grant("alice", "docs", Action::Insert));
+        assert!(!store.has_grant("alice", "docs", Action::Delete));
+
+        db.execute("REVOKE SELECT ON docs FROM alice").unwrap();
+        assert!(!store.has_grant("alice", "docs", Action::Select));
+        assert!(store.has_grant("alice", "docs", Action::Insert));
+    }
+
+    #[test]
+    fn grant_to_unknown_role_errors() {
+        let mut db = test_db();
+        assert!(db.execute("GRANT SELECT ON docs TO nobody").is_err());
+    }
+
+    #[test]
+    fn roles_and_grants_survive_reopen_via_ddl() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        {
+            let mut db = Database::open(p.to_str().unwrap()).unwrap();
+            db.execute("CREATE ROLE alice PASSWORD 'pw'").unwrap();
+            db.execute("GRANT UPDATE ON docs TO alice").unwrap();
+        }
+        // Reopen: WAL replay restores the auth rows.
+        let db = Database::open(p.to_str().unwrap()).unwrap();
+        let store = AuthStore::new(db.engine.clone());
+        assert!(store.get_role("alice").is_some());
+        assert!(store.has_grant("alice", "docs", Action::Update));
+    }
+}
+
+/// Authorization chokepoint tests (task 5): the executor must reject a
+/// non-privileged role with SQLSTATE `42501` *before* touching storage,
+/// and accept the same statement once the matching grant exists. These
+/// run on the embedded `Database` path; the wire path is covered by the
+/// `tokio-postgres` integration test in task 6 once SCRAM supplies the
+/// session. Both paths funnel through `execute_with_context`, so this
+/// exercises the single shared chokepoint (Req 3, AC7).
+#[cfg(test)]
+mod authz_chokepoint_tests {
+    use super::*;
+    use galaxdb_auth::{Role, SessionContext};
+
+    fn fresh_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        std::mem::forget(dir);
+        Database::open(p.to_str().unwrap()).unwrap()
+    }
+
+    /// Assert a result is an `InsufficientPrivilege` error for `role` on
+    /// the given action label, and that it renders to SQLSTATE 42501.
+    fn assert_denied(res: GalaxResult<QueryResult>, role: &str, action: &str) {
+        match res {
+            Err(GalaxError::InsufficientPrivilege {
+                role: r,
+                action: a,
+                ..
+            }) => {
+                assert_eq!(r, role, "denied role");
+                assert_eq!(a, action, "denied action");
+                assert_eq!(
+                    GalaxError::InsufficientPrivilege {
+                        role: r,
+                        action: a,
+                        object: "x".into()
+                    }
+                    .sqlstate(),
+                    "42501",
+                    "insufficient_privilege must map to SQLSTATE 42501",
+                );
+            }
+            other => panic!("expected InsufficientPrivilege, got {other:?}"),
+        }
+    }
+
+    /// A superuser session (the operator) sets up the schema and a
+    /// non-privileged role; a session for that role is then denied until
+    /// granted.
+    #[test]
+    fn non_privileged_role_is_denied_then_granted_select() {
+        // 1. As superuser: create the table and a plain role.
+        let mut admin = fresh_db().with_session(SessionContext::new(Role::superuser("root")));
+        admin
+            .execute("CREATE TABLE docs (id INT PRIMARY KEY, body TEXT)")
+            .unwrap();
+        admin.execute("INSERT INTO docs VALUES (1, 'hello')").unwrap();
+        admin.execute("CREATE ROLE alice PASSWORD 'pw'").unwrap();
+
+        // 2. A handle for alice over the SAME engine/catalog. We reuse
+        //    the admin handle but swap the session, which is exactly what
+        //    the wire server does per-connection.
+        admin.set_session(Some(SessionContext::new(Role::user("alice"))));
+
+        // alice has no grant on docs → SELECT denied with 42501, before
+        // any row is read.
+        assert_denied(admin.execute("SELECT * FROM docs"), "alice", "select");
+
+        // 3. Grant SELECT (must be done by a superuser). Swap back.
+        admin.set_session(Some(SessionContext::new(Role::superuser("root"))));
+        admin.execute("GRANT SELECT ON docs TO alice").unwrap();
+
+        // 4. Now alice can SELECT — no restart, the grant took effect
+        //    immediately (Req 3, AC6).
+        admin.set_session(Some(SessionContext::new(Role::user("alice"))));
+        let res = admin.execute("SELECT * FROM docs").unwrap();
+        match res {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            other => panic!("expected one row, got {other:?}"),
+        }
+    }
+
+    /// INSERT/UPDATE/DELETE each require their own privilege; a SELECT
+    /// grant does not let alice write.
+    #[test]
+    fn write_privileges_are_distinct() {
+        let mut db = fresh_db().with_session(SessionContext::new(Role::superuser("root")));
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        db.execute("CREATE ROLE bob PASSWORD 'pw'").unwrap();
+        db.execute("GRANT SELECT ON t TO bob").unwrap();
+
+        db.set_session(Some(SessionContext::new(Role::user("bob"))));
+        // SELECT works.
+        db.execute("SELECT * FROM t").unwrap();
+        // INSERT/UPDATE/DELETE denied with the matching action label.
+        assert_denied(db.execute("INSERT INTO t VALUES (2, 20)"), "bob", "insert");
+        assert_denied(db.execute("UPDATE t SET n = 99 WHERE id = 1"), "bob", "update");
+        assert_denied(db.execute("DELETE FROM t WHERE id = 1"), "bob", "delete");
+
+        // Grant INSERT; now INSERT works but UPDATE still denied.
+        db.set_session(Some(SessionContext::new(Role::superuser("root"))));
+        db.execute("GRANT INSERT ON t TO bob").unwrap();
+        db.set_session(Some(SessionContext::new(Role::user("bob"))));
+        db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        assert_denied(db.execute("UPDATE t SET n = 99 WHERE id = 1"), "bob", "update");
+    }
+
+    /// Only a superuser may run CREATE ROLE / GRANT / REVOKE (Req 3, AC5).
+    #[test]
+    fn role_admin_is_superuser_only() {
+        let mut db = fresh_db().with_session(SessionContext::new(Role::superuser("root")));
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE ROLE carol PASSWORD 'pw'").unwrap();
+
+        // carol (non-superuser) cannot administer roles/grants.
+        db.set_session(Some(SessionContext::new(Role::user("carol"))));
+        assert_denied(db.execute("CREATE ROLE mallory PASSWORD 'x'"), "carol", "admin");
+        assert_denied(db.execute("GRANT SELECT ON t TO carol"), "carol", "admin");
+        assert_denied(db.execute("REVOKE SELECT ON t FROM carol"), "carol", "admin");
+        // DDL is also superuser-only in the baseline.
+        assert_denied(
+            db.execute("CREATE TABLE t2 (id INT PRIMARY KEY)"),
+            "carol",
+            "ddl",
+        );
+    }
+
+    /// REVOKE takes effect immediately for the next statement (Req 3, AC6).
+    #[test]
+    fn revoke_takes_effect_without_restart() {
+        let mut db = fresh_db().with_session(SessionContext::new(Role::superuser("root")));
+        db.execute("CREATE TABLE docs (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE ROLE dave PASSWORD 'pw'").unwrap();
+        db.execute("GRANT SELECT ON docs TO dave").unwrap();
+
+        db.set_session(Some(SessionContext::new(Role::user("dave"))));
+        db.execute("SELECT * FROM docs").unwrap();
+
+        // Superuser revokes; dave is immediately denied.
+        db.set_session(Some(SessionContext::new(Role::superuser("root"))));
+        db.execute("REVOKE SELECT ON docs FROM dave").unwrap();
+        db.set_session(Some(SessionContext::new(Role::user("dave"))));
+        assert_denied(db.execute("SELECT * FROM docs"), "dave", "select");
+    }
+
+    /// A handle with no session (trusted embedded use) skips authorization
+    /// entirely — today's behavior for direct PyO3/Rust callers.
+    #[test]
+    fn no_session_skips_authorization() {
+        let mut db = fresh_db(); // no session attached
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, n INT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+        db.execute("UPDATE t SET n = 7 WHERE id = 1").unwrap();
+        db.execute("SELECT * FROM t").unwrap();
+        db.execute("DELETE FROM t WHERE id = 1").unwrap();
+        // Even role administration works with no session (trusted caller).
+        db.execute("CREATE ROLE anyone PASSWORD 'pw'").unwrap();
+    }
+
+    /// The grant is scoped to its exact table: a SELECT grant on `a` does
+    /// not authorize SELECT on `b`.
+    #[test]
+    fn grants_are_table_scoped() {
+        let mut db = fresh_db().with_session(SessionContext::new(Role::superuser("root")));
+        db.execute("CREATE TABLE a (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE b (id INT PRIMARY KEY)").unwrap();
+        db.execute("CREATE ROLE eve PASSWORD 'pw'").unwrap();
+        db.execute("GRANT SELECT ON a TO eve").unwrap();
+
+        db.set_session(Some(SessionContext::new(Role::user("eve"))));
+        db.execute("SELECT * FROM a").unwrap();
+        assert_denied(db.execute("SELECT * FROM b"), "eve", "select");
+    }
+}
+
+/// Secondary-index tests (task 8): CREATE/DROP INDEX, index-accelerated
+/// reads equal full-scan results, write-path maintenance, range queries,
+/// and restart survival. All run through the embedded `Database` so the
+/// whole stack (parser → planner → executor → engine) is exercised.
+#[cfg(test)]
+mod secondary_index_tests {
+    use super::*;
+
+    fn fresh_db() -> Database {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        std::mem::forget(dir);
+        Database::open(p.to_str().unwrap()).unwrap()
+    }
+
+    fn rows(res: QueryResult) -> Vec<QueryRow> {
+        match res {
+            QueryResult::Rows(r) => r,
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    /// An index lookup returns exactly the same rows as the equivalent
+    /// full scan (Req 5 AC2), and covers rows that existed *before* the
+    /// index was created.
+    #[test]
+    fn index_lookup_equals_full_scan() {
+        let mut db = fresh_db();
+        db.execute("CREATE TABLE people (id INT PRIMARY KEY, city TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO people VALUES (1, 'NYC')").unwrap();
+        db.execute("INSERT INTO people VALUES (2, 'LA')").unwrap();
+        db.execute("INSERT INTO people VALUES (3, 'NYC')").unwrap();
+
+        // Build the index AFTER inserting — it must cover existing rows.
+        let msg = db.execute("CREATE INDEX idx_city ON people (city)").unwrap();
+        match msg {
+            QueryResult::Ok(s) => assert!(s.contains("3 rows indexed"), "got: {s}"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+
+        let via_index = rows(db.execute("SELECT id, city FROM people WHERE city = 'NYC'").unwrap());
+        assert_eq!(via_index.len(), 2, "index lookup must return both NYC rows");
+
+        // Drop the index → same query falls back to full scan, same result.
+        db.execute("DROP INDEX idx_city").unwrap();
+        let via_scan = rows(db.execute("SELECT id, city FROM people WHERE city = 'NYC'").unwrap());
+        assert_eq!(via_scan.len(), 2, "full scan must return the same rows");
+    }
+
+    /// INSERT/UPDATE/DELETE keep the index consistent (Req 5 AC3): a query
+    /// through the index reflects the latest committed state.
+    #[test]
+    fn writes_maintain_the_index() {
+        let mut db = fresh_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, status TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_status ON t (status)").unwrap();
+
+        db.execute("INSERT INTO t VALUES (1, 'pending')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'pending')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'shipped')").unwrap();
+        assert_eq!(
+            rows(db.execute("SELECT id FROM t WHERE status = 'pending'").unwrap()).len(),
+            2
+        );
+
+        // UPDATE moves row 1 from pending -> shipped.
+        db.execute("UPDATE t SET status = 'shipped' WHERE id = 1").unwrap();
+        assert_eq!(
+            rows(db.execute("SELECT id FROM t WHERE status = 'pending'").unwrap()).len(),
+            1,
+            "after UPDATE only row 2 is pending"
+        );
+        assert_eq!(
+            rows(db.execute("SELECT id FROM t WHERE status = 'shipped'").unwrap()).len(),
+            2,
+            "rows 1 and 3 are shipped"
+        );
+
+        // DELETE row 2 removes it from the pending bucket.
+        db.execute("DELETE FROM t WHERE id = 2").unwrap();
+        assert_eq!(
+            rows(db.execute("SELECT id FROM t WHERE status = 'pending'").unwrap()).len(),
+            0,
+            "no pending rows remain"
+        );
+    }
+
+    /// Range predicates resolve through the index and match the scan
+    /// result (Req 5 AC2 range case).
+    #[test]
+    fn range_query_uses_index() {
+        let mut db = fresh_db();
+        db.execute("CREATE TABLE u (id INT PRIMARY KEY, age INT)").unwrap();
+        for (id, age) in [(1, 20), (2, 30), (3, 40), (4, 50)] {
+            db.execute(&format!("INSERT INTO u VALUES ({id}, {age})")).unwrap();
+        }
+        db.execute("CREATE INDEX idx_age ON u (age)").unwrap();
+
+        // age >= 30 AND age <= 45 -> ages 30, 40 (ids 2, 3).
+        let got = rows(db.execute("SELECT id FROM u WHERE age >= 30").unwrap());
+        assert_eq!(got.len(), 3, ">= 30 must match ages 30,40,50");
+
+        let got = rows(db.execute("SELECT id FROM u WHERE age <= 30").unwrap());
+        assert_eq!(got.len(), 2, "<= 30 must match ages 20,30");
+    }
+
+    /// The index definition and its entries survive a restart (Req 5 AC4)
+    /// because they are engine rows replayed through the WAL.
+    #[test]
+    fn index_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        {
+            let mut db = Database::open(p.to_str().unwrap()).unwrap();
+            db.execute("CREATE TABLE k (id INT PRIMARY KEY, v TEXT)").unwrap();
+            db.execute("INSERT INTO k VALUES (1, 'x')").unwrap();
+            db.execute("INSERT INTO k VALUES (2, 'y')").unwrap();
+            db.execute("CREATE INDEX idx_v ON k (v)").unwrap();
+        }
+        // Reopen and re-register the table in the session catalog, then
+        // query through the index — the entries were recovered.
+        let mut db = Database::open(p.to_str().unwrap()).unwrap();
+        db.execute("CREATE TABLE k (id INT PRIMARY KEY, v TEXT)").unwrap();
+        let got = rows(db.execute("SELECT id FROM k WHERE v = 'x'").unwrap());
+        assert_eq!(got.len(), 1, "index entry for 'x' survived restart");
+        assert_eq!(got[0].values.iter().find(|(c, _)| c == "id").unwrap().1, "1");
+    }
+
+    /// CREATE INDEX on a missing table or column is a typed error, and
+    /// duplicate index names error unless IF NOT EXISTS.
+    #[test]
+    fn create_index_validation() {
+        let mut db = fresh_db();
+        assert!(db.execute("CREATE INDEX i ON ghost (c)").is_err(), "missing table");
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, a TEXT)").unwrap();
+        assert!(db.execute("CREATE INDEX i ON t (nope)").is_err(), "missing column");
+        db.execute("CREATE INDEX i ON t (a)").unwrap();
+        assert!(db.execute("CREATE INDEX i ON t (a)").is_err(), "duplicate name");
+        db.execute("CREATE INDEX IF NOT EXISTS i ON t (a)").unwrap();
+        // DROP missing index errors unless IF EXISTS.
+        db.execute("DROP INDEX i").unwrap();
+        assert!(db.execute("DROP INDEX i").is_err());
+        db.execute("DROP INDEX IF EXISTS i").unwrap();
     }
 }

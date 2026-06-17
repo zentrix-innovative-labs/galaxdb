@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="assets/GalaxDB-avatar.svg" alt="GalaxDB" width="120" />
+  <img src="assets/Icon.svg" alt="GalaxDB" width="140" />
   <h1>GalaxDB</h1>
   <p><strong>The AI-native database. SQL + vector search + training exports in one system.</strong></p>
 
