@@ -431,3 +431,405 @@ impl ColumnDesc {
         }
     }
 }
+
+// ── Extended query protocol (Req 6) ────────────────────────────────
+//
+// The simple-query loop reads only `Q`. The extended protocol adds a
+// message dispatcher that reads a one-byte type tag + Int32 length +
+// body, and routes Parse/Bind/Describe/Execute/Close/Sync/Flush. To keep
+// the dispatch in one place we read the whole frame into a buffer and
+// parse the body synchronously here, rather than scattering async reads.
+
+/// A decoded frontend (client → server) message. Covers both the simple
+/// (`Query`) and extended (`Parse`/`Bind`/...) protocols plus `Terminate`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FrontendMessage {
+    /// Simple query (`Q`).
+    Query(String),
+    /// Parse (`P`): prepare a named (or unnamed) statement.
+    Parse {
+        statement: String,
+        query: String,
+        /// Parameter type OIDs the client specified (0 = unspecified).
+        param_types: Vec<i32>,
+    },
+    /// Bind (`B`): bind parameter values to a prepared statement → portal.
+    Bind {
+        portal: String,
+        statement: String,
+        /// Per-parameter format codes (0 = text, 1 = binary). Length is
+        /// either 0 (all text), 1 (applies to all), or one per parameter.
+        param_formats: Vec<i16>,
+        /// Parameter values; `None` is SQL NULL.
+        params: Vec<Option<Vec<u8>>>,
+        /// Per-result-column format codes (0 = text, 1 = binary).
+        result_formats: Vec<i16>,
+    },
+    /// Describe (`D`): describe a statement (`S`) or portal (`P`).
+    Describe { kind: u8, name: String },
+    /// Execute (`E`): run a portal, up to `max_rows` (0 = unlimited).
+    Execute { portal: String, max_rows: i32 },
+    /// Close (`C`): drop a statement (`S`) or portal (`P`).
+    Close { kind: u8, name: String },
+    /// Sync (`S`): end the current series, flush, send ReadyForQuery.
+    Sync,
+    /// Flush (`H`): flush pending output without ending the series.
+    Flush,
+    /// Terminate (`X`): client is closing the connection.
+    Terminate,
+}
+
+fn invalid(msg: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
+}
+
+/// Read a null-terminated string starting at `*pos` in `buf`, advancing
+/// `*pos` past the terminator.
+fn read_cstr(buf: &[u8], pos: &mut usize) -> io::Result<String> {
+    let start = *pos;
+    while *pos < buf.len() && buf[*pos] != 0 {
+        *pos += 1;
+    }
+    if *pos >= buf.len() {
+        return Err(invalid("unterminated C string in message"));
+    }
+    let s = String::from_utf8_lossy(&buf[start..*pos]).to_string();
+    *pos += 1; // skip the null
+    Ok(s)
+}
+
+fn read_i16(buf: &[u8], pos: &mut usize) -> io::Result<i16> {
+    if *pos + 2 > buf.len() {
+        return Err(invalid("truncated i16 in message"));
+    }
+    let v = i16::from_be_bytes([buf[*pos], buf[*pos + 1]]);
+    *pos += 2;
+    Ok(v)
+}
+
+fn read_i32_at(buf: &[u8], pos: &mut usize) -> io::Result<i32> {
+    if *pos + 4 > buf.len() {
+        return Err(invalid("truncated i32 in message"));
+    }
+    let v = i32::from_be_bytes([buf[*pos], buf[*pos + 1], buf[*pos + 2], buf[*pos + 3]]);
+    *pos += 4;
+    Ok(v)
+}
+
+/// Read and decode one frontend message: a one-byte type tag, an `Int32`
+/// length (inclusive of itself), and the body. Returns `UnexpectedEof`
+/// when the client has closed the connection cleanly between messages.
+pub async fn read_message<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> io::Result<FrontendMessage> {
+    let tag = reader.read_u8().await?;
+    let len = reader.read_i32().await?;
+    if !(4..=1_073_741_824).contains(&len) {
+        return Err(invalid("invalid message length"));
+    }
+    let body_len = (len - 4) as usize;
+    let mut buf = vec![0u8; body_len];
+    reader.read_exact(&mut buf).await?;
+    decode_frontend(tag, &buf)
+}
+
+/// Decode a frontend message body given its type tag. Split out from
+/// [`read_message`] so it is unit-testable without a socket.
+pub fn decode_frontend(tag: u8, buf: &[u8]) -> io::Result<FrontendMessage> {
+    let mut pos = 0usize;
+    match tag {
+        b'Q' => {
+            // Null-terminated query text.
+            let mut end = buf.len();
+            if end > 0 && buf[end - 1] == 0 {
+                end -= 1;
+            }
+            Ok(FrontendMessage::Query(
+                String::from_utf8_lossy(&buf[..end]).to_string(),
+            ))
+        }
+        b'P' => {
+            let statement = read_cstr(buf, &mut pos)?;
+            let query = read_cstr(buf, &mut pos)?;
+            let n = read_i16(buf, &mut pos)?;
+            if n < 0 {
+                return Err(invalid("negative parameter-type count in Parse"));
+            }
+            let mut param_types = Vec::with_capacity(n as usize);
+            for _ in 0..n {
+                param_types.push(read_i32_at(buf, &mut pos)?);
+            }
+            Ok(FrontendMessage::Parse {
+                statement,
+                query,
+                param_types,
+            })
+        }
+        b'B' => {
+            let portal = read_cstr(buf, &mut pos)?;
+            let statement = read_cstr(buf, &mut pos)?;
+            let nf = read_i16(buf, &mut pos)?;
+            if nf < 0 {
+                return Err(invalid("negative format-code count in Bind"));
+            }
+            let mut param_formats = Vec::with_capacity(nf as usize);
+            for _ in 0..nf {
+                param_formats.push(read_i16(buf, &mut pos)?);
+            }
+            let np = read_i16(buf, &mut pos)?;
+            if np < 0 {
+                return Err(invalid("negative parameter count in Bind"));
+            }
+            let mut params = Vec::with_capacity(np as usize);
+            for _ in 0..np {
+                let plen = read_i32_at(buf, &mut pos)?;
+                if plen < 0 {
+                    params.push(None); // SQL NULL
+                } else {
+                    let n = plen as usize;
+                    if pos + n > buf.len() {
+                        return Err(invalid("Bind parameter value overruns message"));
+                    }
+                    params.push(Some(buf[pos..pos + n].to_vec()));
+                    pos += n;
+                }
+            }
+            let nr = read_i16(buf, &mut pos)?;
+            if nr < 0 {
+                return Err(invalid("negative result-format count in Bind"));
+            }
+            let mut result_formats = Vec::with_capacity(nr as usize);
+            for _ in 0..nr {
+                result_formats.push(read_i16(buf, &mut pos)?);
+            }
+            Ok(FrontendMessage::Bind {
+                portal,
+                statement,
+                param_formats,
+                params,
+                result_formats,
+            })
+        }
+        b'D' => {
+            if buf.is_empty() {
+                return Err(invalid("empty Describe message"));
+            }
+            let kind = buf[0];
+            pos = 1;
+            let name = read_cstr(buf, &mut pos)?;
+            Ok(FrontendMessage::Describe { kind, name })
+        }
+        b'E' => {
+            let portal = read_cstr(buf, &mut pos)?;
+            let max_rows = read_i32_at(buf, &mut pos)?;
+            Ok(FrontendMessage::Execute { portal, max_rows })
+        }
+        b'C' => {
+            if buf.is_empty() {
+                return Err(invalid("empty Close message"));
+            }
+            let kind = buf[0];
+            pos = 1;
+            let name = read_cstr(buf, &mut pos)?;
+            Ok(FrontendMessage::Close { kind, name })
+        }
+        b'S' => Ok(FrontendMessage::Sync),
+        b'H' => Ok(FrontendMessage::Flush),
+        b'X' => Ok(FrontendMessage::Terminate),
+        other => Err(invalid(&format!(
+            "unsupported frontend message tag '{}' (0x{other:02x})",
+            other as char
+        ))),
+    }
+}
+
+// ── Extended-protocol backend replies ───────────────────────────────
+
+/// Write ParseComplete (`1`).
+pub async fn write_parse_complete<W: AsyncWriteExt + Unpin>(writer: &mut W) -> io::Result<()> {
+    writer.write_u8(b'1').await?;
+    writer.write_i32(4).await?;
+    Ok(())
+}
+
+/// Write BindComplete (`2`).
+pub async fn write_bind_complete<W: AsyncWriteExt + Unpin>(writer: &mut W) -> io::Result<()> {
+    writer.write_u8(b'2').await?;
+    writer.write_i32(4).await?;
+    Ok(())
+}
+
+/// Write CloseComplete (`3`).
+pub async fn write_close_complete<W: AsyncWriteExt + Unpin>(writer: &mut W) -> io::Result<()> {
+    writer.write_u8(b'3').await?;
+    writer.write_i32(4).await?;
+    Ok(())
+}
+
+/// Write NoData (`n`) — the response to Describe for a statement that
+/// returns no rows (INSERT/UPDATE/DELETE/DDL).
+pub async fn write_no_data<W: AsyncWriteExt + Unpin>(writer: &mut W) -> io::Result<()> {
+    writer.write_u8(b'n').await?;
+    writer.write_i32(4).await?;
+    Ok(())
+}
+
+/// Write PortalSuspended (`s`) — sent when an Execute hit its row limit.
+pub async fn write_portal_suspended<W: AsyncWriteExt + Unpin>(writer: &mut W) -> io::Result<()> {
+    writer.write_u8(b's').await?;
+    writer.write_i32(4).await?;
+    Ok(())
+}
+
+/// Write EmptyQueryResponse (`I`) — the response to an empty query string.
+pub async fn write_empty_query_response<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+) -> io::Result<()> {
+    writer.write_u8(b'I').await?;
+    writer.write_i32(4).await?;
+    Ok(())
+}
+
+/// Write ParameterDescription (`t`): the type OID of each parameter.
+pub async fn write_parameter_description<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    param_type_oids: &[i32],
+) -> io::Result<()> {
+    let body_len = 2 + param_type_oids.len() * 4;
+    writer.write_u8(b't').await?;
+    writer.write_i32((body_len + 4) as i32).await?;
+    writer.write_i16(param_type_oids.len() as i16).await?;
+    for oid in param_type_oids {
+        writer.write_i32(*oid).await?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod extended_tests {
+    use super::*;
+
+    #[test]
+    fn decode_simple_query() {
+        let body = b"SELECT 1\0";
+        match decode_frontend(b'Q', body).unwrap() {
+            FrontendMessage::Query(q) => assert_eq!(q, "SELECT 1"),
+            other => panic!("expected Query, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_parse_with_params() {
+        // statement="s1", query="SELECT $1", 1 param type OID = 23 (int4)
+        let mut body = Vec::new();
+        body.extend_from_slice(b"s1\0");
+        body.extend_from_slice(b"SELECT $1\0");
+        body.extend_from_slice(&1i16.to_be_bytes());
+        body.extend_from_slice(&23i32.to_be_bytes());
+        match decode_frontend(b'P', &body).unwrap() {
+            FrontendMessage::Parse {
+                statement,
+                query,
+                param_types,
+            } => {
+                assert_eq!(statement, "s1");
+                assert_eq!(query, "SELECT $1");
+                assert_eq!(param_types, vec![23]);
+            }
+            other => panic!("expected Parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_bind_text_params_and_null() {
+        // portal="", statement="s1", 0 format codes, 2 params ["7", NULL],
+        // 0 result format codes.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"\0"); // portal
+        body.extend_from_slice(b"s1\0"); // statement
+        body.extend_from_slice(&0i16.to_be_bytes()); // param format count
+        body.extend_from_slice(&2i16.to_be_bytes()); // param count
+        body.extend_from_slice(&1i32.to_be_bytes()); // len of "7"
+        body.extend_from_slice(b"7");
+        body.extend_from_slice(&(-1i32).to_be_bytes()); // NULL
+        body.extend_from_slice(&0i16.to_be_bytes()); // result format count
+        match decode_frontend(b'B', &body).unwrap() {
+            FrontendMessage::Bind {
+                portal,
+                statement,
+                param_formats,
+                params,
+                result_formats,
+            } => {
+                assert_eq!(portal, "");
+                assert_eq!(statement, "s1");
+                assert!(param_formats.is_empty());
+                assert_eq!(params, vec![Some(b"7".to_vec()), None]);
+                assert!(result_formats.is_empty());
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_bind_binary_param() {
+        // 1 format code = 1 (binary), 1 param = int4 BE 0x0000002A (42).
+        let mut body = Vec::new();
+        body.extend_from_slice(b"\0"); // portal
+        body.extend_from_slice(b"\0"); // statement (unnamed)
+        body.extend_from_slice(&1i16.to_be_bytes()); // one format code
+        body.extend_from_slice(&1i16.to_be_bytes()); // binary
+        body.extend_from_slice(&1i16.to_be_bytes()); // one param
+        body.extend_from_slice(&4i32.to_be_bytes());
+        body.extend_from_slice(&42i32.to_be_bytes());
+        body.extend_from_slice(&0i16.to_be_bytes()); // result format count
+        match decode_frontend(b'B', &body).unwrap() {
+            FrontendMessage::Bind {
+                param_formats,
+                params,
+                ..
+            } => {
+                assert_eq!(param_formats, vec![1]);
+                assert_eq!(params, vec![Some(42i32.to_be_bytes().to_vec())]);
+            }
+            other => panic!("expected Bind, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_describe_execute_close_sync() {
+        // Describe statement "stmt": kind byte 'S' then the C-string.
+        match decode_frontend(b'D', b"Sstmt\0").unwrap() {
+            FrontendMessage::Describe { kind, name } => {
+                assert_eq!(kind, b'S');
+                assert_eq!(name, "stmt");
+            }
+            other => panic!("expected Describe, got {other:?}"),
+        }
+        let mut e = Vec::new();
+        e.extend_from_slice(b"\0"); // portal
+        e.extend_from_slice(&0i32.to_be_bytes()); // max rows
+        assert_eq!(
+            decode_frontend(b'E', &e).unwrap(),
+            FrontendMessage::Execute { portal: String::new(), max_rows: 0 }
+        );
+        assert_eq!(
+            decode_frontend(b'C', b"Pportal\0").unwrap(),
+            FrontendMessage::Close { kind: b'P', name: "portal".to_string() }
+        );
+        assert_eq!(decode_frontend(b'S', &[]).unwrap(), FrontendMessage::Sync);
+        assert_eq!(decode_frontend(b'H', &[]).unwrap(), FrontendMessage::Flush);
+        assert_eq!(decode_frontend(b'X', &[]).unwrap(), FrontendMessage::Terminate);
+    }
+
+    #[test]
+    fn decode_rejects_unterminated_cstring() {
+        // Parse with a statement name that has no null terminator.
+        assert!(decode_frontend(b'P', b"s1").is_err());
+    }
+
+    #[test]
+    fn decode_rejects_unknown_tag() {
+        assert!(decode_frontend(b'Z', &[]).is_err());
+    }
+}
