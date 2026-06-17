@@ -14,14 +14,18 @@ on:
 
 jobs:
   # -----------------------------------------------------------------------
-  # Linux wheels (manylinux via maturin cross-compilation matrix)
+  # Linux wheels — native runners to avoid cross-compilation Docker issues
   # -----------------------------------------------------------------------
   build-linux:
     name: "Wheel · Linux ${{ matrix.target }}"
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
-        target: [x86_64, aarch64]
+        include:
+          - target: x86_64
+            runner: ubuntu-latest
+          - target: aarch64
+            runner: ubuntu-24.04-arm   # GitHub-hosted native arm64 runner
 
     steps:
       - uses: actions/checkout@v4
@@ -37,11 +41,10 @@ jobs:
       - name: Install protoc + cmake (needed by build scripts in transitive deps)
         run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
 
-      - name: Build manylinux wheel (${{ matrix.target }})
+      - name: Build wheel (${{ matrix.target }})
         run: |
           maturin build --release \
             --manylinux 2_28 \
-            --target ${{ matrix.target }}-unknown-linux-gnu \
             -m galaxdb-python/Cargo.toml
         env:
           PROTOC: /usr/bin/protoc
