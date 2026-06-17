@@ -452,87 +452,347 @@ where
     write_ready_for_query(&mut writer, b'I').await?;
     writer.flush().await?;
 
-    // Query loop.
+    // Query loop — dispatches both the simple (`Q`) and extended
+    // (Parse/Bind/Describe/Execute/Close/Sync) query protocols (Req 6).
+    // Per-connection prepared statements and portals live here; they are
+    // dropped when the connection closes. `ReadyForQuery` is sent after a
+    // simple query and after `Sync` (extended protocol), never mid-series.
+    let mut prepared: std::collections::HashMap<String, PreparedStatement> =
+        std::collections::HashMap::new();
+    let mut portals: std::collections::HashMap<String, Portal> =
+        std::collections::HashMap::new();
+
     loop {
-        let sql = match read_query(&mut reader).await {
-            Ok(q) => q,
+        let msg = match read_message(&mut reader).await {
+            Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         };
 
-        // Task 38.6: SQL commenter format — extract a W3C traceparent
-        // from the `/* traceparent='...' */` suffix if the client
-        // attached one. When present the query span logs the trace
-        // and span ids so downstream backends can stitch together the
-        // full distributed trace. Task 38.5: the child spans emitted
-        // by the executor (`sql.parse`, `query.execute`,
-        // `executor.full_scan`, `executor.semantic_search`) run
-        // inside the `wire.query` span entered below, so tracing
-        // backends that support `trace_id`/`span_id` fields link the
-        // whole tree back to the client's traceparent.
-        let traceparent = galaxdb_observe::extract_traceparent_from_sql(&sql);
-        let wire_span = match traceparent.as_ref() {
-            Some(tp) => tracing::info_span!(
-                "wire.query",
-                trace_id = %tp.trace_id,
-                parent_span_id = %tp.span_id,
-                sampled = tp.sampled,
-            ),
-            None => tracing::info_span!("wire.query"),
-        };
-        let _wire_entered = wire_span.enter();
-        galaxdb_observe::metrics().queries_total.inc();
+        match msg {
+            FrontendMessage::Terminate => break,
 
-        // Catalog queries first (psycopg2 / SQLAlchemy reflection).
-        if let Some(pg_result) = pg_catalog::try_handle_pg_catalog(&sql) {
-            write_row_description(&mut writer, &pg_result.columns).await?;
-            for row in &pg_result.rows {
-                let values: Vec<Option<&str>> = row.iter().map(|v| v.as_deref()).collect();
-                write_data_row(&mut writer, &values).await?;
+            FrontendMessage::Query(sql) => {
+                run_simple_query(&mut writer, &db, &session, &sql).await?;
+                write_ready_for_query(&mut writer, b'I').await?;
+                writer.flush().await?;
             }
-            write_command_complete(
-                &mut writer,
-                &format!("SELECT {}", pg_result.rows.len()),
-            )
-            .await?;
-            write_ready_for_query(&mut writer, b'I').await?;
-            writer.flush().await?;
-            continue;
+
+            // ── Extended query protocol ────────────────────────────
+            FrontendMessage::Parse {
+                statement,
+                query,
+                param_types,
+            } => {
+                prepared.insert(
+                    statement,
+                    PreparedStatement {
+                        sql: query,
+                        param_types,
+                    },
+                );
+                write_parse_complete(&mut writer).await?;
+                writer.flush().await?;
+            }
+
+            FrontendMessage::Bind {
+                portal,
+                statement,
+                param_formats,
+                params,
+                result_formats,
+            } => {
+                let Some(stmt) = prepared.get(&statement) else {
+                    write_error_response(
+                        &mut writer,
+                        "26000",
+                        &format!("prepared statement \"{statement}\" does not exist"),
+                    )
+                    .await?;
+                    writer.flush().await?;
+                    continue;
+                };
+                match bind_portal(stmt, &param_formats, &params, result_formats) {
+                    Ok(p) => {
+                        portals.insert(portal, p);
+                        write_bind_complete(&mut writer).await?;
+                    }
+                    Err(msg) => {
+                        write_error_response(&mut writer, "22023", &msg).await?;
+                    }
+                }
+                writer.flush().await?;
+            }
+
+            FrontendMessage::Describe { kind, name } => {
+                if kind == b'S' {
+                    // Describe statement: ParameterDescription + (RowDescription | NoData).
+                    let Some(stmt) = prepared.get(&name) else {
+                        write_error_response(
+                            &mut writer,
+                            "26000",
+                            &format!("prepared statement \"{name}\" does not exist"),
+                        )
+                        .await?;
+                        writer.flush().await?;
+                        continue;
+                    };
+                    let shape = describe_sql(&db, &stmt.sql).await;
+                    // Parameter type OIDs: prefer the client-declared types
+                    // from Parse; fall back to the resolved count as text.
+                    let oids = resolve_param_oids(stmt, &shape);
+                    write_parameter_description(&mut writer, &oids).await?;
+                    write_describe_rows(&mut writer, shape.ok().and_then(|s| s.columns)).await?;
+                } else {
+                    // Describe portal: RowDescription | NoData.
+                    let Some(p) = portals.get(&name) else {
+                        write_error_response(
+                            &mut writer,
+                            "34000",
+                            &format!("portal \"{name}\" does not exist"),
+                        )
+                        .await?;
+                        writer.flush().await?;
+                        continue;
+                    };
+                    let shape = describe_sql(&db, &p.sql).await;
+                    write_describe_rows(&mut writer, shape.ok().and_then(|s| s.columns)).await?;
+                }
+                writer.flush().await?;
+            }
+
+            FrontendMessage::Execute { portal, .. } => {
+                let Some(p) = portals.get(&portal) else {
+                    write_error_response(
+                        &mut writer,
+                        "34000",
+                        &format!("portal \"{portal}\" does not exist"),
+                    )
+                    .await?;
+                    writer.flush().await?;
+                    continue;
+                };
+                // Execute carries no RowDescription (the client already got
+                // it from Describe); emit DataRows + CommandComplete only.
+                let sql = p.sql.clone();
+                run_extended_execute(&mut writer, &db, &session, &sql).await?;
+                // No ReadyForQuery here — that waits for Sync.
+                writer.flush().await?;
+            }
+
+            FrontendMessage::Close { kind, name } => {
+                if kind == b'S' {
+                    prepared.remove(&name);
+                } else {
+                    portals.remove(&name);
+                }
+                write_close_complete(&mut writer).await?;
+                writer.flush().await?;
+            }
+
+            FrontendMessage::Sync => {
+                write_ready_for_query(&mut writer, b'I').await?;
+                writer.flush().await?;
+            }
+
+            FrontendMessage::Flush => {
+                writer.flush().await?;
+            }
         }
+    }
 
-        // Execute SQL — use write lock for DDL/DML, read lock for SELECT.
-        //
-        // Every code path here calls into the synchronous storage
-        // engine, which can block on `WalWriter::append_sync`'s
-        // `tokio::sync::oneshot::blocking_recv`. Blocking primitives
-        // are forbidden inside a tokio runtime worker, so we offload
-        // both the lock acquisition AND the executor call to
-        // `spawn_blocking`. Moving the acquisition inside the blocking
-        // task is what lets the group-commit wait actually block. The
-        // AWS integration run on i-0b2dec9226f62db65 caught the
-        // non-offloaded version panicking on INSERT.
-        let upper = sql.trim().to_uppercase();
-        let is_read = upper.starts_with("SELECT") || upper.starts_with("SHOW");
+    Ok(())
+}
 
-        let sql_owned = sql.clone();
-        let db_clone = db.clone();
-        let session_clone = session.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            if is_read {
-                let guard = db_clone.blocking_read();
-                guard.execute_readonly_with_session(&sql_owned, Some(session_clone))
-            } else {
-                let mut guard = db_clone.blocking_write();
-                guard.execute_with_session(&sql_owned, Some(session_clone))
-            }
+/// A statement prepared via `Parse`: the SQL text (with `$n` placeholders)
+/// and the client-declared parameter type OIDs (0 = unspecified).
+struct PreparedStatement {
+    sql: String,
+    param_types: Vec<i32>,
+}
+
+/// A portal produced by `Bind`: the concrete SQL with parameters
+/// substituted as literals, ready to execute.
+struct Portal {
+    sql: String,
+}
+
+/// Substitute bound parameters into a prepared statement, producing the
+/// concrete SQL for a portal. Each value is rendered as a typed SQL
+/// literal (Req 6 AC5: text + binary formats).
+fn bind_portal(
+    stmt: &PreparedStatement,
+    param_formats: &[i16],
+    params: &[Option<Vec<u8>>],
+    _result_formats: Vec<i16>,
+) -> Result<Portal, String> {
+    // Per PostgreSQL: 0 format codes → all text; 1 code → applies to all;
+    // otherwise one code per parameter.
+    let fmt_for = |i: usize| -> i16 {
+        match param_formats.len() {
+            0 => 0,
+            1 => param_formats[0],
+            _ => *param_formats.get(i).unwrap_or(&0),
+        }
+    };
+    let mut literals = Vec::with_capacity(params.len());
+    for (i, val) in params.iter().enumerate() {
+        let type_oid = stmt.param_types.get(i).copied().unwrap_or(0);
+        let literal = galaxdb_wire::param_codec::param_to_sql_literal(
+            val.as_deref(),
+            fmt_for(i),
+            type_oid,
+        )?;
+        literals.push(literal);
+    }
+    Ok(Portal {
+        sql: galaxdb_wire::param_codec::substitute_parameters(&stmt.sql, &literals),
+    })
+}
+
+/// Resolve the parameter type OIDs to report in `ParameterDescription`:
+/// use the client-declared types from `Parse` where given, padding any
+/// remaining inferred parameters with `text` (the executor accepts text
+/// literals for every supported type).
+fn resolve_param_oids(
+    stmt: &PreparedStatement,
+    shape: &Result<galaxdb_embedded::StatementShape, galaxdb_common::GalaxError>,
+) -> Vec<i32> {
+    let inferred = shape.as_ref().map(|s| s.param_count).unwrap_or(0);
+    let n = stmt.param_types.len().max(inferred);
+    (0..n)
+        .map(|i| match stmt.param_types.get(i) {
+            Some(&oid) if oid != 0 => oid,
+            _ => galaxdb_wire::param_codec::oid::TEXT,
         })
-        .await
-        .map_err(|e| {
-            std::io::Error::other(format!("worker panic: {e}"))
-        })?;
+        .collect()
+}
 
-        match result {
-            Ok(galaxdb_embedded::QueryResult::Rows(rows)) => {
+/// Resolve a statement's shape off the blocking pool (it parses + reads
+/// the catalog under a read lock).
+async fn describe_sql(
+    db: &Arc<RwLock<Database>>,
+    sql: &str,
+) -> Result<galaxdb_embedded::StatementShape, galaxdb_common::GalaxError> {
+    let db_clone = db.clone();
+    let sql_owned = sql.to_string();
+    tokio::task::spawn_blocking(move || {
+        let guard = db_clone.blocking_read();
+        guard.describe_statement(&sql_owned)
+    })
+    .await
+    .unwrap_or_else(|e| Err(galaxdb_common::GalaxError::Internal(format!("describe worker panic: {e}"))))
+}
+
+/// Emit a `RowDescription` for the resolved columns (text-typed, matching
+/// the simple-query result path), or `NoData` when the statement returns
+/// no rows.
+async fn write_describe_rows<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    columns: Option<Vec<String>>,
+) -> std::io::Result<()> {
+    match columns {
+        Some(cols) if !cols.is_empty() => {
+            let descs: Vec<ColumnDesc> = cols.iter().map(|c| ColumnDesc::text(c)).collect();
+            write_row_description(writer, &descs).await
+        }
+        // Empty column list or a non-row statement → NoData. (An empty
+        // projection that resolved to zero catalog columns is degenerate;
+        // NoData is the correct answer.)
+        _ => write_no_data(writer).await,
+    }
+}
+
+/// Run a simple-query (`Q`) statement: pg_catalog passthrough, then the
+/// engine, writing RowDescription + DataRows + CommandComplete (or an
+/// ErrorResponse). Does NOT write ReadyForQuery — the caller does.
+async fn run_simple_query<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    db: &Arc<RwLock<Database>>,
+    session: &SessionContext,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Build the trace span and record the SQL-commenter traceparent (if
+    // any) into it. We do NOT hold the span's `Entered` guard across the
+    // `.await`s below: the engine runs on the blocking pool (a different
+    // thread), so a held guard would neither parent those spans nor be
+    // `Send` for the spawned connection task.
+    let traceparent = galaxdb_observe::extract_traceparent_from_sql(sql);
+    let wire_span = match traceparent.as_ref() {
+        Some(tp) => tracing::info_span!(
+            "wire.query",
+            trace_id = %tp.trace_id,
+            parent_span_id = %tp.span_id,
+            sampled = tp.sampled,
+        ),
+        None => tracing::info_span!("wire.query"),
+    };
+    wire_span.in_scope(|| galaxdb_observe::metrics().queries_total.inc());
+
+    if let Some(pg_result) = pg_catalog::try_handle_pg_catalog(sql) {
+        write_row_description(writer, &pg_result.columns).await?;
+        for row in &pg_result.rows {
+            let values: Vec<Option<&str>> = row.iter().map(|v| v.as_deref()).collect();
+            write_data_row(writer, &values).await?;
+        }
+        write_command_complete(writer, &format!("SELECT {}", pg_result.rows.len())).await?;
+        return Ok(());
+    }
+
+    let result = run_engine(db, session, sql).await?;
+    write_query_result(writer, result, true).await
+}
+
+/// Run an extended-protocol `Execute`: same engine path, but the client
+/// already received the RowDescription from `Describe`, so only DataRows +
+/// CommandComplete are written (no RowDescription).
+async fn run_extended_execute<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    db: &Arc<RwLock<Database>>,
+    session: &SessionContext,
+    sql: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    galaxdb_observe::metrics().queries_total.inc();
+    let result = run_engine(db, session, sql).await?;
+    write_query_result(writer, result, false).await
+}
+
+/// Execute one statement against the engine on the blocking pool, choosing
+/// a read or write lock by statement kind (same rule as the v1 loop).
+async fn run_engine(
+    db: &Arc<RwLock<Database>>,
+    session: &SessionContext,
+    sql: &str,
+) -> Result<galaxdb_common::GalaxResult<galaxdb_embedded::QueryResult>, std::io::Error> {
+    let upper = sql.trim().to_uppercase();
+    let is_read = upper.starts_with("SELECT") || upper.starts_with("SHOW");
+    let sql_owned = sql.to_string();
+    let db_clone = db.clone();
+    let session_clone = session.clone();
+    tokio::task::spawn_blocking(move || {
+        if is_read {
+            let guard = db_clone.blocking_read();
+            guard.execute_readonly_with_session(&sql_owned, Some(session_clone))
+        } else {
+            let mut guard = db_clone.blocking_write();
+            guard.execute_with_session(&sql_owned, Some(session_clone))
+        }
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("worker panic: {e}")))
+}
+
+/// Write an engine result to the wire. `with_row_description` controls
+/// whether a RowDescription precedes the DataRows (true for simple query,
+/// false for extended Execute, which already sent it via Describe).
+async fn write_query_result<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    result: galaxdb_common::GalaxResult<galaxdb_embedded::QueryResult>,
+    with_row_description: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match result {
+        Ok(galaxdb_embedded::QueryResult::Rows(rows)) => {
+            if with_row_description {
                 let col_descs: Vec<ColumnDesc> = if let Some(first) = rows.first() {
                     first
                         .values
@@ -542,40 +802,25 @@ where
                 } else {
                     vec![]
                 };
-
-                write_row_description(&mut writer, &col_descs).await?;
-
-                for row in &rows {
-                    let values: Vec<Option<&str>> =
-                        row.values.iter().map(|(_, v)| Some(v.as_str())).collect();
-                    write_data_row(&mut writer, &values).await?;
-                }
-
-                write_command_complete(
-                    &mut writer,
-                    &format!("SELECT {}", rows.len()),
-                )
-                .await?;
+                write_row_description(writer, &col_descs).await?;
             }
-            Ok(galaxdb_embedded::QueryResult::RowCount(n)) => {
-                write_command_complete(&mut writer, &format!("OK {}", n)).await?;
+            for row in &rows {
+                let values: Vec<Option<&str>> =
+                    row.values.iter().map(|(_, v)| Some(v.as_str())).collect();
+                write_data_row(writer, &values).await?;
             }
-            Ok(galaxdb_embedded::QueryResult::Ok(msg)) => {
-                write_command_complete(&mut writer, &msg).await?;
-            }
-            Err(e) => {
-                // Render the typed engine error to its PostgreSQL SQLSTATE
-                // so standard clients classify it correctly — e.g. a
-                // failed authorization surfaces as `42501`
-                // (insufficient_privilege), not a generic syntax error.
-                write_error_response(&mut writer, e.sqlstate(), &format!("{}", e)).await?;
-            }
+            write_command_complete(writer, &format!("SELECT {}", rows.len())).await?;
         }
-
-        write_ready_for_query(&mut writer, b'I').await?;
-        writer.flush().await?;
+        Ok(galaxdb_embedded::QueryResult::RowCount(n)) => {
+            write_command_complete(writer, &format!("OK {}", n)).await?;
+        }
+        Ok(galaxdb_embedded::QueryResult::Ok(msg)) => {
+            write_command_complete(writer, &msg).await?;
+        }
+        Err(e) => {
+            write_error_response(writer, e.sqlstate(), &format!("{}", e)).await?;
+        }
     }
-
     Ok(())
 }
 

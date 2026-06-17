@@ -210,6 +210,110 @@ async fn crud_round_trip_over_wire() {
     );
 }
 
+/// Task 9 (Req 6): the extended query protocol — prepared statements with
+/// bound parameters over `tokio-postgres`. `prepare_typed` drives
+/// Parse(with param OIDs) + Describe + Sync; `query`/`execute` drive
+/// Bind(binary/text params) + Execute + Sync. Results are text-typed
+/// (consistent with the simple-query result path), so columns are read as
+/// `String`. A regression in the dispatcher, the parameter codec, or the
+/// describe path shows up as a connect/prepare/query error or a wrong row.
+#[tokio::test]
+async fn extended_protocol_prepared_statements() {
+    use tokio_postgres::types::Type;
+
+    let (conn_str, _td) = start_server().await;
+    let (client, connection) = tokio::time::timeout(
+        Duration::from_secs(5),
+        tokio_postgres::connect(&conn_str, NoTls),
+    )
+    .await
+    .expect("connect timed out")
+    .expect("connect failed");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // Set up the table with the simple protocol (already covered above).
+    client
+        .simple_query("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, price FLOAT)")
+        .await
+        .expect("create table failed");
+
+    // 1. Prepared INSERT with bound params (int4, text, float8). This is
+    //    Parse(typed) + Bind(binary int4 / text / binary float8) + Execute.
+    let insert = client
+        .prepare_typed(
+            "INSERT INTO items (id, name, price) VALUES ($1, $2, $3)",
+            &[Type::INT4, Type::TEXT, Type::FLOAT8],
+        )
+        .await
+        .expect("prepare insert failed");
+    for (id, name, price) in [(1i32, "espresso", 3.50f64), (2, "latte", 4.25), (3, "mocha", 4.75)] {
+        client
+            .execute(&insert, &[&id, &name, &price])
+            .await
+            .unwrap_or_else(|e| panic!("prepared insert ({id},{name}) failed: {e}"));
+    }
+
+    // 2. Prepared SELECT with a bound int4 parameter — exercises Bind
+    //    parameter substitution into the WHERE clause and the Describe
+    //    RowDescription (2 columns). Results come back text-typed.
+    let by_id = client
+        .prepare_typed(
+            "SELECT id, name FROM items WHERE id = $1",
+            &[Type::INT4],
+        )
+        .await
+        .expect("prepare select failed");
+
+    let rows = client.query(&by_id, &[&2i32]).await.expect("query failed");
+    assert_eq!(rows.len(), 1, "WHERE id = $1 must return exactly one row");
+    assert_eq!(rows[0].get::<_, &str>("id"), "2");
+    assert_eq!(rows[0].get::<_, &str>("name"), "latte");
+
+    // A different bound value selects a different row — proves the param
+    // is actually substituted, not constant-folded at prepare time.
+    let rows = client.query(&by_id, &[&3i32]).await.expect("re-query failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("name"), "mocha");
+
+    // 3. Prepared SELECT with a float8 range parameter.
+    let dear = client
+        .prepare_typed(
+            "SELECT name FROM items WHERE price > $1",
+            &[Type::FLOAT8],
+        )
+        .await
+        .expect("prepare range select failed");
+    let rows = client.query(&dear, &[&4.0f64]).await.expect("range query failed");
+    let mut names: Vec<String> = rows.iter().map(|r| r.get::<_, &str>("name").to_string()).collect();
+    names.sort();
+    assert_eq!(names, vec!["latte".to_string(), "mocha".to_string()]);
+
+    // 4. A text parameter is escaped correctly (no injection, quotes
+    //    doubled). Insert a name with an apostrophe via a bound param,
+    //    then read it back.
+    client
+        .execute(&insert, &[&4i32, &"o'brien", &9.99f64])
+        .await
+        .expect("insert with apostrophe failed");
+    let rows = client
+        .query(&by_id, &[&4i32])
+        .await
+        .expect("query apostrophe row failed");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get::<_, &str>("name"), "o'brien");
+
+    // 5. Final count via the simple protocol confirms all 4 prepared
+    //    inserts landed.
+    let msgs = client.simple_query("SELECT id FROM items").await.unwrap();
+    let count = msgs
+        .into_iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(count, 4, "expected 4 rows after prepared inserts, got {count}");
+}
+
 #[tokio::test]
 async fn many_concurrent_inserts_do_not_panic() {
     // Phase I Bug 2 hardening: drive inserts concurrently from several

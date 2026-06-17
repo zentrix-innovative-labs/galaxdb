@@ -64,6 +64,21 @@ pub enum QueryResult {
     Ok(String),
 }
 
+/// The static shape of a prepared statement, resolved without executing
+/// it — used by the extended query protocol's `Describe` (Req 6 AC4).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatementShape {
+    /// Number of bind parameters (`$1..$N`) the statement expects.
+    pub param_count: usize,
+    /// Result column names when the statement returns rows (a SELECT),
+    /// resolved from the catalog projection. `None` for statements that
+    /// return no rows (INSERT/UPDATE/DELETE/DDL) → the protocol answers
+    /// `NoData`. Columns are reported as text-typed, consistent with the
+    /// simple-query result path.
+    pub columns: Option<Vec<String>>,
+}
+
+
 // ---------------------------------------------------------------------------
 // Per-table vector index
 // ---------------------------------------------------------------------------
@@ -311,6 +326,51 @@ impl Database {
         let result = self.execute(sql);
         self.session = prev;
         result
+    }
+
+    /// Resolve the static shape of a statement for the extended query
+    /// protocol's `Describe` (Req 6 AC4) — parameter count and, for a
+    /// row-returning SELECT, the result column names — without executing
+    /// it. `&self` (read-only): describing never mutates the database.
+    pub fn describe_statement(&self, sql: &str) -> GalaxResult<StatementShape> {
+        let param_count = count_placeholders(sql);
+
+        // Strip any AuroraSQL `AT VERSION ...` suffix before parsing, the
+        // same way `execute` does — it is still a row-returning SELECT.
+        let sql_for_parse = match split_at_version(sql)? {
+            Some((stripped, _)) => stripped,
+            None => sql.to_string(),
+        };
+
+        let stmts = parser::parse(&sql_for_parse)?;
+        let columns = stmts.first().and_then(|stmt| self.describe_columns(stmt));
+        Ok(StatementShape {
+            param_count,
+            columns,
+        })
+    }
+
+    /// Result column names for a statement, or `None` when it returns no
+    /// rows. Mirrors the SELECT dispatch in `exec_stmt`: a `Query` resolves
+    /// its projection (explicit columns, or all catalog columns for
+    /// `SELECT *`); everything else returns no rows.
+    fn describe_columns(&self, stmt: &AuroraStatement) -> Option<Vec<String>> {
+        let AuroraStatement::Standard(s) = stmt else {
+            return None;
+        };
+        let sqlparser::ast::Statement::Query(q) = s.as_ref() else {
+            return None;
+        };
+        let (proj, _filter) = extract_projection_and_filter(q);
+        if !proj.is_empty() {
+            return Some(proj);
+        }
+        // Empty projection means `SELECT *` (or an unsupported expression
+        // that falls back to the full row) — report all catalog columns in
+        // declaration order so the client sees the same shape it gets back.
+        let table = extract_table(q);
+        let entry = self.catalog.get_table(&table)?;
+        Some(entry.columns.iter().map(|c| c.name.clone()).collect())
     }
 
     /// Synchronous execute — for embedded Rust callers and the Python
@@ -1650,6 +1710,54 @@ fn query_result_from(r: ExecuteResult) -> QueryResult {
         ExecuteResult::Ok(msg) => QueryResult::Ok(msg),
         ExecuteResult::Error(msg) => QueryResult::Ok(msg),
     }
+}
+
+/// Count the bind parameters (`$1..$N`) in a SQL string by the highest
+/// placeholder index, skipping `$N` sequences that appear inside
+/// single-quoted string literals. PostgreSQL prepared-statement
+/// parameters are contiguous `$1..$N`, so the maximum index is the count.
+fn count_placeholders(sql: &str) -> usize {
+    let bytes = sql.as_bytes();
+    let mut max = 0usize;
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if b == b'\'' {
+                // Doubled '' is an escaped quote inside the literal.
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\'' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if b == b'$' {
+            let mut j = i + 1;
+            let mut num = 0usize;
+            let mut has_digit = false;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                num = num * 10 + (bytes[j] - b'0') as usize;
+                has_digit = true;
+                j += 1;
+            }
+            if has_digit {
+                max = max.max(num);
+                i = j;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    max
 }
 
 fn extract_table(q: &sqlparser::ast::Query) -> String {
