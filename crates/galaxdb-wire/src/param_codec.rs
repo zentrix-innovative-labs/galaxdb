@@ -183,6 +183,76 @@ pub fn substitute_parameters(query: &str, literals: &[String]) -> String {
     out
 }
 
+/// Decode a bound parameter into a typed [`galaxdb_sql::BoundValue`] for
+/// AST-level binding into a prepared statement template (the parse-once
+/// path, Req 7). Mirrors [`param_to_sql_literal`] but yields a typed value
+/// instead of a literal string, so the executor reuses the cached parse.
+pub fn param_to_bound_value(
+    value: Option<&[u8]>,
+    format: i16,
+    type_oid: i32,
+) -> Result<galaxdb_sql::BoundValue, String> {
+    use galaxdb_sql::BoundValue;
+    let bytes = match value {
+        None => return Ok(BoundValue::Null),
+        Some(b) => b,
+    };
+    match format {
+        FORMAT_TEXT => {
+            let s = std::str::from_utf8(bytes)
+                .map_err(|_| "text parameter is not valid UTF-8".to_string())?;
+            match type_oid {
+                oid::BOOL => Ok(BoundValue::Bool(parse_bool(s)?)),
+                oid::INT2 | oid::INT4 | oid::INT8 => s
+                    .trim()
+                    .parse::<i64>()
+                    .map(BoundValue::Int)
+                    .map_err(|_| format!("invalid integer parameter '{s}'")),
+                oid::FLOAT4 | oid::FLOAT8 => s
+                    .trim()
+                    .parse::<f64>()
+                    .map(BoundValue::Float)
+                    .map_err(|_| format!("invalid float parameter '{s}'")),
+                _ => Ok(BoundValue::Text(s.to_string())),
+            }
+        }
+        FORMAT_BINARY => match type_oid {
+            oid::BOOL => {
+                if bytes.len() != 1 {
+                    return Err("binary bool must be exactly 1 byte".into());
+                }
+                Ok(BoundValue::Bool(bytes[0] != 0))
+            }
+            oid::INT2 => {
+                let a: [u8; 2] = bytes.try_into().map_err(|_| "binary int2 must be 2 bytes".to_string())?;
+                Ok(BoundValue::Int(i16::from_be_bytes(a) as i64))
+            }
+            oid::INT4 => {
+                let a: [u8; 4] = bytes.try_into().map_err(|_| "binary int4 must be 4 bytes".to_string())?;
+                Ok(BoundValue::Int(i32::from_be_bytes(a) as i64))
+            }
+            oid::INT8 => {
+                let a: [u8; 8] = bytes.try_into().map_err(|_| "binary int8 must be 8 bytes".to_string())?;
+                Ok(BoundValue::Int(i64::from_be_bytes(a)))
+            }
+            oid::FLOAT4 => {
+                let a: [u8; 4] = bytes.try_into().map_err(|_| "binary float4 must be 4 bytes".to_string())?;
+                Ok(BoundValue::Float(f32::from_be_bytes(a) as f64))
+            }
+            oid::FLOAT8 => {
+                let a: [u8; 8] = bytes.try_into().map_err(|_| "binary float8 must be 8 bytes".to_string())?;
+                Ok(BoundValue::Float(f64::from_be_bytes(a)))
+            }
+            _ => {
+                let s = std::str::from_utf8(bytes)
+                    .map_err(|_| "binary text parameter is not valid UTF-8".to_string())?;
+                Ok(BoundValue::Text(s.to_string()))
+            }
+        },
+        other => Err(format!("unsupported parameter format code {other}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +330,31 @@ mod tests {
             &["1".to_string(), "'alice'".to_string()],
         );
         assert_eq!(out, "INSERT INTO t (id, name) VALUES (1, 'alice')");
+    }
+
+    #[test]
+    fn bound_value_text_and_binary() {
+        use galaxdb_sql::BoundValue;
+        assert_eq!(param_to_bound_value(None, 0, oid::INT4).unwrap(), BoundValue::Null);
+        assert_eq!(
+            param_to_bound_value(Some(b"42"), 0, oid::INT4).unwrap(),
+            BoundValue::Int(42)
+        );
+        assert_eq!(
+            param_to_bound_value(Some(&7i32.to_be_bytes()), 1, oid::INT4).unwrap(),
+            BoundValue::Int(7)
+        );
+        assert_eq!(
+            param_to_bound_value(Some(&3.5f64.to_be_bytes()), 1, oid::FLOAT8).unwrap(),
+            BoundValue::Float(3.5)
+        );
+        assert_eq!(
+            param_to_bound_value(Some(&[1]), 1, oid::BOOL).unwrap(),
+            BoundValue::Bool(true)
+        );
+        assert_eq!(
+            param_to_bound_value(Some(b"hi"), 0, oid::TEXT).unwrap(),
+            BoundValue::Text("hi".to_string())
+        );
     }
 }

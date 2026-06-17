@@ -36,6 +36,10 @@ use galaxdb_sql::executor::{
 use galaxdb_sql::parser;
 use galaxdb_sql::planner::{self, FilterExpr, QueryPlan, SearchStrategy, Value};
 use galaxdb_sql::row_codec;
+
+/// Re-export of the bound-parameter value type so wire-protocol callers
+/// (the server) can name it without depending on `galaxdb-sql` directly.
+pub use galaxdb_sql::BoundValue;
 use galaxdb_storage::engine::{Engine, EngineConfig};
 use galaxdb_vector::{
     execute_semantic_match, DeltaBuffer, HnswConfig, HnswGraph, SemanticMatchConfig,
@@ -76,6 +80,24 @@ pub struct StatementShape {
     /// `NoData`. Columns are reported as text-typed, consistent with the
     /// simple-query result path.
     pub columns: Option<Vec<String>>,
+}
+
+/// A statement parsed once for repeated parameterised execution (Req 6/7).
+///
+/// Holds the parsed AST template (with `$n` placeholders) plus its static
+/// shape, so each `Execute` binds values into a clone of the AST instead
+/// of re-parsing. Produced by [`Database::prepare`].
+#[derive(Clone)]
+pub struct PreparedTemplate {
+    /// The parsed template; `$n` placeholders are filled per execution.
+    stmts: Arc<Vec<AuroraStatement>>,
+    /// Number of bind parameters (`$1..$N`).
+    pub param_count: usize,
+    /// Result column names (text-typed) for a SELECT, else `None`.
+    pub columns: Option<Vec<String>>,
+    /// Whether this is a read-only statement (a single SELECT) — lets the
+    /// caller choose a read vs write lock.
+    pub is_read: bool,
 }
 
 
@@ -150,6 +172,11 @@ pub struct Database {
     /// events (no-op). The server attaches a real sink (e.g. a JSONL file)
     /// when one is configured.
     audit: Option<Arc<dyn galaxdb_auth::AuditSink>>,
+    /// Bounded LRU cache of parsed statements (Req 7). A repeated,
+    /// byte-identical statement skips the SQL parser on a hit. Wrapped in
+    /// a `Mutex` for interior mutability so both `&mut self` (`execute`)
+    /// and `&self` (`execute_readonly`) callers can use it.
+    stmt_cache: Mutex<galaxdb_sql::StatementCache>,
 }
 
 impl Database {
@@ -177,6 +204,7 @@ impl Database {
             catalog: galaxdb_sql::executor::Catalog::new(),
             session: None,
             audit: None,
+            stmt_cache: Mutex::new(galaxdb_sql::StatementCache::new(256)),
         })
     }
 
@@ -373,6 +401,72 @@ impl Database {
         Some(entry.columns.iter().map(|c| c.name.clone()).collect())
     }
 
+    /// Prepare a statement template once (extended query protocol, Req 6).
+    /// Parses the SQL a single time and resolves its static shape so that
+    /// repeated `Execute`s bind parameters into the cached AST without
+    /// ever re-invoking the parser (Req 7). The returned [`PreparedTemplate`]
+    /// is bound + run via [`Database::execute_bound_with_session`] /
+    /// [`Database::execute_bound_readonly_with_session`].
+    pub fn prepare(&self, sql: &str) -> GalaxResult<PreparedTemplate> {
+        let stmts = parser::parse(sql)?;
+        let columns = stmts.first().and_then(|s| self.describe_columns(s));
+        // A read-only statement is a single standard `Query` (SELECT). This
+        // mirrors the read/write split the wire server uses for locking.
+        let is_read = matches!(
+            stmts.first(),
+            Some(AuroraStatement::Standard(s))
+                if matches!(s.as_ref(), sqlparser::ast::Statement::Query(_))
+        );
+        Ok(PreparedTemplate {
+            stmts: Arc::new(stmts),
+            param_count: count_placeholders(sql),
+            columns,
+            is_read,
+        })
+    }
+
+    /// Bind parameters into a prepared template and execute it on the
+    /// write path (`&mut self`). The template's AST is reused — the parser
+    /// is not invoked (Req 7). Authorization is enforced identically to the
+    /// simple-query path because execution funnels through `exec_stmt`.
+    pub fn execute_bound_with_session(
+        &mut self,
+        template: &PreparedTemplate,
+        values: &[galaxdb_sql::BoundValue],
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        let bound = galaxdb_sql::bind_placeholders(&template.stmts, values)?;
+        let prev = self.session.take();
+        self.session = session;
+        let result = (|| {
+            let mut last = QueryResult::Ok("OK".to_string());
+            for stmt in &bound {
+                last = self.exec_stmt(stmt)?;
+            }
+            Ok(last)
+        })();
+        self.session = prev;
+        result
+    }
+
+    /// Bind parameters into a prepared template and execute it on the
+    /// read-only path (`&self`). Only valid for SELECT/SHOW templates
+    /// (`PreparedTemplate::is_read`).
+    pub fn execute_bound_readonly_with_session(
+        &self,
+        template: &PreparedTemplate,
+        values: &[galaxdb_sql::BoundValue],
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        let bound = galaxdb_sql::bind_placeholders(&template.stmts, values)?;
+        let sess = session.or_else(|| self.session.clone());
+        let mut last = QueryResult::Ok("OK".to_string());
+        for stmt in &bound {
+            last = self.dispatch_readonly_stmt(stmt, sess.as_ref())?;
+        }
+        Ok(last)
+    }
+
     /// Synchronous execute — for embedded Rust callers and the Python
     /// FFI.
     pub fn execute(&mut self, sql: &str) -> GalaxResult<QueryResult> {
@@ -385,9 +479,13 @@ impl Database {
             return self.exec_select_at_version(&stripped, at);
         }
 
-        let stmts = parser::parse(sql)?;
+        let stmts = self
+            .stmt_cache
+            .lock()
+            .map_err(|_| GalaxError::Internal("statement cache mutex poisoned".into()))?
+            .get_or_parse(sql)?;
         let mut last = QueryResult::Ok("OK".to_string());
-        for stmt in &stmts {
+        for stmt in stmts.iter() {
             last = self.exec_stmt(stmt)?;
         }
         Ok(last)
@@ -422,41 +520,53 @@ impl Database {
             return self.select_at_version_readonly(&stripped, at, session.as_ref());
         }
 
-        let stmts = parser::parse(sql)?;
+        let stmts = self
+            .stmt_cache
+            .lock()
+            .map_err(|_| GalaxError::Internal("statement cache mutex poisoned".into()))?
+            .get_or_parse(sql)?;
         let mut last = QueryResult::Ok("OK".to_string());
-        for stmt in &stmts {
-            match stmt {
-                AuroraStatement::Standard(s) => {
-                    if let sqlparser::ast::Statement::Query(q) = s.as_ref() {
-                        last = self.select_readonly(q, session.as_ref())?;
-                    } else {
-                        return Err(GalaxError::Internal(
-                            "execute_readonly only supports SELECT and SHOW; \
-                             use execute() for write-capable statements"
-                                .into(),
-                        ));
-                    }
-                }
-                AuroraStatement::ShowEmbeddingHealth { table } => {
-                    let msg = table
-                        .as_ref()
-                        .map_or("SHOW EMBEDDING HEALTH".to_string(), |t| {
-                            format!("SHOW EMBEDDING HEALTH FOR {}", t)
-                        });
-                    last = QueryResult::Rows(vec![QueryRow {
-                        values: vec![("status".to_string(), msg)],
-                    }]);
-                }
-                _ => {
-                    return Err(GalaxError::Internal(
-                        "execute_readonly only supports SELECT and SHOW; use execute() for \
-                         write-capable statements"
-                            .into(),
-                    ));
-                }
-            }
+        for stmt in stmts.iter() {
+            last = self.dispatch_readonly_stmt(stmt, session.as_ref())?;
         }
         Ok(last)
+    }
+
+    /// Dispatch one already-parsed statement on the read-only path.
+    /// Rejects write-capable statements so a read lock can never mutate.
+    fn dispatch_readonly_stmt(
+        &self,
+        stmt: &AuroraStatement,
+        session: Option<&galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        match stmt {
+            AuroraStatement::Standard(s) => {
+                if let sqlparser::ast::Statement::Query(q) = s.as_ref() {
+                    self.select_readonly(q, session)
+                } else {
+                    Err(GalaxError::Internal(
+                        "execute_readonly only supports SELECT and SHOW; \
+                         use execute() for write-capable statements"
+                            .into(),
+                    ))
+                }
+            }
+            AuroraStatement::ShowEmbeddingHealth { table } => {
+                let msg = table
+                    .as_ref()
+                    .map_or("SHOW EMBEDDING HEALTH".to_string(), |t| {
+                        format!("SHOW EMBEDDING HEALTH FOR {}", t)
+                    });
+                Ok(QueryResult::Rows(vec![QueryRow {
+                    values: vec![("status".to_string(), msg)],
+                }]))
+            }
+            _ => Err(GalaxError::Internal(
+                "execute_readonly only supports SELECT and SHOW; use execute() for \
+                 write-capable statements"
+                    .into(),
+            )),
+        }
     }
 
     fn select_readonly(

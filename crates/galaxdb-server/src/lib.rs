@@ -484,14 +484,31 @@ where
                 query,
                 param_types,
             } => {
-                prepared.insert(
-                    statement,
-                    PreparedStatement {
-                        sql: query,
-                        param_types,
-                    },
-                );
-                write_parse_complete(&mut writer).await?;
+                // Parse the template ONCE here; Bind/Execute reuse this AST
+                // (no re-parse per execution — Req 7). A parse error is
+                // reported now via ErrorResponse.
+                let db_clone = db.clone();
+                let q = query.clone();
+                let prepared_result = tokio::task::spawn_blocking(move || {
+                    db_clone.blocking_read().prepare(&q)
+                })
+                .await
+                .map_err(|e| std::io::Error::other(format!("prepare worker panic: {e}")))?;
+                match prepared_result {
+                    Ok(template) => {
+                        prepared.insert(
+                            statement,
+                            PreparedStatement {
+                                template,
+                                param_types,
+                            },
+                        );
+                        write_parse_complete(&mut writer).await?;
+                    }
+                    Err(e) => {
+                        write_error_response(&mut writer, e.sqlstate(), &format!("{}", e)).await?;
+                    }
+                }
                 writer.flush().await?;
             }
 
@@ -512,7 +529,7 @@ where
                     writer.flush().await?;
                     continue;
                 };
-                match bind_portal(stmt, &param_formats, &params, result_formats) {
+                match bind_portal(stmt, &statement, &param_formats, &params, result_formats) {
                     Ok(p) => {
                         portals.insert(portal, p);
                         write_bind_complete(&mut writer).await?;
@@ -537,26 +554,26 @@ where
                         writer.flush().await?;
                         continue;
                     };
-                    let shape = describe_sql(&db, &stmt.sql).await;
-                    // Parameter type OIDs: prefer the client-declared types
-                    // from Parse; fall back to the resolved count as text.
-                    let oids = resolve_param_oids(stmt, &shape);
+                    let oids = resolve_param_oids(stmt);
                     write_parameter_description(&mut writer, &oids).await?;
-                    write_describe_rows(&mut writer, shape.ok().and_then(|s| s.columns)).await?;
+                    write_describe_rows(&mut writer, stmt.template.columns.clone()).await?;
                 } else {
-                    // Describe portal: RowDescription | NoData.
-                    let Some(p) = portals.get(&name) else {
+                    // Describe portal: RowDescription | NoData (columns come
+                    // from the portal's backing prepared statement).
+                    let columns = portals
+                        .get(&name)
+                        .and_then(|p| prepared.get(&p.statement))
+                        .and_then(|s| s.template.columns.clone());
+                    if portals.contains_key(&name) {
+                        write_describe_rows(&mut writer, columns).await?;
+                    } else {
                         write_error_response(
                             &mut writer,
                             "34000",
                             &format!("portal \"{name}\" does not exist"),
                         )
                         .await?;
-                        writer.flush().await?;
-                        continue;
-                    };
-                    let shape = describe_sql(&db, &p.sql).await;
-                    write_describe_rows(&mut writer, shape.ok().and_then(|s| s.columns)).await?;
+                    }
                 }
                 writer.flush().await?;
             }
@@ -572,10 +589,22 @@ where
                     writer.flush().await?;
                     continue;
                 };
-                // Execute carries no RowDescription (the client already got
-                // it from Describe); emit DataRows + CommandComplete only.
-                let sql = p.sql.clone();
-                run_extended_execute(&mut writer, &db, &session, &sql).await?;
+                let Some(stmt) = prepared.get(&p.statement) else {
+                    write_error_response(
+                        &mut writer,
+                        "26000",
+                        &format!("prepared statement \"{}\" does not exist", p.statement),
+                    )
+                    .await?;
+                    writer.flush().await?;
+                    continue;
+                };
+                // Bind the parsed template + run it — no re-parse (Req 7).
+                // The client already received the RowDescription from
+                // Describe, so emit DataRows + CommandComplete only.
+                let result =
+                    run_bound_execute(&db, &session, &stmt.template, p.values.clone()).await?;
+                write_query_result(&mut writer, result, false).await?;
                 // No ReadyForQuery here — that waits for Sync.
                 writer.flush().await?;
             }
@@ -604,24 +633,25 @@ where
     Ok(())
 }
 
-/// A statement prepared via `Parse`: the SQL text (with `$n` placeholders)
-/// and the client-declared parameter type OIDs (0 = unspecified).
+/// A statement prepared via `Parse`: the parse-once template and the
+/// client-declared parameter type OIDs (0 = unspecified).
 struct PreparedStatement {
-    sql: String,
+    template: galaxdb_embedded::PreparedTemplate,
     param_types: Vec<i32>,
 }
 
-/// A portal produced by `Bind`: the concrete SQL with parameters
-/// substituted as literals, ready to execute.
+/// A portal produced by `Bind`: the backing prepared-statement name and
+/// the decoded parameter values to bind at `Execute`.
 struct Portal {
-    sql: String,
+    statement: String,
+    values: Vec<galaxdb_embedded::BoundValue>,
 }
 
-/// Substitute bound parameters into a prepared statement, producing the
-/// concrete SQL for a portal. Each value is rendered as a typed SQL
-/// literal (Req 6 AC5: text + binary formats).
+/// Decode the bound parameters of a `Bind` into typed values, producing a
+/// portal that references its prepared statement (Req 6 AC5: text+binary).
 fn bind_portal(
     stmt: &PreparedStatement,
+    statement_name: &str,
     param_formats: &[i16],
     params: &[Option<Vec<u8>>],
     _result_formats: Vec<i16>,
@@ -635,53 +665,30 @@ fn bind_portal(
             _ => *param_formats.get(i).unwrap_or(&0),
         }
     };
-    let mut literals = Vec::with_capacity(params.len());
+    let mut values = Vec::with_capacity(params.len());
     for (i, val) in params.iter().enumerate() {
         let type_oid = stmt.param_types.get(i).copied().unwrap_or(0);
-        let literal = galaxdb_wire::param_codec::param_to_sql_literal(
-            val.as_deref(),
-            fmt_for(i),
-            type_oid,
-        )?;
-        literals.push(literal);
+        let v = galaxdb_wire::param_codec::param_to_bound_value(val.as_deref(), fmt_for(i), type_oid)?;
+        values.push(v);
     }
     Ok(Portal {
-        sql: galaxdb_wire::param_codec::substitute_parameters(&stmt.sql, &literals),
+        statement: statement_name.to_string(),
+        values,
     })
 }
 
 /// Resolve the parameter type OIDs to report in `ParameterDescription`:
 /// use the client-declared types from `Parse` where given, padding any
-/// remaining inferred parameters with `text` (the executor accepts text
-/// literals for every supported type).
-fn resolve_param_oids(
-    stmt: &PreparedStatement,
-    shape: &Result<galaxdb_embedded::StatementShape, galaxdb_common::GalaxError>,
-) -> Vec<i32> {
-    let inferred = shape.as_ref().map(|s| s.param_count).unwrap_or(0);
-    let n = stmt.param_types.len().max(inferred);
+/// inferred parameters with `text` (the executor binds text literals for
+/// every supported type).
+fn resolve_param_oids(stmt: &PreparedStatement) -> Vec<i32> {
+    let n = stmt.param_types.len().max(stmt.template.param_count);
     (0..n)
         .map(|i| match stmt.param_types.get(i) {
             Some(&oid) if oid != 0 => oid,
             _ => galaxdb_wire::param_codec::oid::TEXT,
         })
         .collect()
-}
-
-/// Resolve a statement's shape off the blocking pool (it parses + reads
-/// the catalog under a read lock).
-async fn describe_sql(
-    db: &Arc<RwLock<Database>>,
-    sql: &str,
-) -> Result<galaxdb_embedded::StatementShape, galaxdb_common::GalaxError> {
-    let db_clone = db.clone();
-    let sql_owned = sql.to_string();
-    tokio::task::spawn_blocking(move || {
-        let guard = db_clone.blocking_read();
-        guard.describe_statement(&sql_owned)
-    })
-    .await
-    .unwrap_or_else(|e| Err(galaxdb_common::GalaxError::Internal(format!("describe worker panic: {e}"))))
 }
 
 /// Emit a `RowDescription` for the resolved columns (text-typed, matching
@@ -696,9 +703,7 @@ async fn write_describe_rows<W: AsyncWriteExt + Unpin>(
             let descs: Vec<ColumnDesc> = cols.iter().map(|c| ColumnDesc::text(c)).collect();
             write_row_description(writer, &descs).await
         }
-        // Empty column list or a non-row statement → NoData. (An empty
-        // projection that resolved to zero catalog columns is degenerate;
-        // NoData is the correct answer.)
+        // Empty column list or a non-row statement → NoData.
         _ => write_no_data(writer).await,
     }
 }
@@ -743,18 +748,30 @@ async fn run_simple_query<W: AsyncWriteExt + Unpin>(
     write_query_result(writer, result, true).await
 }
 
-/// Run an extended-protocol `Execute`: same engine path, but the client
-/// already received the RowDescription from `Describe`, so only DataRows +
-/// CommandComplete are written (no RowDescription).
-async fn run_extended_execute<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
+/// Bind a prepared template's parameters and execute it on the blocking
+/// pool (Req 7: no re-parse). The lock is chosen by the template's
+/// read/write classification, matching the simple-query path.
+async fn run_bound_execute(
     db: &Arc<RwLock<Database>>,
     session: &SessionContext,
-    sql: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    template: &galaxdb_embedded::PreparedTemplate,
+    values: Vec<galaxdb_embedded::BoundValue>,
+) -> Result<galaxdb_common::GalaxResult<galaxdb_embedded::QueryResult>, std::io::Error> {
     galaxdb_observe::metrics().queries_total.inc();
-    let result = run_engine(db, session, sql).await?;
-    write_query_result(writer, result, false).await
+    let db_clone = db.clone();
+    let session_clone = session.clone();
+    let template = template.clone();
+    tokio::task::spawn_blocking(move || {
+        if template.is_read {
+            let guard = db_clone.blocking_read();
+            guard.execute_bound_readonly_with_session(&template, &values, Some(session_clone))
+        } else {
+            let mut guard = db_clone.blocking_write();
+            guard.execute_bound_with_session(&template, &values, Some(session_clone))
+        }
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("worker panic: {e}")))
 }
 
 /// Execute one statement against the engine on the blocking pool, choosing

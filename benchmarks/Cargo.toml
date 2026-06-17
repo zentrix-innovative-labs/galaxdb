@@ -12,6 +12,10 @@ galaxdb-storage = { path = "../crates/galaxdb-storage" }
 galaxdb-io = { path = "../crates/galaxdb-io" }
 galaxdb-vector = { path = "../crates/galaxdb-vector" }
 galaxdb-sidecar = { path = "../crates/galaxdb-sidecar" }
+# For the single-row wire INSERT benchmark (task 10.4): drive a real
+# galaxdb-server over the PostgreSQL wire protocol with a real client.
+galaxdb-server = { path = "../crates/galaxdb-server" }
+tokio-postgres = "0.7"
 tokio = { version = "1", features = ["full"] }
 rand = { version = "0.8", features = ["small_rng"] }
 rayon = "1"

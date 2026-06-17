@@ -2565,6 +2565,7 @@ dependencies = [
  "galaxdb-common",
  "galaxdb-io",
  "galaxdb-observe",
+ "galaxdb-server",
  "galaxdb-sidecar",
  "galaxdb-storage",
  "galaxdb-vector",
@@ -2575,6 +2576,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-postgres",
 ]
 
 [[package]]
