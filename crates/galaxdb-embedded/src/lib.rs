@@ -356,6 +356,194 @@ impl Database {
         result
     }
 
+    /// DML-write path that takes `&self` (shared/read lock) instead of
+    /// `&mut self` (exclusive write lock). Safe for concurrent callers
+    /// because:
+    ///   - INSERT, UPDATE, DELETE, BULK INSERT never mutate `self.catalog`
+    ///     (only DDL does). This method rejects DDL explicitly.
+    ///   - The storage engine (`Arc<Engine>`) is internally thread-safe —
+    ///     memtable, ART, and WAL use their own fine-grained locks.
+    ///   - The catalog is cloned once per call (cheap: table metadata only,
+    ///     no row data) so the executor has a stable snapshot without
+    ///     locking the caller.
+    ///
+    /// This enables multiple concurrent wire connections to insert rows
+    /// simultaneously, letting the WAL group-commit coalesce their fsyncs
+    /// — the same pattern that gives PostgreSQL its concurrent TPS.
+    ///
+    /// Callers must NOT pass DDL (CREATE TABLE, DROP TABLE, CREATE INDEX,
+    /// role/grant statements). Those require `&mut self` via
+    /// `execute_with_session` so the catalog mutation is visible.
+    pub fn execute_dml_concurrent(
+        &self,
+        sql: &str,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        // Parse and classify — reject DDL before we even touch the engine.
+        let stmts = {
+            let mut cache = self.stmt_cache
+                .lock()
+                .map_err(|_| GalaxError::Internal("statement cache mutex poisoned".into()))?;
+            cache.get_or_parse(sql)?
+        };
+
+        for stmt in stmts.iter() {
+            match stmt {
+                AuroraStatement::Standard(s) => {
+                    use sqlparser::ast::Statement;
+                    match s.as_ref() {
+                        // These are all safe DML that never mutate the catalog.
+                        Statement::Insert(_)
+                        | Statement::Update { .. }
+                        | Statement::Delete(_)
+                        | Statement::Query(_) => {}
+                        other => {
+                            return Err(GalaxError::Internal(format!(
+                                "execute_dml_concurrent: DDL statement not allowed \
+                                 on the concurrent path: {other}"
+                            )));
+                        }
+                    }
+                }
+                // BulkInsert is safe: no catalog mutation.
+                AuroraStatement::BulkInsert(_) => {}
+                other => {
+                    return Err(GalaxError::Internal(format!(
+                        "execute_dml_concurrent: statement not allowed on the \
+                         concurrent path: {other:?}"
+                    )));
+                }
+            }
+        }
+
+        // Build a context from &self — mirrors what context() does but
+        // without the &mut self requirement.
+        let mut last = QueryResult::Ok("OK".to_string());
+        for stmt in stmts.iter() {
+            // Translate the parsed statement to a QueryPlan inline.
+            // Only INSERT and BULK INSERT are allowed (validated above).
+            let plan = match stmt {
+                AuroraStatement::BulkInsert(bi) => QueryPlan::BulkInsert {
+                    table: bi.table.clone(),
+                    columns: bi.columns.clone(),
+                    values: bi.values.clone(),
+                },
+                AuroraStatement::Standard(s) => {
+                    match s.as_ref() {
+                        sqlparser::ast::Statement::Insert(ins) => {
+                            // Build one Insert plan per row in the VALUES list.
+                            let table = ins.table_name.to_string();
+                            let column_names: Vec<String> = ins.columns.iter()
+                                .map(|c| c.to_string())
+                                .collect();
+                            let Some(source) = &ins.source else {
+                                continue;
+                            };
+                            let sqlparser::ast::SetExpr::Values(values) =
+                                source.body.as_ref() else { continue };
+                            for row in &values.rows {
+                                let row_values: Vec<Value> = row.iter()
+                                    .map(value_from_expr)
+                                    .collect();
+                                let row_plan = QueryPlan::Insert {
+                                    table: table.clone(),
+                                    columns: column_names.clone(),
+                                    values: row_values,
+                                };
+                                let mut ctx = ExecutorContext::new(self.engine.clone());
+                                ctx.catalog = self.catalog.clone();
+                                ctx.sidecar = self.sidecar.clone();
+                                ctx.merkle_dag = Some(self.merkle_dag.clone());
+                                ctx.tag_catalog = Some(self.tag_catalog.clone());
+                                ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
+                                    sidecar: self.sidecar.clone(),
+                                    indexes: self.vector_indexes.clone(),
+                                    engine: self.engine.clone(),
+                                }));
+                                ctx.auth_store = Some(
+                                    galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()),
+                                );
+                                ctx.secondary_index = Some(
+                                    galaxdb_sql::secondary_index::SecondaryIndexStore::new(
+                                        self.engine.clone(),
+                                    ),
+                                );
+                                ctx.session = session.clone();
+                                ctx.audit = self.audit.clone();
+                                let res = execute_with_context(&row_plan, &mut ctx)?;
+                                // Intentionally NOT writing ctx.catalog back — INSERT
+                                // never mutates it, and this is &self so we couldn't anyway.
+                                last = query_result_from(res);
+                            }
+                            continue;
+                        }
+                        sqlparser::ast::Statement::Update {
+                            table, assignments, selection, ..
+                        } => {
+                            let tname = table.relation.to_string();
+                            let asns: Vec<(String, Value)> = assignments.iter()
+                                .map(|a| (
+                                    a.target.to_string(),
+                                    value_from_expr(&a.value),
+                                ))
+                                .collect();
+                            let filter = selection.as_ref().and_then(filter_from_expr);
+                            QueryPlan::Update {
+                                table: tname,
+                                assignments: asns,
+                                filter,
+                            }
+                        }
+                        sqlparser::ast::Statement::Delete(del) => {
+                            let tname = match &del.from {
+                                sqlparser::ast::FromTable::WithFromKeyword(tables)
+                                | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
+                                    tables.first().map(|t| t.relation.to_string()).unwrap_or_default()
+                                }
+                            };
+                            let filter = del.selection.as_ref().and_then(filter_from_expr);
+                            QueryPlan::Delete { table: tname, filter }
+                        }
+                        sqlparser::ast::Statement::Query(q) => {
+                            let (columns, filter) = extract_projection_and_filter(q);
+                            let table = extract_table(q);
+                            QueryPlan::FullScan { table, filter, columns }
+                        }
+                        other => {
+                            return Err(GalaxError::Internal(format!(
+                                "execute_dml_concurrent: unexpected statement: {other}"
+                            )));
+                        }
+                    }
+                }
+                other => {
+                    return Err(GalaxError::Internal(format!(
+                        "execute_dml_concurrent: unexpected statement: {other:?}"
+                    )));
+                }
+            };
+            let mut ctx = ExecutorContext::new(self.engine.clone());
+            ctx.catalog = self.catalog.clone();
+            ctx.sidecar = self.sidecar.clone();
+            ctx.merkle_dag = Some(self.merkle_dag.clone());
+            ctx.tag_catalog = Some(self.tag_catalog.clone());
+            ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
+                sidecar: self.sidecar.clone(),
+                indexes: self.vector_indexes.clone(),
+                engine: self.engine.clone(),
+            }));
+            ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+            ctx.secondary_index = Some(
+                galaxdb_sql::secondary_index::SecondaryIndexStore::new(self.engine.clone()),
+            );
+            ctx.session = session.clone();
+            ctx.audit = self.audit.clone();
+            let res = execute_with_context(&plan, &mut ctx)?;
+            last = query_result_from(res);
+        }
+        Ok(last)
+    }
+
     /// Resolve the static shape of a statement for the extended query
     /// protocol's `Describe` (Req 6 AC4) — parameter count and, for a
     /// row-returning SELECT, the result column names — without executing
@@ -376,6 +564,18 @@ impl Database {
             param_count,
             columns,
         })
+    }
+
+    /// All column names of a table in catalog (declaration) order, or a
+    /// `TableNotFound` error. Used by the COPY sub-protocol to resolve the
+    /// column set when `COPY t FROM STDIN` / `TO STDOUT` omits an explicit
+    /// list, and to advertise the column count.
+    pub fn table_columns(&self, table: &str) -> GalaxResult<Vec<String>> {
+        let entry = self
+            .catalog
+            .get_table(table)
+            .ok_or_else(|| GalaxError::TableNotFound(table.to_string()))?;
+        Ok(entry.columns.iter().map(|c| c.name.clone()).collect())
     }
 
     /// Result column names for a statement, or `None` when it returns no
@@ -465,6 +665,151 @@ impl Database {
             last = self.dispatch_readonly_stmt(stmt, sess.as_ref())?;
         }
         Ok(last)
+    }
+
+    /// `&self` DML path for prepared statements — same as
+    /// `execute_bound_with_session` but takes a shared read lock instead of
+    /// an exclusive write lock. Safe because DML (INSERT/UPDATE/DELETE) never
+    /// mutates the catalog, and the engine is internally thread-safe. Allows
+    /// concurrent prepared INSERTs to share WAL group-commit fsyncs.
+    pub fn execute_bound_dml_concurrent(
+        &self,
+        template: &PreparedTemplate,
+        values: &[galaxdb_sql::BoundValue],
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        let bound = galaxdb_sql::bind_placeholders(&template.stmts, values)?;
+        let mut last = QueryResult::Ok("OK".to_string());
+        for stmt in bound.iter() {
+            // Reuse the execute_dml_concurrent approach: build a context
+            // from &self and dispatch the already-parsed statement.
+            let plan = match stmt {
+                AuroraStatement::BulkInsert(bi) => QueryPlan::BulkInsert {
+                    table: bi.table.clone(),
+                    columns: bi.columns.clone(),
+                    values: bi.values.clone(),
+                },
+                AuroraStatement::Standard(s) => match s.as_ref() {
+                    sqlparser::ast::Statement::Insert(ins) => {
+                        let table = ins.table_name.to_string();
+                        let column_names: Vec<String> = ins.columns.iter()
+                            .map(|c| c.to_string())
+                            .collect();
+                        let Some(source) = &ins.source else { continue };
+                        let sqlparser::ast::SetExpr::Values(vals) =
+                            source.body.as_ref() else { continue };
+                        for row in &vals.rows {
+                            let row_values: Vec<Value> = row.iter()
+                                .map(value_from_expr)
+                                .collect();
+                            let row_plan = QueryPlan::Insert {
+                                table: table.clone(),
+                                columns: column_names.clone(),
+                                values: row_values,
+                            };
+                            let mut ctx = ExecutorContext::new(self.engine.clone());
+                            ctx.catalog = self.catalog.clone();
+                            ctx.sidecar = self.sidecar.clone();
+                            ctx.merkle_dag = Some(self.merkle_dag.clone());
+                            ctx.tag_catalog = Some(self.tag_catalog.clone());
+                            ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
+                                sidecar: self.sidecar.clone(),
+                                indexes: self.vector_indexes.clone(),
+                                engine: self.engine.clone(),
+                            }));
+                            ctx.auth_store = Some(
+                                galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()),
+                            );
+                            ctx.secondary_index = Some(
+                                galaxdb_sql::secondary_index::SecondaryIndexStore::new(
+                                    self.engine.clone(),
+                                ),
+                            );
+                            ctx.session = session.clone();
+                            ctx.audit = self.audit.clone();
+                            let res = execute_with_context(&row_plan, &mut ctx)?;
+                            last = query_result_from(res);
+                        }
+                        continue;
+                    }
+                    sqlparser::ast::Statement::Update {
+                        table, assignments, selection, ..
+                    } => {
+                        let tname = table.relation.to_string();
+                        let asns: Vec<(String, Value)> = assignments.iter()
+                            .map(|a| (a.target.to_string(), value_from_expr(&a.value)))
+                            .collect();
+                        let filter = selection.as_ref().and_then(filter_from_expr);
+                        QueryPlan::Update { table: tname, assignments: asns, filter }
+                    }
+                    sqlparser::ast::Statement::Delete(del) => {
+                        let tname = match &del.from {
+                            sqlparser::ast::FromTable::WithFromKeyword(tables)
+                            | sqlparser::ast::FromTable::WithoutKeyword(tables) => {
+                                tables.first().map(|t| t.relation.to_string()).unwrap_or_default()
+                            }
+                        };
+                        let filter = del.selection.as_ref().and_then(filter_from_expr);
+                        QueryPlan::Delete { table: tname, filter }
+                    }
+                    other => {
+                        return Err(GalaxError::Internal(format!(
+                            "execute_bound_dml_concurrent: unexpected statement: {other}"
+                        )));
+                    }
+                },
+                other => {
+                    return Err(GalaxError::Internal(format!(
+                        "execute_bound_dml_concurrent: unexpected statement: {other:?}"
+                    )));
+                }
+            };
+            let mut ctx = ExecutorContext::new(self.engine.clone());
+            ctx.catalog = self.catalog.clone();
+            ctx.sidecar = self.sidecar.clone();
+            ctx.merkle_dag = Some(self.merkle_dag.clone());
+            ctx.tag_catalog = Some(self.tag_catalog.clone());
+            ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
+                sidecar: self.sidecar.clone(),
+                indexes: self.vector_indexes.clone(),
+                engine: self.engine.clone(),
+            }));
+            ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+            ctx.secondary_index = Some(
+                galaxdb_sql::secondary_index::SecondaryIndexStore::new(self.engine.clone()),
+            );
+            ctx.session = session.clone();
+            ctx.audit = self.audit.clone();
+            let res = execute_with_context(&plan, &mut ctx)?;
+            last = query_result_from(res);
+        }
+        Ok(last)
+    }
+
+
+    /// Bulk-insert pre-tokenized rows through the BULK INSERT executor path
+    /// (`exec_bulk_insert` → `put_sync`), under an optional session so
+    /// authorization is enforced (Req 3 AC7). Each cell is a raw token
+    /// typed by `value_from_str` (`NULL`, numerics, bools, otherwise text),
+    /// which is exactly the form `COPY ... FROM STDIN` produces — so the
+    /// wire server ingests a COPY stream without building one INSERT per
+    /// row (Req 8 AC3).
+    pub fn bulk_insert_with_session(
+        &mut self,
+        table: &str,
+        columns: Vec<String>,
+        values: Vec<Vec<String>>,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        let prev = self.session.take();
+        self.session = session;
+        let result = self.dispatch(QueryPlan::BulkInsert {
+            table: table.to_string(),
+            columns,
+            values,
+        });
+        self.session = prev;
+        result
     }
 
     /// Synchronous execute — for embedded Rust callers and the Python

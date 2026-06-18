@@ -290,6 +290,19 @@ pub async fn start(
                 }
             };
 
+            // Disable Nagle's algorithm. The PostgreSQL wire protocol is
+            // request/response with many small backend messages (especially
+            // the extended-query path: BindComplete, DataRow,
+            // CommandComplete sent across separate writes). With Nagle on,
+            // these small segments collide with the peer's delayed-ACK
+            // timer and stall ~40 ms per round trip — which caps prepared
+            // single-row throughput at ~24 rows/s. Real PostgreSQL sets
+            // TCP_NODELAY for the same reason. Best-effort: a failure here
+            // is non-fatal, the connection still works (just slower).
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!(peer = %peer, error = %e, "could not set TCP_NODELAY");
+            }
+
             let current = active.load(Ordering::Relaxed);
             if current >= max_connections {
                 tracing::warn!(peer = %peer, "rejecting: too many connections");
@@ -468,12 +481,17 @@ where
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         };
-
         match msg {
             FrontendMessage::Terminate => break,
 
             FrontendMessage::Query(sql) => {
-                run_simple_query(&mut writer, &db, &session, &sql).await?;
+                // COPY ... FROM STDIN / TO STDOUT is a wire sub-protocol,
+                // not a normal statement — intercept it before execution.
+                if let Some(cmd) = galaxdb_wire::copy::parse_copy(&sql) {
+                    run_copy(&mut reader, &mut writer, &db, &session, cmd).await?;
+                } else {
+                    run_simple_query(&mut writer, &db, &session, &sql).await?;
+                }
                 write_ready_for_query(&mut writer, b'I').await?;
                 writer.flush().await?;
             }
@@ -484,6 +502,14 @@ where
                 query,
                 param_types,
             } => {
+                // COPY is a wire sub-protocol, not a parseable statement —
+                // detect it at Parse and store the command for Execute.
+                if let Some(cmd) = galaxdb_wire::copy::parse_copy(&query) {
+                    prepared.insert(statement, PreparedStatement::Copy(cmd));
+                    write_parse_complete(&mut writer).await?;
+                    writer.flush().await?;
+                    continue;
+                }
                 // Parse the template ONCE here; Bind/Execute reuse this AST
                 // (no re-parse per execution — Req 7). A parse error is
                 // reported now via ErrorResponse.
@@ -498,7 +524,7 @@ where
                     Ok(template) => {
                         prepared.insert(
                             statement,
-                            PreparedStatement {
+                            PreparedStatement::Normal {
                                 template,
                                 param_types,
                             },
@@ -519,23 +545,37 @@ where
                 params,
                 result_formats,
             } => {
-                let Some(stmt) = prepared.get(&statement) else {
-                    write_error_response(
-                        &mut writer,
-                        "26000",
-                        &format!("prepared statement \"{statement}\" does not exist"),
-                    )
-                    .await?;
-                    writer.flush().await?;
-                    continue;
-                };
-                match bind_portal(stmt, &statement, &param_formats, &params, result_formats) {
-                    Ok(p) => {
-                        portals.insert(portal, p);
+                match prepared.get(&statement) {
+                    None => {
+                        write_error_response(
+                            &mut writer,
+                            "26000",
+                            &format!("prepared statement \"{statement}\" does not exist"),
+                        )
+                        .await?;
+                    }
+                    Some(PreparedStatement::Copy(_)) => {
+                        // COPY takes no parameters; the portal just refers
+                        // back to the prepared COPY command.
+                        portals.insert(
+                            portal,
+                            Portal {
+                                statement: statement.clone(),
+                                values: Vec::new(),
+                            },
+                        );
                         write_bind_complete(&mut writer).await?;
                     }
-                    Err(msg) => {
-                        write_error_response(&mut writer, "22023", &msg).await?;
+                    Some(PreparedStatement::Normal { param_types, .. }) => {
+                        match bind_portal(param_types, &statement, &param_formats, &params, result_formats) {
+                            Ok(p) => {
+                                portals.insert(portal, p);
+                                write_bind_complete(&mut writer).await?;
+                            }
+                            Err(msg) => {
+                                write_error_response(&mut writer, "22023", &msg).await?;
+                            }
+                        }
                     }
                 }
                 writer.flush().await?;
@@ -543,27 +583,33 @@ where
 
             FrontendMessage::Describe { kind, name } => {
                 if kind == b'S' {
-                    // Describe statement: ParameterDescription + (RowDescription | NoData).
-                    let Some(stmt) = prepared.get(&name) else {
-                        write_error_response(
-                            &mut writer,
-                            "26000",
-                            &format!("prepared statement \"{name}\" does not exist"),
-                        )
-                        .await?;
-                        writer.flush().await?;
-                        continue;
-                    };
-                    let oids = resolve_param_oids(stmt);
-                    write_parameter_description(&mut writer, &oids).await?;
-                    write_describe_rows(&mut writer, stmt.template.columns.clone()).await?;
+                    match prepared.get(&name) {
+                        None => {
+                            write_error_response(
+                                &mut writer,
+                                "26000",
+                                &format!("prepared statement \"{name}\" does not exist"),
+                            )
+                            .await?;
+                        }
+                        Some(PreparedStatement::Copy(_)) => {
+                            // COPY has no bind parameters and no result rows.
+                            write_parameter_description(&mut writer, &[]).await?;
+                            write_no_data(&mut writer).await?;
+                        }
+                        Some(PreparedStatement::Normal { template, param_types }) => {
+                            let oids = resolve_param_oids(param_types, template.param_count);
+                            write_parameter_description(&mut writer, &oids).await?;
+                            write_describe_rows(&mut writer, template.columns.clone()).await?;
+                        }
+                    }
                 } else {
                     // Describe portal: RowDescription | NoData (columns come
                     // from the portal's backing prepared statement).
-                    let columns = portals
-                        .get(&name)
-                        .and_then(|p| prepared.get(&p.statement))
-                        .and_then(|s| s.template.columns.clone());
+                    let columns = portals.get(&name).and_then(|p| match prepared.get(&p.statement) {
+                        Some(PreparedStatement::Normal { template, .. }) => template.columns.clone(),
+                        _ => None,
+                    });
                     if portals.contains_key(&name) {
                         write_describe_rows(&mut writer, columns).await?;
                     } else {
@@ -589,22 +635,31 @@ where
                     writer.flush().await?;
                     continue;
                 };
-                let Some(stmt) = prepared.get(&p.statement) else {
-                    write_error_response(
-                        &mut writer,
-                        "26000",
-                        &format!("prepared statement \"{}\" does not exist", p.statement),
-                    )
-                    .await?;
-                    writer.flush().await?;
-                    continue;
-                };
-                // Bind the parsed template + run it — no re-parse (Req 7).
-                // The client already received the RowDescription from
-                // Describe, so emit DataRows + CommandComplete only.
-                let result =
-                    run_bound_execute(&db, &session, &stmt.template, p.values.clone()).await?;
-                write_query_result(&mut writer, result, false).await?;
+                match prepared.get(&p.statement) {
+                    None => {
+                        write_error_response(
+                            &mut writer,
+                            "26000",
+                            &format!("prepared statement \"{}\" does not exist", p.statement),
+                        )
+                        .await?;
+                    }
+                    Some(PreparedStatement::Copy(cmd)) => {
+                        // COPY drives its own sub-protocol on the live
+                        // reader/writer (CopyInResponse / CopyData / ...).
+                        let cmd = cmd.clone();
+                        run_copy(&mut reader, &mut writer, &db, &session, cmd).await?;
+                    }
+                    Some(PreparedStatement::Normal { template, .. }) => {
+                        // Bind the parsed template + run it — no re-parse
+                        // (Req 7). The client already received the
+                        // RowDescription from Describe, so emit DataRows +
+                        // CommandComplete only.
+                        let result =
+                            run_bound_execute(&db, &session, template, p.values.clone()).await?;
+                        write_query_result(&mut writer, result, false).await?;
+                    }
+                }
                 // No ReadyForQuery here — that waits for Sync.
                 writer.flush().await?;
             }
@@ -633,11 +688,16 @@ where
     Ok(())
 }
 
-/// A statement prepared via `Parse`: the parse-once template and the
-/// client-declared parameter type OIDs (0 = unspecified).
-struct PreparedStatement {
-    template: galaxdb_embedded::PreparedTemplate,
-    param_types: Vec<i32>,
+/// A statement prepared via `Parse`. Either a normal parse-once template,
+/// or a COPY command (which is a wire sub-protocol, not a parseable
+/// statement) detected at Parse time.
+enum PreparedStatement {
+    Normal {
+        template: galaxdb_embedded::PreparedTemplate,
+        /// Client-declared parameter type OIDs (0 = unspecified).
+        param_types: Vec<i32>,
+    },
+    Copy(galaxdb_wire::copy::CopyCommand),
 }
 
 /// A portal produced by `Bind`: the backing prepared-statement name and
@@ -650,7 +710,7 @@ struct Portal {
 /// Decode the bound parameters of a `Bind` into typed values, producing a
 /// portal that references its prepared statement (Req 6 AC5: text+binary).
 fn bind_portal(
-    stmt: &PreparedStatement,
+    param_types: &[i32],
     statement_name: &str,
     param_formats: &[i16],
     params: &[Option<Vec<u8>>],
@@ -667,7 +727,7 @@ fn bind_portal(
     };
     let mut values = Vec::with_capacity(params.len());
     for (i, val) in params.iter().enumerate() {
-        let type_oid = stmt.param_types.get(i).copied().unwrap_or(0);
+        let type_oid = param_types.get(i).copied().unwrap_or(0);
         let v = galaxdb_wire::param_codec::param_to_bound_value(val.as_deref(), fmt_for(i), type_oid)?;
         values.push(v);
     }
@@ -681,10 +741,10 @@ fn bind_portal(
 /// use the client-declared types from `Parse` where given, padding any
 /// inferred parameters with `text` (the executor binds text literals for
 /// every supported type).
-fn resolve_param_oids(stmt: &PreparedStatement) -> Vec<i32> {
-    let n = stmt.param_types.len().max(stmt.template.param_count);
+fn resolve_param_oids(param_types: &[i32], param_count: usize) -> Vec<i32> {
+    let n = param_types.len().max(param_count);
     (0..n)
-        .map(|i| match stmt.param_types.get(i) {
+        .map(|i| match param_types.get(i) {
             Some(&oid) if oid != 0 => oid,
             _ => galaxdb_wire::param_codec::oid::TEXT,
         })
@@ -748,7 +808,134 @@ async fn run_simple_query<W: AsyncWriteExt + Unpin>(
     write_query_result(writer, result, true).await
 }
 
-/// Bind a prepared template's parameters and execute it on the blocking
+/// Drive the COPY sub-protocol (Req 8): `COPY t FROM STDIN` ingests text
+/// rows through the bulk-insert path (not one INSERT per row); `COPY t TO
+/// STDOUT` streams the table's rows back as text `CopyData`. Text format
+/// only (AC4). Does NOT write ReadyForQuery — the caller does.
+async fn run_copy<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    db: &Arc<RwLock<Database>>,
+    session: &SessionContext,
+    cmd: galaxdb_wire::copy::CopyCommand,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    use galaxdb_wire::copy::CopyDirection;
+    galaxdb_observe::metrics().queries_total.inc();
+
+    // Resolve the table's full column set (also validates the table
+    // exists, before we tell the client to start streaming).
+    let table = cmd.table.clone();
+    let all_cols = {
+        let db2 = db.clone();
+        let t = table.clone();
+        tokio::task::spawn_blocking(move || db2.blocking_read().table_columns(&t))
+            .await
+            .map_err(|e| std::io::Error::other(format!("copy worker panic: {e}")))?
+    };
+    let all_cols = match all_cols {
+        Ok(c) => c,
+        Err(e) => {
+            write_error_response(writer, e.sqlstate(), &format!("{e}")).await?;
+            return Ok(());
+        }
+    };
+    let num_cols = if cmd.columns.is_empty() {
+        all_cols.len()
+    } else {
+        cmd.columns.len()
+    };
+
+    match cmd.direction {
+        CopyDirection::In => {
+            write_copy_in_response(writer, num_cols as u16).await?;
+            writer.flush().await?;
+
+            // Accumulate the text stream across CopyData frames.
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                match read_copy_in_message(reader).await? {
+                    CopyInMessage::Data(mut d) => buf.append(&mut d),
+                    CopyInMessage::Done => break,
+                    CopyInMessage::Fail(msg) => {
+                        write_error_response(
+                            writer,
+                            "57014",
+                            &format!("COPY from stdin failed: {msg}"),
+                        )
+                        .await?;
+                        return Ok(());
+                    }
+                }
+            }
+
+            // Split the text into rows (text format, Req 8 AC4).
+            let text = String::from_utf8_lossy(&buf);
+            let mut values: Vec<Vec<String>> = Vec::new();
+            for line in text.split('\n') {
+                let line = line.strip_suffix('\r').unwrap_or(line);
+                if line.is_empty() || line == "\\." {
+                    continue;
+                }
+                values.push(galaxdb_wire::copy::decode_text_row(line));
+            }
+            let n = values.len();
+
+            let db2 = db.clone();
+            let sess = session.clone();
+            let t = table.clone();
+            let cols = cmd.columns.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                db2.blocking_write()
+                    .bulk_insert_with_session(&t, cols, values, Some(sess))
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("copy worker panic: {e}")))?;
+            match result {
+                Ok(_) => write_command_complete(writer, &format!("COPY {n}")).await?,
+                Err(e) => write_error_response(writer, e.sqlstate(), &format!("{e}")).await?,
+            }
+        }
+        CopyDirection::Out => {
+            // Project the requested columns (or all) and stream the rows.
+            let projection = if cmd.columns.is_empty() {
+                "*".to_string()
+            } else {
+                cmd.columns.join(", ")
+            };
+            let sql = format!("SELECT {projection} FROM {table}");
+            let result = run_engine(db, session, &sql).await?;
+            match result {
+                Ok(galaxdb_embedded::QueryResult::Rows(rows)) => {
+                    let ncols = rows.first().map(|r| r.values.len()).unwrap_or(num_cols);
+                    write_copy_out_response(writer, ncols as u16).await?;
+                    for row in &rows {
+                        let cells: Vec<(bool, &str)> = row
+                            .values
+                            .iter()
+                            .map(|(_, v)| (v == "NULL", v.as_str()))
+                            .collect();
+                        let mut line = galaxdb_wire::copy::encode_text_row(&cells);
+                        line.push('\n');
+                        write_copy_data(writer, line.as_bytes()).await?;
+                    }
+                    write_copy_done(writer).await?;
+                    write_command_complete(writer, &format!("COPY {}", rows.len())).await?;
+                }
+                Ok(_) => {
+                    write_copy_out_response(writer, num_cols as u16).await?;
+                    write_copy_done(writer).await?;
+                    write_command_complete(writer, "COPY 0").await?;
+                }
+                Err(e) => write_error_response(writer, e.sqlstate(), &format!("{e}")).await?,
+            }
+        }
+    }
+    Ok(())
+}
 /// pool (Req 7: no re-parse). The lock is chosen by the template's
 /// read/write classification, matching the simple-query path.
 async fn run_bound_execute(
@@ -766,8 +953,11 @@ async fn run_bound_execute(
             let guard = db_clone.blocking_read();
             guard.execute_bound_readonly_with_session(&template, &values, Some(session_clone))
         } else {
-            let mut guard = db_clone.blocking_write();
-            guard.execute_bound_with_session(&template, &values, Some(session_clone))
+            // Use the shared read lock for DML prepared statements so
+            // concurrent clients can batch their WAL fsyncs (same as
+            // run_engine's DML path).
+            let guard = db_clone.blocking_read();
+            guard.execute_bound_dml_concurrent(&template, &values, Some(session_clone))
         }
     })
     .await
@@ -776,6 +966,10 @@ async fn run_bound_execute(
 
 /// Execute one statement against the engine on the blocking pool, choosing
 /// a read or write lock by statement kind (same rule as the v1 loop).
+/// DML (INSERT/UPDATE/DELETE) uses the concurrent path with `blocking_read()`
+/// so multiple clients can issue writes simultaneously and share WAL fsyncs
+/// through group commit — the same pattern that gives PostgreSQL its
+/// multi-client throughput.
 async fn run_engine(
     db: &Arc<RwLock<Database>>,
     session: &SessionContext,
@@ -783,6 +977,15 @@ async fn run_engine(
 ) -> Result<galaxdb_common::GalaxResult<galaxdb_embedded::QueryResult>, std::io::Error> {
     let upper = sql.trim().to_uppercase();
     let is_read = upper.starts_with("SELECT") || upper.starts_with("SHOW");
+    // DML (INSERT/UPDATE/DELETE) is safe on the shared read lock because:
+    //   - The storage engine (Arc<Engine>) is internally thread-safe.
+    //   - DML never mutates the schema catalog.
+    //   - Concurrent reads allow WAL group-commit to batch multiple clients'
+    //     fsyncs into a single durable write (matching PostgreSQL's model).
+    let is_dml = upper.starts_with("INSERT")
+        || upper.starts_with("UPDATE")
+        || upper.starts_with("DELETE")
+        || upper.starts_with("COPY");
     let sql_owned = sql.to_string();
     let db_clone = db.clone();
     let session_clone = session.clone();
@@ -790,7 +993,13 @@ async fn run_engine(
         if is_read {
             let guard = db_clone.blocking_read();
             guard.execute_readonly_with_session(&sql_owned, Some(session_clone))
+        } else if is_dml {
+            // Shared read lock — concurrent writers allowed.
+            let guard = db_clone.blocking_read();
+            guard.execute_dml_concurrent(&sql_owned, Some(session_clone))
         } else {
+            // DDL (CREATE/DROP TABLE, CREATE INDEX, GRANT, etc.) needs
+            // the exclusive write lock so catalog mutations are visible.
             let mut guard = db_clone.blocking_write();
             guard.execute_with_session(&sql_owned, Some(session_clone))
         }

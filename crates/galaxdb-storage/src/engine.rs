@@ -836,12 +836,15 @@ impl Engine {
         }
 
         let active = self.memtable_mgr.active();
-        for (key, versioned) in active.iter_all() {
-            if let Some(prefix) = key_prefix {
-                if !key.starts_with(prefix) {
-                    continue;
-                }
-            }
+        let mem_entries = match key_prefix {
+            // Bounded prefix range scan — O(log n + matches) per shard,
+            // not a full O(table-size) iteration. This is what keeps
+            // per-row secondary-index/grant prefix lookups off the
+            // O(n)-per-call path (otherwise ingest is O(n^2)).
+            Some(prefix) => active.iter_prefix(prefix),
+            None => active.iter_all(),
+        };
+        for (key, versioned) in mem_entries {
             match versioned.value {
                 Some(v) => {
                     out.insert(key, v);

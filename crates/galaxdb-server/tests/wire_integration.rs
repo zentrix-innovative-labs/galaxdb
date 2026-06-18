@@ -314,6 +314,89 @@ async fn extended_protocol_prepared_statements() {
     assert_eq!(count, 4, "expected 4 rows after prepared inserts, got {count}");
 }
 
+/// Task 11 (Req 8): the COPY sub-protocol. `COPY FROM STDIN` bulk-loads
+/// text rows through the bulk-insert path; `COPY TO STDOUT` streams them
+/// back; a malformed row aborts cleanly without a partial commit.
+#[tokio::test]
+async fn copy_protocol_round_trip_and_malformed_abort() {
+    use bytes::Bytes;
+    use futures_util::SinkExt;
+    use futures_util::TryStreamExt;
+
+    let (conn_str, _td) = start_server().await;
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls)
+        .await
+        .expect("connect failed");
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .simple_query("CREATE TABLE c (id INTEGER PRIMARY KEY, name TEXT)")
+        .await
+        .expect("create table failed");
+
+    // 1. COPY FROM STDIN — bulk load three rows across two CopyData frames.
+    let sink = client
+        .copy_in("COPY c (id, name) FROM STDIN")
+        .await
+        .expect("copy_in failed");
+    futures_util::pin_mut!(sink);
+    sink.send(Bytes::from_static(b"1\tespresso\n2\tlatte\n"))
+        .await
+        .expect("send frame 1");
+    sink.send(Bytes::from_static(b"3\tmocha\n"))
+        .await
+        .expect("send frame 2");
+    let copied = sink.finish().await.expect("copy_in finish failed");
+    assert_eq!(copied, 3, "COPY FROM STDIN must report 3 rows");
+
+    // Verify the rows landed.
+    let rows = client
+        .simple_query("SELECT id, name FROM c")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(rows, 3, "table must hold the 3 copied rows");
+
+    // 2. COPY TO STDOUT — stream the rows back in text format.
+    let stream = client
+        .copy_out("COPY c (id, name) TO STDOUT")
+        .await
+        .expect("copy_out failed");
+    let chunks: Vec<Bytes> = stream.try_collect().await.expect("copy_out collect failed");
+    let dumped: Vec<u8> = chunks.concat();
+    let text = String::from_utf8(dumped).expect("copy out text utf8");
+    let lines: Vec<&str> = text.lines().filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines.len(), 3, "COPY TO STDOUT must stream 3 rows, got: {text:?}");
+    assert!(text.contains("1\tespresso"), "missing row 1 in: {text:?}");
+    assert!(text.contains("3\tmocha"), "missing row 3 in: {text:?}");
+
+    // 3. Malformed row (wrong column count) aborts the COPY with an error
+    //    and leaves the table unchanged (no partial commit, Req 8 AC5).
+    let sink = client
+        .copy_in("COPY c (id, name) FROM STDIN")
+        .await
+        .expect("copy_in (bad) failed");
+    futures_util::pin_mut!(sink);
+    // Three tab-separated cells for a two-column target.
+    let _ = sink.send(Bytes::from_static(b"99\tbad\textra\n")).await;
+    let result = sink.finish().await;
+    assert!(result.is_err(), "malformed COPY row must abort with an error");
+
+    // The table still has exactly the original 3 rows.
+    let rows_after = client
+        .simple_query("SELECT id FROM c")
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|m| matches!(m, tokio_postgres::SimpleQueryMessage::Row(_)))
+        .count();
+    assert_eq!(rows_after, 3, "malformed COPY must not partially commit");
+}
+
 #[tokio::test]
 async fn many_concurrent_inserts_do_not_panic() {
     // Phase I Bug 2 hardening: drive inserts concurrently from several

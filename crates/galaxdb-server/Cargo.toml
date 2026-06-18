@@ -33,3 +33,5 @@ rustls.workspace = true
 rcgen = "0.13"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 serde_json.workspace = true
+futures-util = "0.3"
+bytes = "1"

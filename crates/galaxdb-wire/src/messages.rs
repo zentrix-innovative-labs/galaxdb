@@ -833,3 +833,120 @@ mod extended_tests {
         assert!(decode_frontend(b'Z', &[]).is_err());
     }
 }
+
+// ── COPY sub-protocol (Req 8) ───────────────────────────────────────
+//
+// `COPY t FROM STDIN` / `COPY t TO STDOUT`. The server sends a
+// CopyInResponse (`G`) or CopyOutResponse (`H`) advertising the column
+// count and the overall format (0 = text), then the bulk data flows as
+// CopyData (`d`) frames terminated by CopyDone (`c`); the client may abort
+// an in-copy with CopyFail (`f`).
+
+/// Write a CopyInResponse (`G`): overall format byte (0 = text), the
+/// column count, and a per-column format code (0) for each. The server
+/// sends this to tell the client to start streaming `CopyData`.
+pub async fn write_copy_in_response<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    num_columns: u16,
+) -> io::Result<()> {
+    let body_len = 1 + 2 + (num_columns as usize) * 2;
+    writer.write_u8(b'G').await?;
+    writer.write_i32((body_len + 4) as i32).await?;
+    writer.write_u8(0).await?; // overall format: text
+    writer.write_i16(num_columns as i16).await?;
+    for _ in 0..num_columns {
+        writer.write_i16(0).await?; // per-column format: text
+    }
+    Ok(())
+}
+
+/// Write a CopyOutResponse (`H`): same layout as CopyInResponse. The
+/// server sends this before streaming result rows as `CopyData`.
+pub async fn write_copy_out_response<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    num_columns: u16,
+) -> io::Result<()> {
+    let body_len = 1 + 2 + (num_columns as usize) * 2;
+    writer.write_u8(b'H').await?;
+    writer.write_i32((body_len + 4) as i32).await?;
+    writer.write_u8(0).await?; // overall format: text
+    writer.write_i16(num_columns as i16).await?;
+    for _ in 0..num_columns {
+        writer.write_i16(0).await?;
+    }
+    Ok(())
+}
+
+/// Write a CopyData (`d`) frame carrying raw payload bytes (one or more
+/// text rows during `COPY TO STDOUT`).
+pub async fn write_copy_data<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    payload: &[u8],
+) -> io::Result<()> {
+    writer.write_u8(b'd').await?;
+    writer.write_i32((payload.len() + 4) as i32).await?;
+    writer.write_all(payload).await?;
+    Ok(())
+}
+
+/// Write a CopyDone (`c`) frame ending a `COPY TO STDOUT` stream.
+pub async fn write_copy_done<W: AsyncWriteExt + Unpin>(writer: &mut W) -> io::Result<()> {
+    writer.write_u8(b'c').await?;
+    writer.write_i32(4).await?;
+    Ok(())
+}
+
+/// A frontend message received while the server is in copy-in mode.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CopyInMessage {
+    /// A `CopyData` (`d`) frame with raw row bytes (text format).
+    Data(Vec<u8>),
+    /// `CopyDone` (`c`) — the client finished sending rows.
+    Done,
+    /// `CopyFail` (`f`) — the client aborted the copy with a message.
+    Fail(String),
+}
+
+/// Read one frontend message during `COPY FROM STDIN`. Only `CopyData`,
+/// `CopyDone`, and `CopyFail` are valid here; anything else is a protocol
+/// error.
+pub async fn read_copy_in_message<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> io::Result<CopyInMessage> {
+    loop {
+        let tag = reader.read_u8().await?;
+        let len = reader.read_i32().await?;
+        if !(4..=1_073_741_824).contains(&len) {
+            return Err(invalid("invalid copy-in message length"));
+        }
+        let body_len = (len - 4) as usize;
+        let mut buf = vec![0u8; body_len];
+        reader.read_exact(&mut buf).await?;
+        match tag {
+            b'd' => return Ok(CopyInMessage::Data(buf)),
+            b'c' => return Ok(CopyInMessage::Done),
+            b'f' => {
+                // CopyFail body is a null-terminated error string.
+                let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+                return Ok(CopyInMessage::Fail(
+                    String::from_utf8_lossy(&buf[..end]).to_string(),
+                ));
+            }
+            // PostgreSQL's `CopyGetData` ignores Flush (`H`) and Sync (`S`)
+            // during COPY-in "for the convenience of client libraries (such
+            // as libpq) that may send those without noticing the command
+            // was COPY." tokio-postgres in particular pipelines a Sync right
+            // after Execute (its `query::encode` emits Bind+Execute+Sync).
+            // The real end marker is CopyDone; the trailing Sync that the
+            // client sends after CopyDone yields the single ReadyForQuery,
+            // handled by the connection's main message loop.
+            b'H' | b'S' => continue,
+            other => {
+                return Err(invalid(&format!(
+                    "unexpected message '{}' during COPY FROM STDIN",
+                    other as char
+                )))
+            }
+        }
+    }
+}

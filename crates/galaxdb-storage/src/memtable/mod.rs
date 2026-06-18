@@ -247,6 +247,36 @@ impl Memtable {
         entries.sort_by(|a, b| a.0.cmp(&b.0));
         entries
     }
+
+    /// Collect only the entries whose key starts with `prefix`, using a
+    /// bounded range scan per shard instead of iterating the whole table.
+    ///
+    /// The memtable is sharded by key hash, so a prefix's keys are
+    /// scattered across all shards — but each shard's `SkipMap` is
+    /// key-ordered, so `range(prefix..)` on each shard yields the prefix's
+    /// keys in `O(log n + matches)` and stops at the first key that no
+    /// longer matches. This keeps prefix lookups (secondary-index
+    /// definitions, role grants, index entry rows) off the O(table-size)
+    /// path that otherwise turns every INSERT into an O(table-size)
+    /// operation and ingest into O(n^2).
+    pub fn iter_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, VersionedValue)> {
+        let mut entries = Vec::new();
+        let start = prefix.to_vec();
+        for shard in &self.shards {
+            for entry in shard.map.range(start.clone()..) {
+                if !entry.key().starts_with(prefix) {
+                    // Keys are ordered; the first non-matching key ends the run.
+                    break;
+                }
+                let key = entry.key().clone();
+                let value = entry.value().clone();
+                drop(entry);
+                entries.push((key, value));
+            }
+        }
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        entries
+    }
 }
 
 /// Manages the active memtable and a queue of sealed memtables awaiting flush.

@@ -1870,7 +1870,7 @@ fn exec_bulk_insert(
         return Ok(ExecuteResult::RowCount(0));
     }
 
-    // Validate column-count up front so we don't half-commit.
+    // Validate column-count up front so we never half-commit.
     let expected = if columns.is_empty() {
         table_entry.columns.len()
     } else {
@@ -1887,40 +1887,96 @@ fn exec_bulk_insert(
         }
     }
 
-    // Resolve each raw token to a typed `Value`. `value_from_str`
-    // auto-detects quoted strings, numerics, NULL, and bools; the
-    // catalog metadata is not strictly required for v1 because the
-    // BULK INSERT parser already strips surrounding quotes. A
-    // data-type-checked path can replace this once the planner
-    // carries typed per-column tokens.
-    let mut inserted = 0u64;
+    // Validate that every referenced column exists — once, not per row.
+    // Unknown columns must error, not silently drop the value.
+    if !columns.is_empty() {
+        for name in columns {
+            if !table_entry.columns.iter().any(|c| &c.name == name) {
+                return Err(GalaxError::Internal(format!(
+                    "BULK INSERT references unknown column '{}'",
+                    name
+                )));
+            }
+        }
+    }
+
+    // Resolve + encode every row BEFORE any storage write, so a malformed
+    // row aborts the whole batch with no partial commit (Req 8 AC5).
+    // `value_from_str` auto-detects quoted strings, numerics, NULL, bools —
+    // exactly the tokens `COPY ... FROM STDIN` produces.
+    let mut ordered_rows: Vec<Vec<(String, Value)>> = Vec::with_capacity(rows.len());
+    let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(rows.len());
     for row_tokens in rows {
         let row_values: Vec<Value> = row_tokens
             .iter()
             .map(|tok| row_codec::value_from_str(tok))
             .collect();
 
-        // Validate that every referenced column exists when an
-        // explicit column list was supplied. Unknown columns must
-        // error, not silently drop the value.
-        if !columns.is_empty() {
-            for name in columns {
-                if !table_entry.columns.iter().any(|c| &c.name == name) {
-                    return Err(GalaxError::Internal(format!(
-                        "BULK INSERT references unknown column '{}'",
-                        name
-                    )));
+        // MinHash policy runs before the storage write so signatures and
+        // row bytes commit together (parity with exec_insert / task 35.2).
+        if let Some(policy) = ctx.minhash_policy.as_ref() {
+            policy.compute_and_sink(table, &table_entry, columns, &row_values);
+        }
+
+        let ordered = row_codec::align_values(&table_entry, columns, &row_values)?;
+        let key = row_codec::build_primary_key(table, &table_entry, &ordered)?;
+        let value_bytes = row_codec::encode_row(&ordered);
+        pairs.push((key, value_bytes));
+        ordered_rows.push(ordered);
+    }
+
+    // The whole point of BULK INSERT / COPY (Req 8 AC3): batch the WAL
+    // fsync instead of one fsync per row. We commit in bounded chunks
+    // (`BULK_COMMIT_CHUNK` rows → one `put_batch_sync` → one fsync per
+    // chunk) rather than one unbounded `put_batch_sync` of the whole
+    // input. Chunking keeps the per-call cost flat so total ingest stays
+    // linear in row count (a single giant batch degrades super-linearly),
+    // and bounds peak memory for very large COPY streams. Looping
+    // `exec_insert` here would defeat the feature (one fsync per row).
+    const BULK_COMMIT_CHUNK: usize = 1024;
+    for chunk in pairs.chunks(BULK_COMMIT_CHUNK) {
+        ctx.engine
+            .put_batch_sync(chunk)
+            .map_err(|e| GalaxError::Internal(format!("engine batch put failed: {}", e)))?;
+    }
+
+    // Secondary-index + embedding maintenance, per row, only when the table
+    // actually has indexes / an embedding column. Plain tables skip this
+    // loop entirely, preserving the single-fsync fast path above.
+    let has_index = ctx.secondary_index.is_some();
+    let has_embedding = table_entry.has_embedding && ctx.sidecar.is_some();
+    if has_index || has_embedding {
+        for (ordered, (key, _)) in ordered_rows.iter().zip(pairs.iter()) {
+            if let Some(idx) = ctx.secondary_index.as_ref() {
+                idx.on_row_inserted(table, ordered, key)?;
+            }
+            if has_embedding {
+                if let Some(sidecar) = ctx.sidecar.as_ref() {
+                    for col in &table_entry.columns {
+                        if !col.is_embedding_source {
+                            continue;
+                        }
+                        let text = ordered
+                            .iter()
+                            .find(|(name, _)| name == &col.name)
+                            .and_then(|(_, v)| match v {
+                                Value::Text(s) => Some(s.clone()),
+                                _ => None,
+                            });
+                        let Some(text) = text else { continue };
+                        let row_id = xxhash_rust::xxh3::xxh3_64(key);
+                        let _ = sidecar.embed(EmbedRequest {
+                            row_id,
+                            text,
+                            column: col.name.clone(),
+                        });
+                    }
                 }
             }
         }
-
-        let res = exec_insert(table, columns, &row_values, ctx)?;
-        if let ExecuteResult::RowCount(n) = res {
-            inserted += n;
-        }
     }
 
-    Ok(ExecuteResult::RowCount(inserted))
+    Ok(ExecuteResult::RowCount(pairs.len() as u64))
 }
 
 // ---------------------------------------------------------------------------

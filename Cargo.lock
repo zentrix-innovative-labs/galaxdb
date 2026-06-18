@@ -2561,7 +2561,9 @@ dependencies = [
 name = "galaxdb-benchmarks"
 version = "0.2.0"
 dependencies = [
+ "bytes",
  "clap",
+ "futures-util",
  "galaxdb-common",
  "galaxdb-io",
  "galaxdb-observe",
@@ -2686,6 +2688,8 @@ dependencies = [
 name = "galaxdb-server"
 version = "0.2.0"
 dependencies = [
+ "bytes",
+ "futures-util",
  "galaxdb-auth",
  "galaxdb-common",
  "galaxdb-embedded",
