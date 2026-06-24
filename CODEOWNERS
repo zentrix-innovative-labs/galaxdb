@@ -1,0 +1,41 @@
+# GalaxDB code owners.
+#
+# Lines are matched last-wins, GitHub-style. Listed owners are requested for
+# review automatically on PRs touching the matching paths. Update this file
+# when crate ownership changes.
+
+# Default owner for everything not matched below.
+*                               @zentrix-innovative-labs/maintainers
+
+# Storage engine (LSM, PAX, WAL, ART, compaction, buffer pool, blob log).
+/crates/galaxdb-storage/        @zentrix-innovative-labs/storage
+
+# SQL parser, planner, executor, statement cache.
+/crates/galaxdb-sql/            @zentrix-innovative-labs/sql
+
+# PostgreSQL wire protocol (auth handshake, TLS prologue, extended protocol, COPY).
+/crates/galaxdb-wire/           @zentrix-innovative-labs/wire
+
+# Security extension seams: authn/authz/audit, SCRAM, role/grant model.
+/crates/galaxdb-auth/           @zentrix-innovative-labs/security
+/crates/galaxdb-crypto/         @zentrix-innovative-labs/security
+
+# Vector index (HNSW, delta buffer, quantization).
+/crates/galaxdb-vector/         @zentrix-innovative-labs/vector
+
+# Versioning, Lance training export, MinHash dedup.
+/crates/galaxdb-versioning/     @zentrix-innovative-labs/versioning
+
+# Embedded API, server binary, embedding sidecar, cluster seam.
+/crates/galaxdb-embedded/       @zentrix-innovative-labs/core
+/crates/galaxdb-server/         @zentrix-innovative-labs/core
+/crates/galaxdb-sidecar/        @zentrix-innovative-labs/core
+/crates/galaxdb-cluster/        @zentrix-innovative-labs/core
+
+# Python client.
+/galaxdb-python/                @zentrix-innovative-labs/clients
+
+# Security policy, CI, and dependency-ban configuration require security review.
+/SECURITY.md                    @zentrix-innovative-labs/security
+/deny.toml                      @zentrix-innovative-labs/security
+/.github/                       @zentrix-innovative-labs/maintainers

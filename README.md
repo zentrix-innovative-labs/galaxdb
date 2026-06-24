@@ -309,19 +309,24 @@ GALAXDB_KEY_PROVIDER=vault:transit/galaxdb-prod galaxdb-server ...
 
 ## Security status
 
-GalaxDB encrypts data at rest today (AES-256-GCM on every PAX block and WAL record, pluggable key
-management above). Network security is in active development:
+GalaxDB encrypts data at rest (AES-256-GCM on every PAX block and WAL record, pluggable key
+management above) and secures client connections with SCRAM-SHA-256 authentication, TLS 1.2/1.3
+transport encryption (rustls, no OpenSSL), and role-based access control.
 
 | Capability | Status |
 |------------|--------|
 | Encryption at rest (AES-256-GCM, pluggable KMS) | ✅ Available now |
-| Wire authentication (SCRAM-SHA-256) | 🚧 In progress |
-| TLS transport encryption | 🚧 In progress |
-| Roles, privileges, GRANT/REVOKE | 🚧 In progress |
-| SSO / fine-grained RBAC / audit logging | Enterprise edition |
+| Wire authentication (SCRAM-SHA-256) | ✅ Available now |
+| TLS transport encryption (TLS 1.2/1.3, rustls) | ✅ Available now |
+| Roles, privileges, GRANT/REVOKE (SQLSTATE 42501) | ✅ Available now |
+| JSONL security audit log (authN/authZ/DDL/admin) | ✅ Available now |
+| Native cloud KMS (AWS/GCP/Azure over REST) | 🚧 In progress |
+| SSO / fine-grained RBAC | Enterprise edition |
 
-Until wire authentication and TLS land, run `galaxdb-server` only on a trusted network or loopback
-interface (the connection examples above use `sslmode=disable` accordingly). See
+Authentication is enabled with `--auth` (or `GALAXDB_AUTH=1`); the initial superuser is provisioned
+from `GALAXDB_INITIAL_SUPERUSER[_PASSWORD]` on first start — no default password ships. With
+`tls_mode=require`, plaintext connections are rejected and SCRAM runs inside the TLS channel. When
+auth is disabled the server runs in trusted-local mode and logs a loud startup warning. See
 [ROADMAP.md](ROADMAP.md) for what is shipping next.
 
 ---

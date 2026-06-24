@@ -29,6 +29,28 @@ pip install pytest pylance pyarrow psycopg2-binary sqlalchemy
 pytest galaxdb-python/tests/python/ -v
 ```
 
+## Two-repository model (OSS core + Enterprise edition)
+
+GalaxDB ships as two repositories:
+
+- **`galaxdb`** (this repo) — the Apache-2.0 open-source core: the entire single-node engine,
+  including security, encryption, and the stable extension interfaces (`galaxdb-auth`,
+  `galaxdb-cluster`, key-provider and object-store traits) the enterprise edition plugs into.
+- **`galaxdb-enterprise`** (private) — distributed clustering, distributed ANN, SSO/fine-grained
+  RBAC, and storage tiering, built **on top of** the OSS extension seams. The OSS core never
+  depends on enterprise code (enforced by `deny.toml`, which bans any `galaxdb-enterprise*`
+  dependency in the OSS graph).
+
+### Bug-fix routing rule
+
+- A bug in OSS behavior (anything under `crates/` in this repo) is fixed **here**, in the OSS repo.
+  The enterprise edition then bumps its pinned OSS version tag to pick up the fix.
+- A bug that exists only in enterprise code is fixed in the enterprise repo **only** — never work
+  around an OSS-seam shortcoming by patching enterprise; if the seam is wrong, fix the seam here.
+- Changing an extension seam (a public trait the enterprise edition implements) is a semver-relevant
+  change: bump the crate version and call it out in the PR so the enterprise pin can be updated
+  deliberately.
+
 ## Engineering rules (non-negotiable)
 
 These rules are enforced by CI and will cause your PR to fail if violated:
