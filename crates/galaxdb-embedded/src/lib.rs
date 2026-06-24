@@ -1643,9 +1643,11 @@ impl Database {
     /// 4. Build an Arrow schema from that table's `CatalogColumn`s,
     ///    mapping SQL types to Arrow types (`INT` / `BIGINT` → `Int64`,
     ///    `FLOAT` / `REAL` / `DOUBLE` → `Float32`, everything else →
-    ///    `Utf8`). Embedding columns are not projected yet — the v1
-    ///    export surface is the scalar/text row; vector export lands
-    ///    once the delta buffer can be versioned.
+    ///    `Utf8`). A table with an embedding column gets one extra Arrow
+    ///    column (`{column}_embedding`): `FixedSizeList<Float32, dim>` for
+    ///    Float32 precision, or `Binary` for Sq8/Rabitq. Each row's vector is
+    ///    resolved by primary key from the in-memory vector index; a row with
+    ///    no embedding at the tag version exports a NULL (never fabricated).
     /// 5. Instantiate an [`EmbeddedLanceExportSource`] that reads rows
     ///    at the tag's `version_timestamp` via
     ///    [`Engine::scan_all_at`], filters them to the chosen table's
@@ -1714,16 +1716,57 @@ impl Database {
         // correctness bug the user has no way to see.
         let (table_name, table_entry) = self.pick_training_table()?;
 
-        // 4. Build the Arrow schema from the catalog.
-        let schema = Arc::new(arrow_schema_from_catalog(&table_entry));
+        // 4. Resolve the training precision up front — the Arrow schema for an
+        // embedding column depends on it (FixedSizeList<Float32> for Float32,
+        // Binary for Sq8/Rabitq, which the exporter quantises into).
+        let precision = version_tag
+            .training_opts
+            .as_ref()
+            .and_then(|o| TrainingPrecision::from_str_opt(&o.precision))
+            .unwrap_or(TrainingPrecision::Float32);
+        let seed = version_tag.training_opts.as_ref().and_then(|o| o.seed);
 
-        // 5. Build the export source over the real engine.
+        // 4b. Snapshot the table's embedding vectors (if any) keyed by primary
+        // key, so the export source can attach each row's vector. Vectors live
+        // in the in-memory vector index, not in the row codec; we resolve
+        // key→row_id→vector here. A row whose embedding never landed (no
+        // sidecar, or not yet computed) simply won't appear in the map and is
+        // exported as a NULL vector (Req 20 AC4 — never fabricate).
+        let embedding_info: Option<EmbeddingExportInfo> = {
+            let indexes = self
+                .vector_indexes
+                .read()
+                .map_err(|_| GalaxError::Internal("vector index lock poisoned".into()))?;
+            indexes.get(&table_name).map(|idx| {
+                let mut key_to_vec = HashMap::new();
+                for (key, row_id) in &idx.key_to_row_id {
+                    if let Some(v) = idx.vectors.get(row_id) {
+                        key_to_vec.insert(key.clone(), v.clone());
+                    }
+                }
+                EmbeddingExportInfo {
+                    column: format!("{}_embedding", idx.embedding_column),
+                    dim: idx.dim,
+                    key_to_vec,
+                }
+            })
+        };
+
+        // 5. Build the Arrow schema from the catalog (+ the embedding column).
+        let schema = Arc::new(arrow_schema_from_catalog(
+            &table_entry,
+            embedding_info.as_ref(),
+            precision,
+        ));
+
+        // 5b. Build the export source over the real engine.
         let source: Arc<dyn galaxdb_versioning::LanceExportSource> =
             Arc::new(EmbeddedLanceExportSource {
                 engine: self.engine.clone(),
                 table_name: table_name.clone(),
                 table_entry: table_entry.clone(),
                 version_timestamp: version_tag.version_timestamp,
+                embedding: embedding_info,
             });
 
         // 6. Resolve the output path. Use the tag name plus the tag's
@@ -1747,16 +1790,8 @@ impl Database {
             std::fs::create_dir_all(parent)?;
         }
 
-        // 7. Precision comes from the tag's training metadata, falling
-        // back to Float32 if the tag didn't specify one (shouldn't
-        // happen with the SQL path today, which always sets it — but
-        // guard against programmatic tag creation).
-        let precision = version_tag
-            .training_opts
-            .as_ref()
-            .and_then(|o| TrainingPrecision::from_str_opt(&o.precision))
-            .unwrap_or(TrainingPrecision::Float32);
-        let seed = version_tag.training_opts.as_ref().and_then(|o| o.seed);
+        // 7. Precision and seed were resolved up front (step 4) so the schema
+        // could be built for the right embedding-column Arrow type.
 
         // 8. Build the exporter and drive it. Lance writers are async;
         // the embedded database API is sync. Spin a dedicated current-
@@ -2683,6 +2718,27 @@ struct EmbeddedLanceExportSource {
     table_name: String,
     table_entry: galaxdb_sql::executor::TableEntry,
     version_timestamp: u64,
+    /// Embedding-column projection (Req 20). When `Some`, each exported row
+    /// gets one extra `FieldValue` appended after its scalar fields: the
+    /// row's vector resolved by primary key, or `FieldValue::Null` when the
+    /// row has no embedding at this version (AC4 — never fabricate).
+    embedding: Option<EmbeddingExportInfo>,
+}
+
+/// Snapshot of a table's embedding vectors for a training export.
+///
+/// `key_to_vec` maps storage primary-key bytes (the `{table}:…` key that
+/// `Engine::scan_all_at` returns) to the row's embedding vector, resolved
+/// from the in-memory vector index at export time. A row absent from this
+/// map is exported as a NULL vector.
+#[derive(Clone)]
+struct EmbeddingExportInfo {
+    /// Export column name (`{source_column}_embedding`).
+    column: String,
+    /// Embedding dimensionality (Arrow `FixedSizeList` size).
+    dim: usize,
+    /// Primary-key bytes → embedding vector.
+    key_to_vec: HashMap<Vec<u8>, Vec<f32>>,
 }
 
 impl galaxdb_versioning::LanceExportSource for EmbeddedLanceExportSource {
@@ -2708,8 +2764,16 @@ impl galaxdb_versioning::LanceExportSource for EmbeddedLanceExportSource {
             // typed values, then project in catalog order so the row's
             // `fields` align with the Arrow schema.
             let decoded = row_codec::decode_row(&val);
-            let fields =
+            let mut fields =
                 project_row_to_field_values(&self.table_entry, &decoded);
+            // Req 20: append the embedding vector for this row, or NULL if the
+            // row has no embedding at the exported version (never fabricate).
+            if let Some(emb) = &self.embedding {
+                match emb.key_to_vec.get(&key) {
+                    Some(v) => fields.push(galaxdb_versioning::FieldValue::Embedding(v.clone())),
+                    None => fields.push(galaxdb_versioning::FieldValue::Null),
+                }
+            }
             rows.push(ExportedRow {
                 primary_key: key,
                 fields,
@@ -2725,9 +2789,9 @@ impl galaxdb_versioning::LanceExportSource for EmbeddedLanceExportSource {
 /// zero value (0 / empty string / empty vector) so that the Arrow
 /// builder always sees one value per column — the schema is marked
 /// nullable at construction (see [`arrow_schema_from_catalog`]) so
-/// defaulting is safe for v1. Embedding columns are filled with an
-/// empty vector because the scalar row codec doesn't carry them; a
-/// vector-aware source is follow-up work.
+/// defaulting is safe for v1. The embedding column (if any) is NOT
+/// produced here — it is appended separately by the export source from
+/// the vector index, since the scalar row codec does not carry vectors.
 fn project_row_to_field_values(
     entry: &galaxdb_sql::executor::TableEntry,
     decoded: &[(String, galaxdb_sql::planner::Value)],
@@ -2794,15 +2858,22 @@ fn classify_column(data_type: &str) -> ColumnKind {
 }
 
 /// Map a [`TableEntry`] to an Arrow [`arrow::datatypes::Schema`]. Every
-/// column is marked nullable so partial rows (which can happen when a
-/// column was added after some rows were inserted) don't fail the
-/// Arrow builder. Embedding columns are skipped in v1 — the scalar
-/// export carries them as an empty `FieldValue::Utf8` if anyone asks.
+/// scalar column is marked nullable so partial rows (which can happen when a
+/// column was added after some rows were inserted) don't fail the Arrow
+/// builder. When `embedding` is `Some`, one extra nullable column is appended
+/// for the table's embedding vector (Req 20): `FixedSizeList<Float32, dim>`
+/// for `Float32` precision, or `Binary` for `Sq8`/`Rabitq` (which the exporter
+/// quantises the vector into). The column is appended LAST so the export
+/// source can push the vector after the scalar fields in catalog order.
 fn arrow_schema_from_catalog(
     entry: &galaxdb_sql::executor::TableEntry,
+    embedding: Option<&EmbeddingExportInfo>,
+    precision: galaxdb_versioning::TrainingPrecision,
 ) -> arrow::datatypes::Schema {
     use arrow::datatypes::{DataType, Field};
-    let fields: Vec<Field> = entry
+    use galaxdb_versioning::TrainingPrecision;
+
+    let mut fields: Vec<Field> = entry
         .columns
         .iter()
         .map(|c| {
@@ -2815,6 +2886,20 @@ fn arrow_schema_from_catalog(
             Field::new(&c.name, dt, true)
         })
         .collect();
+
+    if let Some(emb) = embedding {
+        let dt = match precision {
+            TrainingPrecision::Float32 => DataType::FixedSizeList(
+                Arc::new(Field::new("item", DataType::Float32, true)),
+                emb.dim as i32,
+            ),
+            // Sq8 / Rabitq: the exporter rewrites Embedding → Binary, so the
+            // schema column must be Binary for those precisions.
+            TrainingPrecision::Sq8 | TrainingPrecision::Rabitq => DataType::Binary,
+        };
+        fields.push(Field::new(&emb.column, dt, true));
+    }
+
     arrow::datatypes::Schema::new(fields)
 }
 
@@ -3528,7 +3613,103 @@ mod tests {
         );
     }
 
-    /// Non-training tags must not pass the `training_dataset` guard.
+    /// Task 23 (Req 20): a table with an embedding column exports the vector
+    /// as an Arrow `FixedSizeList<Float32, dim>` column, with a NULL vector for
+    /// any row whose embedding is absent at the tag version (never fabricated).
+    #[test]
+    fn training_dataset_exports_embedding_column_with_nulls() {
+        use galaxdb_versioning::{MerkleRoot, TrainingTagMetadata};
+
+        let mut db = test_db();
+        db.execute(
+            "CREATE TABLE docs (id INT PRIMARY KEY, \
+             body TEXT EMBEDDING MODEL 'sentence-transformers/all-MiniLM-L6-v2' DIM 4)",
+        )
+        .unwrap();
+        for i in 1..=3 {
+            db.execute(&format!(
+                "INSERT INTO docs (id, body) VALUES ({i}, 'row-{i}')"
+            ))
+            .unwrap();
+        }
+
+        // No sidecar in this test, so no vectors were generated. Inject vectors
+        // for the first two rows by their real storage keys; leave the third
+        // without one so the export must emit a NULL vector (AC4).
+        let keys: Vec<Vec<u8>> = db
+            .engine
+            .scan_all_at(u64::MAX)
+            .into_iter()
+            .map(|(k, _, _)| k)
+            .filter(|k| k.starts_with(b"docs:"))
+            .collect();
+        assert_eq!(keys.len(), 3, "three rows must be present");
+        {
+            let mut idxs = db.vector_indexes.write().unwrap();
+            let idx = idxs.get_mut("docs").expect("vector index for docs");
+            for (i, key) in keys.iter().take(2).enumerate() {
+                let row_id = xxhash_rust::xxh3::xxh3_64(key);
+                idx.vectors.insert(row_id, vec![i as f32 + 0.5; 4]);
+                idx.key_to_row_id.insert(key.clone(), row_id);
+            }
+        }
+
+        let tag_ts = db.engine.next_ts_for_tests();
+        {
+            let mut tc = db.tag_catalog.lock().unwrap();
+            tc.create_tag(
+                "train-emb".to_string(),
+                tag_ts,
+                MerkleRoot { hash: 0xBEEF },
+                tag_ts,
+                vec![],
+                true,
+                Some(TrainingTagMetadata {
+                    precision: "float32".to_string(),
+                    seed: Some(7),
+                    deterministic_order: true,
+                }),
+            )
+            .expect("create training tag");
+        }
+
+        let path = db
+            .training_dataset("train-emb")
+            .expect("training_dataset must produce a Lance dataset");
+
+        let (row_count, embedding_dim) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let ds = lance::Dataset::open(path.to_str().unwrap())
+                    .await
+                    .expect("open Lance dataset");
+                let rows = ds.scan().count_rows().await.expect("count rows");
+                let arrow_schema = arrow::datatypes::Schema::from(ds.schema());
+                let field = arrow_schema
+                    .field_with_name("body_embedding")
+                    .expect("body_embedding column must exist")
+                    .clone();
+                let dim = match field.data_type() {
+                    arrow::datatypes::DataType::FixedSizeList(child, len) => {
+                        assert_eq!(
+                            child.data_type(),
+                            &arrow::datatypes::DataType::Float32,
+                            "embedding child type must be Float32"
+                        );
+                        *len
+                    }
+                    other => panic!("embedding column must be FixedSizeList, got {other:?}"),
+                };
+                (rows, dim)
+            });
+
+        assert_eq!(row_count, 3, "all three rows must be exported");
+        assert_eq!(embedding_dim, 4, "embedding dimensionality must match DIM 4");
+    }
+
+
     /// This keeps the deterministic-order contract on the exporter:
     /// every caller of `training_dataset` is guaranteed the tag was
     /// created with `FOR TRAINING` (and therefore carries a precision

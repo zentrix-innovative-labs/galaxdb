@@ -297,6 +297,10 @@ pub enum FieldValue {
     /// Fixed-size dense embedding (Arrow `FixedSizeList<Float32, dim>`).
     /// The length of the vector must equal the schema's fixed-list size.
     Embedding(Vec<f32>),
+    /// An explicit NULL for this column. Used when a row has no embedding
+    /// at the exported version (Req 20 AC4 — never fabricate a vector).
+    /// Builds to `append_null()` for whatever Arrow type the column declares.
+    Null,
 }
 
 /// A single row surfaced by a [`LanceExportSource`] for the Lance exporter.
@@ -979,6 +983,8 @@ const TAG_UTF8: u8 = 0x02;
 const TAG_FLOAT32: u8 = 0x03;
 const TAG_BINARY: u8 = 0x04;
 const TAG_EMBEDDING: u8 = 0x05;
+/// Tag byte for an explicit NULL field in the canonical encoding (Req 20 AC4).
+const TAG_NULL: u8 = 0x07;
 /// Tag byte that precedes the per-row `near_duplicate_group` encoding
 /// after the primary key and field list. Added in task 34.4 so that
 /// flipping `LanceExporter::dedup` or changing a row's group ID is
@@ -1042,6 +1048,9 @@ fn canonical_content_hash(rows: &[ExportedRow]) -> [u8; 16] {
                     for x in v {
                         buf.extend_from_slice(&x.to_le_bytes());
                     }
+                }
+                FieldValue::Null => {
+                    buf.push(TAG_NULL);
                 }
             }
         }
@@ -1107,6 +1116,7 @@ fn build_column_array(
                 let v = field_at(row, col_idx, row_idx)?;
                 match v {
                     FieldValue::Int64(i) => b.append_value(*i),
+                    FieldValue::Null => b.append_null(),
                     other => return Err(mismatch(col_idx, "Int64", other)),
                 }
             }
@@ -1118,6 +1128,7 @@ fn build_column_array(
                 let v = field_at(row, col_idx, row_idx)?;
                 match v {
                     FieldValue::Utf8(s) => b.append_value(s),
+                    FieldValue::Null => b.append_null(),
                     other => return Err(mismatch(col_idx, "Utf8", other)),
                 }
             }
@@ -1129,6 +1140,7 @@ fn build_column_array(
                 let v = field_at(row, col_idx, row_idx)?;
                 match v {
                     FieldValue::Float32(f) => b.append_value(*f),
+                    FieldValue::Null => b.append_null(),
                     other => return Err(mismatch(col_idx, "Float32", other)),
                 }
             }
@@ -1140,6 +1152,7 @@ fn build_column_array(
                 let v = field_at(row, col_idx, row_idx)?;
                 match v {
                     FieldValue::Binary(bytes) => b.append_value(bytes),
+                    FieldValue::Null => b.append_null(),
                     other => return Err(mismatch(col_idx, "Binary", other)),
                 }
             }
@@ -1175,6 +1188,16 @@ fn build_column_array(
                         }
                         b.append(true);
                     }
+                    FieldValue::Null => {
+                        // Req 20 AC4: a row with no embedding at the export
+                        // version is a null list, not a fabricated vector.
+                        // The child builder must still hold `expected_dim`
+                        // placeholder values for a fixed-size list null.
+                        for _ in 0..expected_dim {
+                            b.values().append_null();
+                        }
+                        b.append(false);
+                    }
                     other => return Err(mismatch(col_idx, "Embedding", other)),
                 }
             }
@@ -1205,6 +1228,7 @@ fn mismatch(col_idx: usize, expected: &str, got: &FieldValue) -> ExportError {
         FieldValue::Float32(_) => "Float32",
         FieldValue::Binary(_) => "Binary",
         FieldValue::Embedding(_) => "Embedding",
+        FieldValue::Null => "Null",
     };
     ExportError::SchemaMismatch(format!(
         "column {}: expected FieldValue::{}, got FieldValue::{}",

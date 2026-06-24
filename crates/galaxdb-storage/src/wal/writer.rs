@@ -167,6 +167,7 @@ impl WalWriter {
             .read(true)
             .write(true)
             .create(true)
+            .truncate(false) // never truncate on open — WAL recovery reads prior records
             .open(&config.wal_path)?;
 
         // Pre-allocate real zero blocks up to at least `preallocate_bytes`.
@@ -311,33 +312,34 @@ impl WalWriter {
             }
         };
 
-        // Hold both locks: no appends or flushes during the rewrite.
-        let mut ws = self.write_state.lock().unwrap();
-        let _sf = self.sync_file.lock().unwrap();
+        // Hold both locks for the rewrite: no appends or flushes during it.
+        // Scoped in an explicit block so both std MutexGuards are released
+        // before the `.await` below (clippy::await_holding_lock).
+        {
+            let mut ws = self.write_state.lock().unwrap();
+            let _sf = self.sync_file.lock().unwrap();
 
-        let logical_end = ws.write_offset;
-        let len = logical_end.saturating_sub(cp_info.offset);
-        let mut remaining = vec![0u8; len as usize];
-        ws.file.seek(SeekFrom::Start(cp_info.offset))?;
-        ws.file.read_exact(&mut remaining)?;
+            let logical_end = ws.write_offset;
+            let len = logical_end.saturating_sub(cp_info.offset);
+            let mut remaining = vec![0u8; len as usize];
+            ws.file.seek(SeekFrom::Start(cp_info.offset))?;
+            ws.file.read_exact(&mut remaining)?;
 
-        ws.file.set_len(0)?;
-        ws.file.seek(SeekFrom::Start(0))?;
-        ws.file.write_all(&remaining)?;
-        let new_end = remaining.len() as u64;
-        let want = new_end.max(self.prealloc_chunk);
-        if want > new_end {
-            zero_fill(&mut ws.file, new_end, want - new_end)?;
+            ws.file.set_len(0)?;
+            ws.file.seek(SeekFrom::Start(0))?;
+            ws.file.write_all(&remaining)?;
+            let new_end = remaining.len() as u64;
+            let want = new_end.max(self.prealloc_chunk);
+            if want > new_end {
+                zero_fill(&mut ws.file, new_end, want - new_end)?;
+            }
+            ws.file.sync_all()?;
+            ws.file.seek(SeekFrom::Start(new_end))?;
+            ws.file_len = want;
+            ws.write_offset = new_end;
+            self.write_offset.store(new_end, Ordering::SeqCst);
+            self.flush_offset.store(new_end, Ordering::SeqCst);
         }
-        ws.file.sync_all()?;
-        ws.file.seek(SeekFrom::Start(new_end))?;
-        ws.file_len = want;
-        ws.write_offset = new_end;
-        self.write_offset.store(new_end, Ordering::SeqCst);
-        self.flush_offset.store(new_end, Ordering::SeqCst);
-
-        drop(_sf);
-        drop(ws);
 
         let mut last_cp = self.last_checkpoint.lock().await;
         if let Some(ref mut info) = *last_cp {
