@@ -77,6 +77,7 @@ fn wal_write_strict(c: &mut Criterion) {
                         group_commit_interval: Duration::from_millis(10),
                         checkpoint_size_bytes: u64::MAX,
                         checkpoint_interval: Duration::from_secs(3600),
+            preallocate_bytes: 1024 * 1024,
                     };
                     let writer = WalWriter::new(config).unwrap();
 
@@ -130,6 +131,7 @@ fn wal_write_relaxed(c: &mut Criterion) {
                         group_commit_interval: Duration::from_millis(2),
                         checkpoint_size_bytes: u64::MAX,
                         checkpoint_interval: Duration::from_secs(3600),
+            preallocate_bytes: 1024 * 1024,
                     };
                     let writer = WalWriter::new(config).unwrap();
 
@@ -176,6 +178,7 @@ fn wal_recovery(c: &mut Criterion) {
             group_commit_interval: Duration::from_millis(5),
             checkpoint_size_bytes: u64::MAX,
             checkpoint_interval: Duration::from_secs(3600),
+            preallocate_bytes: 1024 * 1024,
         };
         let writer = WalWriter::new(config).unwrap();
 

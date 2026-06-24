@@ -18,4 +18,7 @@ mod writer;
 mod tests;
 
 pub use record::{WalRecord, WalRecordType};
-pub use writer::{DurabilityMode, WalWriter, WalWriterConfig, CheckpointInfo, recover_wal};
+pub use writer::{
+    recover_wal, CheckpointInfo, DurabilityMode, WalWriter, WalWriterConfig,
+    DEFAULT_WAL_PREALLOCATE_BYTES,
+};

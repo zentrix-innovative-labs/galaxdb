@@ -140,6 +140,7 @@ async fn wal_write_read_roundtrip_strict() {
         group_commit_interval: Duration::from_millis(10),
         checkpoint_size_bytes: 512 * 1024 * 1024,
         checkpoint_interval: Duration::from_secs(60),
+        preallocate_bytes: 262144,
     };
 
     let writer = WalWriter::new(config).unwrap();
@@ -188,6 +189,7 @@ async fn wal_write_read_roundtrip_relaxed() {
         group_commit_interval: Duration::from_millis(5),
         checkpoint_size_bytes: 512 * 1024 * 1024,
         checkpoint_interval: Duration::from_secs(60),
+        preallocate_bytes: 262144,
     };
 
     let writer = WalWriter::new(config).unwrap();
@@ -231,6 +233,7 @@ async fn group_commit_batches_writes() {
         group_commit_interval: Duration::from_millis(50),
         checkpoint_size_bytes: 512 * 1024 * 1024,
         checkpoint_interval: Duration::from_secs(60),
+        preallocate_bytes: 262144,
     };
 
     let writer = Arc::new(WalWriter::new(config).unwrap());
@@ -279,6 +282,7 @@ async fn checkpoint_trigger_by_size() {
         group_commit_interval: Duration::from_millis(5),
         checkpoint_size_bytes: 100, // Very small — will trigger quickly
         checkpoint_interval: Duration::from_secs(3600), // Don't trigger by time
+        preallocate_bytes: 262144,
     };
 
     let writer = WalWriter::new(config).unwrap();
@@ -319,6 +323,7 @@ async fn checkpoint_trigger_by_time() {
         group_commit_interval: Duration::from_millis(5),
         checkpoint_size_bytes: u64::MAX, // Don't trigger by size
         checkpoint_interval: Duration::from_millis(50), // Very short interval
+        preallocate_bytes: 262144,
     };
 
     let writer = WalWriter::new(config).unwrap();
@@ -357,6 +362,7 @@ async fn truncate_to_checkpoint() {
         group_commit_interval: Duration::from_millis(5),
         checkpoint_size_bytes: 512 * 1024 * 1024,
         checkpoint_interval: Duration::from_secs(60),
+        preallocate_bytes: 262144,
     };
 
     let writer = WalWriter::new(config).unwrap();
@@ -416,6 +422,7 @@ async fn recovery_with_corrupt_records() {
         group_commit_interval: Duration::from_millis(5),
         checkpoint_size_bytes: 512 * 1024 * 1024,
         checkpoint_interval: Duration::from_secs(60),
+        preallocate_bytes: 262144,
     };
 
     let writer = WalWriter::new(config).unwrap();
@@ -493,6 +500,7 @@ async fn recovery_replays_from_last_checkpoint() {
         group_commit_interval: Duration::from_millis(5),
         checkpoint_size_bytes: 512 * 1024 * 1024,
         checkpoint_interval: Duration::from_secs(60),
+        preallocate_bytes: 262144,
     };
 
     let writer = WalWriter::new(config).unwrap();
@@ -552,6 +560,7 @@ async fn mixed_durability_modes() {
         group_commit_interval: Duration::from_millis(5),
         checkpoint_size_bytes: 512 * 1024 * 1024,
         checkpoint_interval: Duration::from_secs(60),
+        preallocate_bytes: 262144,
     };
 
     let writer = WalWriter::new(config).unwrap();
@@ -591,6 +600,7 @@ async fn all_record_types_roundtrip() {
         group_commit_interval: Duration::from_millis(5),
         checkpoint_size_bytes: 512 * 1024 * 1024,
         checkpoint_interval: Duration::from_secs(60),
+        preallocate_bytes: 262144,
     };
 
     let writer = WalWriter::new(config).unwrap();
@@ -633,6 +643,7 @@ async fn recovery_time_under_30_seconds() {
         group_commit_interval: Duration::from_millis(5),
         checkpoint_size_bytes: 512 * 1024 * 1024,
         checkpoint_interval: Duration::from_secs(60),
+        preallocate_bytes: 262144,
     };
 
     let writer = WalWriter::new(config).unwrap();

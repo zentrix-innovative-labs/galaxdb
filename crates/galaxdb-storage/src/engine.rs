@@ -233,6 +233,7 @@ impl Engine {
             group_commit_interval: Duration::from_millis(config.wal_group_commit_ms),
             checkpoint_size_bytes: 512 * 1024 * 1024,
             checkpoint_interval: Duration::from_secs(60),
+            preallocate_bytes: crate::wal::DEFAULT_WAL_PREALLOCATE_BYTES,
         };
         let wal_path_for_replay = config.data_dir.join("wal.log");
 

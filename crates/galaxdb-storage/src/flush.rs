@@ -755,6 +755,7 @@ mod tests {
             group_commit_interval: Duration::from_millis(5),
             checkpoint_size_bytes: 512 * 1024 * 1024,
             checkpoint_interval: Duration::from_secs(60),
+            preallocate_bytes: 262144,
         };
 
         let wal_writer = WalWriter::new(wal_config).unwrap();
@@ -821,6 +822,7 @@ mod tests {
             group_commit_interval: Duration::from_millis(5),
             checkpoint_size_bytes: 512 * 1024 * 1024,
             checkpoint_interval: Duration::from_secs(60),
+            preallocate_bytes: 262144,
         };
 
         let wal_writer = WalWriter::new(wal_config).unwrap();
