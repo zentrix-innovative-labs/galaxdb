@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::collections::{BTreeMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::time::Duration;
 
 use galaxdb_common::{GalaxError, GalaxResult, Timestamp};
@@ -16,6 +16,7 @@ use galaxdb_io::{IoScheduler, IoPriority};
 use crate::art::{ArtIndex, RowLocation};
 use crate::flush::{self, FlushConfig};
 use crate::memtable::MemtableManager;
+use crate::write_controller::{WriteAdmission, WriteController, WriteControllerConfig};
 
 use crate::wal::{DurabilityMode, WalRecordType, WalWriter, WalWriterConfig};
 
@@ -263,6 +264,20 @@ pub struct Engine {
     compaction_lock: Mutex<()>,
     /// Optional source of pinned timestamps for MVCC GC during compaction.
     pin_source: RwLock<Option<Arc<dyn PinSource>>>,
+    /// User-write admission throttle driven by the pending-compaction
+    /// backlog (v1 WriteController design). Writes consult it so that if
+    /// compaction falls behind, ingest is slowed/blocked instead of letting
+    /// the SST backlog grow without bound.
+    write_controller: WriteController,
+    /// Wake signal + shutdown flag for the optional background compaction
+    /// worker. `(wake, shutdown)` guarded by the mutex; the condvar wakes
+    /// the worker when a flush signals new work or on shutdown.
+    compaction_wake: Arc<(Mutex<(bool, bool)>, Condvar)>,
+    /// Whether a background compaction worker is running. When `false`,
+    /// `flush_memtable` compacts inline (used by raw-`Engine` callers and
+    /// tests); when `true`, the flush only signals the worker so it never
+    /// blocks on a merge.
+    bg_worker_active: AtomicBool,
     /// Optional AEGIS-256 TDE module for encrypting/decrypting PAX blocks.
     #[cfg(feature = "aegis-tde")]
     tde: Option<Arc<galaxdb_crypto::AegisTdeModule>>,
@@ -437,6 +452,9 @@ impl Engine {
             io_scheduler,
             compaction_lock: Mutex::new(()),
             pin_source: RwLock::new(None),
+            write_controller: WriteController::new(WriteControllerConfig::default()),
+            compaction_wake: Arc::new((Mutex::new((false, false)), Condvar::new())),
+            bg_worker_active: AtomicBool::new(false),
             #[cfg(feature = "aegis-tde")]
             tde: None,
         })
@@ -503,6 +521,7 @@ impl Engine {
     /// Insert a row synchronously (memtable + ART + WAL sync).
     /// Use this from sync contexts (embedded mode, Python FFI).
     pub fn put_sync(&self, key: Vec<u8>, value: Vec<u8>) -> GalaxResult<Timestamp> {
+        self.admit_write();
         let ts = self.next_ts();
 
         // Write to WAL first (durability — sync fsync)
@@ -535,6 +554,7 @@ impl Engine {
         if rows.is_empty() {
             return Ok(0);
         }
+        self.admit_write();
 
         // Build a single WAL payload containing all rows
         let mut batch_payload = Vec::with_capacity(rows.len() * 128);
@@ -733,11 +753,16 @@ impl Engine {
         // Runtime compaction (Req 12 knob consumer): once the on-disk SST
         // count reaches the configured L0 trigger, merge the SSTs so file
         // count and read amplification stay bounded instead of growing with
-        // every flush. A compaction failure must not fail the flush — the
-        // rows are already durably on disk — so it is logged, not propagated.
-        if let Err(e) = self.maybe_compact() {
+        // every flush. When a background worker is running it does the merge
+        // off the flush path (so flush never blocks); otherwise we compact
+        // inline. A compaction failure must not fail the flush — the rows
+        // are already durably on disk — so it is logged, not propagated.
+        if self.bg_worker_active.load(Ordering::Relaxed) {
+            self.signal_compaction();
+        } else if let Err(e) = self.maybe_compact() {
             tracing::warn!(error = %e, "runtime compaction after flush failed");
         }
+        self.refresh_compaction_backlog();
 
         Ok(result.rows_flushed as u64)
     }
@@ -1546,6 +1571,131 @@ impl Engine {
             .read()
             .map(|r| r.entries.len())
             .unwrap_or(0)
+    }
+
+    /// Wake the background compaction worker (if any) to consider a merge.
+    fn signal_compaction(&self) {
+        let (lock, cvar) = &*self.compaction_wake;
+        if let Ok(mut g) = lock.lock() {
+            g.0 = true; // wake
+            cvar.notify_one();
+        }
+    }
+
+    /// Recompute the pending-compaction backlog and publish it to the
+    /// [`WriteController`]. The estimate is the total on-disk SST bytes once
+    /// the file count is past the L0 trigger (i.e. work the compactor still
+    /// owes); below the trigger there is no backlog. This is what lets write
+    /// admission slow down if compaction falls behind.
+    pub fn refresh_compaction_backlog(&self) {
+        let pending = {
+            match self.sst_registry.read() {
+                Ok(reg) => {
+                    if reg.entries.len() <= self.config.l0_compaction_trigger {
+                        0
+                    } else {
+                        reg.entries
+                            .values()
+                            .filter_map(|e| std::fs::metadata(&e.path).ok())
+                            .map(|m| m.len())
+                            .sum()
+                    }
+                }
+                Err(_) => 0,
+            }
+        };
+        self.write_controller.update_pending_bytes(pending);
+    }
+
+    /// Block the calling (synchronous) writer as the [`WriteController`]
+    /// dictates: proceed immediately below the soft limit, sleep for a
+    /// proportional delay between the soft and hard limits, and spin-wait in
+    /// short sleeps while writes are hard-stopped at/above the hard limit.
+    /// Returns once the write is admitted.
+    fn admit_write(&self) {
+        loop {
+            match self.write_controller.check_write() {
+                WriteAdmission::Proceed => return,
+                WriteAdmission::Delay(d) => {
+                    std::thread::sleep(d);
+                    return;
+                }
+                WriteAdmission::Block => {
+                    std::thread::sleep(Duration::from_millis(1));
+                    // Re-check; a background compaction will reduce the
+                    // backlog and unblock us.
+                }
+            }
+        }
+    }
+
+    /// Borrow the write controller (observability + tests).
+    pub fn write_controller(&self) -> &WriteController {
+        &self.write_controller
+    }
+
+    /// Start a background compaction worker so flushes never block on a
+    /// merge. Idempotent. The worker holds only a [`Weak`] reference to the
+    /// engine, so it imposes no liveness of its own: once the last strong
+    /// `Arc<Engine>` is dropped (or [`shutdown_background_compaction`] is
+    /// called) the worker exits. Call after wrapping the engine in an `Arc`
+    /// (the embedded `Database` does this at open).
+    pub fn start_background_compaction(self: &Arc<Self>) {
+        if self
+            .bg_worker_active
+            .swap(true, Ordering::SeqCst)
+        {
+            return; // already running
+        }
+        let weak: Weak<Engine> = Arc::downgrade(self);
+        let wake = self.compaction_wake.clone();
+        std::thread::Builder::new()
+            .name("galaxdb-compaction".to_string())
+            .spawn(move || {
+                let (lock, cvar) = &*wake;
+                loop {
+                    // Wait for a wake signal or a periodic timeout (so we
+                    // also notice the engine being dropped).
+                    let shutdown = {
+                        let mut g = match lock.lock() {
+                            Ok(g) => g,
+                            Err(_) => break,
+                        };
+                        if !g.0 && !g.1 {
+                            let (ng, _timeout) = cvar
+                                .wait_timeout(g, Duration::from_millis(500))
+                                .expect("compaction condvar");
+                            g = ng;
+                        }
+                        g.0 = false; // consume the wake
+                        g.1 // shutdown?
+                    };
+                    if shutdown {
+                        break;
+                    }
+                    // Upgrade only for the duration of one maybe_compact; if
+                    // the engine is gone, exit.
+                    let Some(engine) = weak.upgrade() else {
+                        break;
+                    };
+                    if let Err(e) = engine.maybe_compact() {
+                        tracing::warn!(error = %e, "background compaction failed");
+                    }
+                    engine.refresh_compaction_backlog();
+                }
+            })
+            .expect("spawn compaction worker");
+    }
+
+    /// Signal the background compaction worker to stop. The worker finishes
+    /// any in-flight merge and exits. Safe to call even if no worker runs.
+    pub fn shutdown_background_compaction(&self) {
+        let (lock, cvar) = &*self.compaction_wake;
+        if let Ok(mut g) = lock.lock() {
+            g.1 = true; // shutdown
+            cvar.notify_all();
+        }
+        self.bg_worker_active.store(false, Ordering::SeqCst);
     }
 
     /// Run compaction iff the on-disk SST count has reached the configured

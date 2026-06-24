@@ -13,6 +13,7 @@
 //!    still resolves across a compaction (MVCC GC honors the pin set).
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use galaxdb_common::Timestamp;
 use galaxdb_storage::engine::{Engine, EngineConfig, PinSource};
@@ -188,4 +189,55 @@ async fn compaction_is_noop_below_two_ssts() {
     assert_eq!(stats.input_ssts, 1);
     assert_eq!(stats.output_ssts, 1);
     assert_eq!(engine.get(b"only"), Some(b"one".to_vec()));
+}
+
+#[tokio::test]
+async fn background_worker_bounds_sst_count_without_blocking_flush() {
+    // With a background compaction worker, flushes only signal the worker
+    // (never block on a merge); the worker converges the SST count to a
+    // bounded steady state and the data stays correct.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::new(small_config(dir.path())).unwrap());
+    engine.start_background_compaction();
+
+    let n_keys = 40usize;
+    let rounds = 20usize;
+    for round in 0..rounds {
+        for k in 0..n_keys {
+            engine
+                .put(format!("k{k:03}").into_bytes(), format!("v{k}-r{round}").into_bytes())
+                .await
+                .unwrap();
+        }
+        engine.flush_memtable().await.unwrap();
+    }
+
+    // Give the background worker time to catch up to a bounded file count.
+    let mut waited = 0;
+    while engine.sst_count() > 6 && waited < 100 {
+        std::thread::sleep(Duration::from_millis(50));
+        waited += 1;
+    }
+    assert!(
+        engine.sst_count() <= 6,
+        "background compaction should bound the SST count, got {}",
+        engine.sst_count()
+    );
+
+    // Every key reads back its latest value.
+    for k in 0..n_keys {
+        let key = format!("k{k:03}").into_bytes();
+        let expected = format!("v{k}-r{}", rounds - 1).into_bytes();
+        assert_eq!(engine.get(&key), Some(expected), "latest value for k{k:03}");
+    }
+
+    // The write controller exposes the (now-drained) compaction backlog.
+    engine.refresh_compaction_backlog();
+    assert_eq!(
+        engine.write_controller().pending_compaction_bytes(),
+        0,
+        "backlog should be drained once the count is at/below the trigger"
+    );
+
+    engine.shutdown_background_compaction();
 }

@@ -252,6 +252,10 @@ impl Database {
         // compaction. Without this, a flush-triggered compaction would GC
         // unpinned historical versions and break time-travel reads.
         engine.set_pin_source(Arc::new(TagCatalogPins(tag_catalog.clone())));
+        // Run compaction on a background worker so flushes never block on a
+        // merge; the worker holds only a Weak<Engine> and exits when this
+        // handle is dropped (see Database::drop).
+        engine.start_background_compaction();
         Self {
             path,
             engine,
@@ -2012,6 +2016,10 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        // Stop the background compaction worker promptly (it holds only a
+        // Weak<Engine>, but this wakes it instead of waiting for its poll
+        // timeout), then run the engine's own shutdown.
+        self.engine.shutdown_background_compaction();
         self.engine.shutdown();
     }
 }
