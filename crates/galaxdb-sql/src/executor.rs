@@ -1864,8 +1864,13 @@ fn exec_create_version_tag(
         // Pick whichever is greater so we never regress behind a DAG
         // update, and never land behind an uncommitted-but-visible row.
         let ts = dag_ts.max(engine_ts);
-        let root = dag.latest_root();
         let blocks = dag.blocks_at_version(ts);
+        // Compute a real content Merkle root over the exact snapshot the tag
+        // pins (xxh3-128 of the per-row checksums of everything visible at
+        // `ts`). This certifies the tagged contents and is reproducible from
+        // the same data, rather than echoing the DAG's empty/seed root in a
+        // memtable-only database.
+        let root = galaxdb_versioning::MerkleRoot::compute(&ctx.engine.snapshot_checksums(ts));
         (root, ts, blocks)
     };
 

@@ -1651,8 +1651,10 @@ impl Database {
             .map_err(|_| GalaxError::Internal("tag catalog mutex poisoned".into()))?;
         tc.create_tag(
             name.to_string(),
-            tag_ts,                      // created_at
-            MerkleRoot { hash: 0xC0DE }, // placeholder — task 36 plumbs the real commit root
+            tag_ts, // created_at
+            // Real content Merkle root over the exact snapshot this tag
+            // pins (xxh3-128 of the per-row checksums) — not a placeholder.
+            MerkleRoot::compute(&self.engine.snapshot_checksums(tag_ts)),
             tag_ts,                      // version_timestamp
             vec![],                      // pinned blocks driven off version_timestamp for now
             true,                        // FOR TRAINING
@@ -3124,6 +3126,52 @@ mod tests {
         assert_eq!(opts.precision, "sq8");
         assert_eq!(opts.seed, Some(42));
         assert!(opts.deterministic_order);
+    }
+
+    #[test]
+    fn training_snapshot_has_real_content_merkle_root() {
+        // The version-tag Merkle root must be a real content digest of the
+        // pinned snapshot — deterministic for the same data, different for
+        // different data, and never the old placeholder constant.
+        let mut db1 = test_db();
+        db1.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db1.execute("INSERT INTO t (id, name) VALUES (1, 'alice')")
+            .unwrap();
+        db1.execute("INSERT INTO t (id, name) VALUES (2, 'bob')")
+            .unwrap();
+        db1.create_training_snapshot("snap", None).unwrap();
+        let root1 = db1.tag_catalog.lock().unwrap().get_tag("snap").unwrap().root;
+
+        // Same data in a second database → identical content root
+        // (reproducible, order-independent).
+        let mut db2 = test_db();
+        db2.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db2.execute("INSERT INTO t (id, name) VALUES (2, 'bob')")
+            .unwrap();
+        db2.execute("INSERT INTO t (id, name) VALUES (1, 'alice')")
+            .unwrap();
+        db2.create_training_snapshot("snap", None).unwrap();
+        let root2 = db2.tag_catalog.lock().unwrap().get_tag("snap").unwrap().root;
+
+        assert_eq!(root1, root2, "same data must yield the same content root");
+        assert_ne!(root1.hash, 0xC0DE, "must not be the old placeholder");
+        assert_ne!(
+            root1,
+            galaxdb_versioning::MerkleRoot::empty(),
+            "a non-empty snapshot must have a non-empty root"
+        );
+
+        // Different data → different root.
+        let mut db3 = test_db();
+        db3.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db3.execute("INSERT INTO t (id, name) VALUES (1, 'CHANGED')")
+            .unwrap();
+        db3.create_training_snapshot("snap", None).unwrap();
+        let root3 = db3.tag_catalog.lock().unwrap().get_tag("snap").unwrap().root;
+        assert_ne!(root1, root3, "different data must yield a different root");
     }
 
     /// End-to-end SEMANTIC_MATCH test using the real model. Gated behind

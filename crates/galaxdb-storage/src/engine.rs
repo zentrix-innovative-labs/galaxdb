@@ -1086,6 +1086,28 @@ impl Engine {
         self.row_count.load(Ordering::Relaxed)
     }
 
+    /// Per-row content checksums for the committed snapshot visible at
+    /// `read_ts`, one `xxh3_64(key ‖ value)` per live row.
+    ///
+    /// This is the raw material for a real version-tag Merkle root: the
+    /// caller folds these with `MerkleRoot::compute`, which sorts and
+    /// hashes them into a 128-bit digest. Because it is derived from the
+    /// exact rows `scan_all_at` (and therefore `AT VERSION`) returns, the
+    /// root is reproducible and actually certifies the tagged snapshot's
+    /// contents — not a placeholder constant.
+    pub fn snapshot_checksums(&self, read_ts: Timestamp) -> Vec<u64> {
+        self.scan_all_at(read_ts)
+            .into_iter()
+            .map(|(k, v, _ts)| {
+                let mut buf = Vec::with_capacity(k.len() + v.len() + 1);
+                buf.extend_from_slice(&k);
+                buf.push(0xff); // separator so (k‖v) is unambiguous
+                buf.extend_from_slice(&v);
+                xxhash_rust::xxh3::xxh3_64(&buf)
+            })
+            .collect()
+    }
+
     /// Get the ART index entry count.
     pub fn index_count(&self) -> usize {
         self.art.len()
