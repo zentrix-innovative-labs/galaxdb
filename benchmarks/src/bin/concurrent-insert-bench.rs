@@ -57,15 +57,19 @@ async fn run_concurrent(conn_str: &str, n_clients: usize, rows_per_client: usize
                 "CREATE TABLE {table} (id INTEGER PRIMARY KEY, val TEXT)"
             )).await.expect("create");
 
+            // Prepared statement (parse once), matching the PostgreSQL path.
+            // GalaxDB advertises TEXT param oids, so bind values as strings.
+            let stmt = client.prepare(&format!(
+                "INSERT INTO {table} (id, val) VALUES ($1, $2)"
+            )).await.expect("prepare");
+
             // All clients start at the same instant
             b.wait().await;
 
             for i in 0..rows_per_client {
-                // GalaxDB reports TEXT oid for all params; use simple_query
-                // to avoid the tokio-postgres typed-parameter mismatch.
-                client.simple_query(&format!(
-                    "INSERT INTO {table} (id, val) VALUES ({i}, 'w{worker}-r{i}')"
-                )).await.expect("insert");
+                let id = i.to_string();
+                let val = format!("w{worker}-r{i}");
+                client.execute(&stmt, &[&id, &val]).await.expect("insert");
             }
         }));
     }

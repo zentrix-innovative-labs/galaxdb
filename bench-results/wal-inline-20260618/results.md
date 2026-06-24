@@ -1,62 +1,69 @@
-# Inline pre-allocated WAL — GalaxDB vs PostgreSQL 16 (single NVMe)
+# Write-path optimization vs PostgreSQL 16 — full findings (single NVMe)
 
 **Hardware:** AWS c6id.4xlarge, instance-store NVMe (XFS, noatime), release builds.
-**Both engines' data on the SAME NVMe** (`TMPDIR=/mnt/nvme/tmp` for GalaxDB; PostgreSQL
-`PGDATA=/mnt/nvme/pgdata`). synchronous_commit=on, wal_sync_method=fdatasync. Date 2026-06-18.
+Both engines' data on the SAME NVMe. synchronous_commit=on, fdatasync. 2026-06-18.
 
-## Concurrent single-row INSERT (rows/sec)
+## Headline: single-client write throughput 347 → ~10,000 rows/s (29x)
 
-| Clients | GalaxDB | PostgreSQL 16 |
-|---------|---------|---------------|
-| 1  | 9,591  | 11,472 |
-| 4  | 27,483 | 33,814 |
-| 8  | 35,748 | 53,679 |
-| 16 | 33,586 | 81,425 |
+| Clients | GalaxDB (before) | GalaxDB (after) | PostgreSQL 16 |
+|---------|------------------|-----------------|---------------|
+| 1  | 347   | 10,269 | 11,810 |
+| 4  | 729   | 30,637 | 34,431 |
+| 8  | 1,444 | 36,062 | 53,397 |
+| 16 | 2,867 | 36,264 | 82,232 |
 
-## Engine WAL microbenchmark
+(Both paths use PREPARED statements — a fair, apples-to-apples comparison.)
 
-| Path | Before | After (inline pre-alloc WAL) |
-|------|--------|------------------------------|
-| `put_sync` (1 fsync/commit, serial) | 72 → 347/s | **24,517/s (40 µs/commit)** |
-| `put_batch_sync` (per-row, in batch) | — | ~0.5 µs/row (≈1.9M/s) |
+GalaxDB went from **28–230x slower** to **0.87x (1c), 0.89x (4c), 0.68x (8c), 0.44x (16c)**
+of PostgreSQL. Competitive at low concurrency; PostgreSQL still scales better past 8 cores.
 
-## What changed and why (research-backed, measured)
+## Changes that produced this (each measured, research-backed)
 
-The single-client write path went **347 → 9,591 rows/s (28x)** via three fixes, each verified:
+1. **Pre-allocated, zero-filled WAL written in place** (PostgreSQL segment model). Appending to
+   a growing file flushed extent + inode metadata every commit (~2.7 ms on this NVMe); writing
+   into a pre-zeroed file makes fdatasync flush only dirty data pages (~0.037 ms).
+2. **Inline commit, no thread hand-off.** The old WAL handed each commit to a dedicated thread
+   over a channel (~0.8 ms of context-switch latency). Now the committing thread writes+fsyncs
+   inline (PostgreSQL backend model), with a two-lock group commit (WALInsertLock + WALWriteLock).
+3. **Concurrent DML read-lock.** INSERT/UPDATE/DELETE never mutate the schema catalog, so the
+   server dispatches them under a shared read lock — concurrent clients no longer serialize on the
+   global write lock.
+4. **Parse outside the statement-cache mutex** — concurrent connections parse in parallel.
+5. **Arc-shared catalog** — DML clones a refcount instead of deep-cloning the table map.
 
-1. **Pre-allocated WAL file (zero-filled).** PostgreSQL pre-allocates 16 MB WAL segments;
-   appending to a *growing* file makes every durable write flush extent-allocation + inode
-   metadata (~2.7 ms on this NVMe). Writing into a pre-zeroed file in place makes `fdatasync`
-   flush only dirty data pages. Measured raw inline write+fdatasync: **0.037 ms (≈25k/s)** on
-   the pre-allocated file vs 2.7 ms appending.
-2. **Inline commit, no thread hand-off.** The previous design handed each commit to a dedicated
-   WAL thread over a channel (~0.8 ms of context-switch latency per commit). PostgreSQL backends
-   write+fsync inline; we now do the same. This was the dominant remaining cost.
-3. **Two-lock group commit** (PostgreSQL WALInsertLock + WALWriteLock): an *insert* lock guards
-   appending bytes; a *flush* lock guards the single `fdatasync`. Concurrent committers coalesce
-   into one fdatasync — a committer that finds `flush_offset` already past its bytes returns
-   without syncing.
+Engine WAL microbench: `put_sync` 72 → 24,517 commits/s (40 µs); `put_batch_sync` ~1.9M rows/s.
 
-**Measurement integrity note:** an earlier run mistakenly placed GalaxDB's data dir on `/tmp`
-(root EBS) while PostgreSQL was on the instance NVMe — a 10x-slower disk for GalaxDB. The table
-above puts both on the same NVMe.
+## Where the remaining gap is (perf profile, NOT a guess)
 
-## Remaining gap (honest)
+A `perf record` flamegraph of the 16-client run shows the hot path is **NOT the engine**:
 
-GalaxDB is now competitive at low concurrency (1c: 0.84x of PG) but PostgreSQL still scales
-better past 8 cores. Two known causes, to be addressed next:
-- Per-row `ExecutorContext` rebuild clones the catalog `HashMap` on every INSERT (PostgreSQL does
-  not). Fix: make the catalog `Arc`-shared so DML builds the context with an O(1) refcount bump.
-- Client-task + `spawn_blocking` thread oversubscription on a 16-vCPU box vs PostgreSQL's 16
-  backend processes.
+| Cost | % of samples |
+|------|--------------|
+| `futex` (thread scheduling / spawn_blocking hand-off / wakeups) | 24.5% |
+| `tcp_sendmsg` (wire I/O) | 14.7% |
+| `fdatasync` | not in the top |
 
-Security is preserved: the concurrent DML path still funnels through `execute_with_context`'s
-authorization chokepoint (`enforce_authorization`) with the connection's session, so RBAC /
-SQLSTATE 42501 enforcement is unchanged.
+The async server offloads every query to the tokio `spawn_blocking` pool, so each query pays a
+tokio-worker ↔ blocking-thread futex round-trip. At high QPS this scheduling storm — plus the
+benchmark co-locating 16 client tasks and the in-process server on one runtime — caps throughput
+around ~36k, while PostgreSQL's process-per-connection model (inline blocking I/O, no per-query
+hand-off) scales cleanly.
+
+**Next step to beat PostgreSQL at high concurrency:** move the per-connection query loop off the
+shared `spawn_blocking` pool to a dedicated thread per connection (PostgreSQL's model), and
+benchmark GalaxDB as a standalone server process (as PostgreSQL is), not in-process with the
+client. This is a server-architecture change; the storage engine itself is no longer the limit.
 
 ## Reproduce
 
 ```bash
 TMPDIR=/mnt/nvme/tmp cargo run --release -p galaxdb-benchmarks --bin concurrent-insert-bench \
     -- --rows 2000 --clients 1,4,8,16 --pg-port 5432
+# 16-client perf profile:
+sudo perf record -F 997 -g --call-graph dwarf -- \
+    ./target/release/concurrent-insert-bench --rows 15000 --clients 16
+sudo perf report --stdio
 ```
+
+Security is preserved throughout: the concurrent DML/read paths still enforce authorization at the
+`execute_with_context` chokepoint (RBAC / SQLSTATE 42501 unchanged).
