@@ -5,8 +5,9 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::collections::{BTreeMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use galaxdb_common::{GalaxError, GalaxResult, Timestamp};
@@ -36,6 +37,15 @@ pub struct EngineConfig {
     /// Controls how much decompressed column data is kept in memory.
     /// Set to a small value (e.g., 10 MB) for cold-cache benchmarks.
     pub sst_cache_bytes: u64,
+    /// Number of worker threads the runtime compaction driver uses to
+    /// build output SSTs in parallel (default: 4). Clamped at run time to
+    /// `1..=number_of_timestamp_buckets`. Fed by auto-tune (Req 12).
+    pub compaction_concurrency: usize,
+    /// Trigger threshold: when the number of on-disk SST files reaches
+    /// this value, a flush schedules a background compaction that merges
+    /// them (default: 4). A larger value trades read amplification for
+    /// fewer compactions.
+    pub l0_compaction_trigger: usize,
 }
 
 impl Default for EngineConfig {
@@ -48,6 +58,8 @@ impl Default for EngineConfig {
             sst_size_bytes: 8 * 1024 * 1024,   // 8 MB — smaller SSTs for fast point reads
             max_rows_per_sst: 100_000,
             sst_cache_bytes: 1024 * 1024 * 1024, // 1 GB
+            compaction_concurrency: 4,
+            l0_compaction_trigger: 4,
         }
     }
 }
@@ -204,6 +216,33 @@ impl SstRegistry {
     }
 }
 
+/// Supplies the set of commit timestamps that runtime compaction must
+/// never garbage-collect, because a version tag (or active snapshot) can
+/// still read the row versions committed at or before them.
+///
+/// The engine does not own the tag catalog (it lives in the embedded
+/// `Database` layer), so the catalog owner installs an implementation via
+/// [`Engine::set_pin_source`]. When no pin source is installed, runtime
+/// compaction keeps only the latest version of each key (plus live
+/// tombstone handling) — correct for a deployment with no version tags.
+pub trait PinSource: Send + Sync {
+    /// Current set of pinned commit timestamps. May be empty.
+    fn pinned_timestamps(&self) -> Vec<Timestamp>;
+}
+
+/// Outcome of a runtime compaction run, returned for observability + tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionStats {
+    /// Number of SST files merged (deleted at the end).
+    pub input_ssts: usize,
+    /// Number of SST files written (registered).
+    pub output_ssts: usize,
+    /// Number of distinct live keys retained.
+    pub keys_retained: usize,
+    /// Number of (key, version) pairs dropped by MVCC GC.
+    pub versions_gc_dropped: usize,
+}
+
 /// The storage engine — unified read/write API.
 pub struct Engine {
     config: EngineConfig,
@@ -218,6 +257,12 @@ pub struct Engine {
     /// Linux, or tokio::fs on macOS/Windows. All SST reads and flush writes
     /// go through this scheduler.
     io_scheduler: Arc<dyn IoScheduler>,
+    /// Serializes runtime compaction runs so at most one merge executes at
+    /// a time (its internal build phase still fans out across
+    /// `compaction_concurrency` threads).
+    compaction_lock: Mutex<()>,
+    /// Optional source of pinned timestamps for MVCC GC during compaction.
+    pin_source: RwLock<Option<Arc<dyn PinSource>>>,
     /// Optional AEGIS-256 TDE module for encrypting/decrypting PAX blocks.
     #[cfg(feature = "aegis-tde")]
     tde: Option<Arc<galaxdb_crypto::AegisTdeModule>>,
@@ -390,6 +435,8 @@ impl Engine {
             next_sst_id: AtomicU64::new(next_sst_id_start),
             row_count: AtomicU64::new(replayed_puts),
             io_scheduler,
+            compaction_lock: Mutex::new(()),
+            pin_source: RwLock::new(None),
             #[cfg(feature = "aegis-tde")]
             tde: None,
         })
@@ -528,7 +575,14 @@ impl Engine {
 
     /// Get a row by primary key. Checks memtable first, then SST files on disk.
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        // Check ART index first
+        // Hold the SST registry read lock across the ART lookup AND the SST
+        // read. Runtime compaction performs its ART relocation + registry
+        // swap under the registry *write* lock (same registry-before-ART
+        // lock order), so a reader observes either the fully pre-compaction
+        // state (old ART entry + old SST present) or the fully
+        // post-compaction state (new ART entry + new SST present) — never a
+        // relocated-but-deleted in-between that would surface a false miss.
+        let registry = self.sst_registry.read().ok()?;
         let location = self.art.lookup(key)?;
 
         match &location {
@@ -542,7 +596,6 @@ impl Engine {
             }
             RowLocation::SST { sst_id, block_offset, row_offset } => {
                 // Read from SST file via IoScheduler (io_uring HP queue on Linux)
-                let registry = self.sst_registry.read().ok()?;
                 #[cfg(feature = "aegis-tde")]
                 {
                     registry.read_value(
@@ -676,6 +729,15 @@ impl Engine {
         galaxdb_observe::metrics()
             .checkpoint_last_duration_ms
             .set(elapsed_ms);
+
+        // Runtime compaction (Req 12 knob consumer): once the on-disk SST
+        // count reaches the configured L0 trigger, merge the SSTs so file
+        // count and read amplification stay bounded instead of growing with
+        // every flush. A compaction failure must not fail the flush — the
+        // rows are already durably on disk — so it is logged, not propagated.
+        if let Err(e) = self.maybe_compact() {
+            tracing::warn!(error = %e, "runtime compaction after flush failed");
+        }
 
         Ok(result.rows_flushed as u64)
     }
@@ -1248,6 +1310,447 @@ pub fn decode_kv(payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
     let key = payload[4..4 + key_len].to_vec();
     let value = payload[4 + key_len..].to_vec();
     Some((key, value))
+}
+
+/// One key's version history read out of the input SSTs: `(timestamp,
+/// value-or-tombstone)` pairs, oldest first after sorting.
+type VersionList = Vec<(Timestamp, Option<Vec<u8>>)>;
+/// A single row queued for an output bucket: `(key, value-or-tombstone)`.
+type BucketRow = (Vec<u8>, Option<Vec<u8>>);
+
+/// One output SST produced by compaction: its raw on-disk bytes and the ART
+/// relocation targets for the rows that are the *latest* version of their
+/// key (only those need a primary-key index entry — older pinned versions
+/// are reachable solely through `scan_all_at`).
+struct CompactionOutput {
+    bytes: Vec<u8>,
+    art_targets: Vec<(Vec<u8>, u32, u32)>,
+}
+
+/// Encrypt a block for compaction output when a TDE module is active,
+/// mirroring the flush pipeline. The block-index footer is always written
+/// in the clear (appended after the encrypted blocks), so re-registration
+/// can read it without the key.
+#[cfg(feature = "aegis-tde")]
+fn compaction_encrypt(
+    bytes: &[u8],
+    tde: Option<&galaxdb_crypto::AegisTdeModule>,
+) -> GalaxResult<Vec<u8>> {
+    match tde {
+        Some(m) => m.encrypt(bytes),
+        None => Ok(bytes.to_vec()),
+    }
+}
+
+#[cfg(not(feature = "aegis-tde"))]
+fn compaction_encrypt(bytes: &[u8], _tde: Option<&()>) -> GalaxResult<Vec<u8>> {
+    Ok(bytes.to_vec())
+}
+
+/// Build the output SST(s) for a single timestamp bucket. All rows in the
+/// bucket committed at `commit_ts`; they are packed into PAX blocks
+/// (≤ `max_rows_per_block` rows each) and SST files (≤ `sst_size_bytes`),
+/// exactly as the flush pipeline does, so the read path is unchanged.
+#[allow(clippy::too_many_arguments)]
+fn build_bucket(
+    commit_ts: Timestamp,
+    rows: &[BucketRow],
+    latest_ts: &HashMap<Vec<u8>, Timestamp>,
+    sst_size_bytes: u64,
+    max_rows_per_block: usize,
+    #[cfg(feature = "aegis-tde")] tde: Option<&galaxdb_crypto::AegisTdeModule>,
+) -> GalaxResult<Vec<CompactionOutput>> {
+    use crate::pax::{CodecId, ColumnData, PaxBlock};
+    use crate::sst::SstBlockIndex;
+    use galaxdb_common::ColumnType;
+
+    let max_rows = max_rows_per_block.max(1);
+    let mut outputs: Vec<CompactionOutput> = Vec::new();
+    let mut cur_data: Vec<u8> = Vec::new();
+    let mut cur_index = SstBlockIndex::new();
+    let mut cur_block_count: u32 = 0;
+    let mut cur_targets: Vec<(Vec<u8>, u32, u32)> = Vec::new();
+    let mut block_id: u64 = 1;
+
+    let mut i = 0;
+    while i < rows.len() {
+        let end = (i + max_rows).min(rows.len());
+        let chunk = &rows[i..end];
+
+        let mut key_col: Vec<Vec<u8>> = Vec::with_capacity(chunk.len());
+        let mut val_col: Vec<Vec<u8>> = Vec::with_capacity(chunk.len());
+        for (k, v) in chunk {
+            key_col.push(k.clone());
+            val_col.push(v.clone().unwrap_or_default());
+        }
+        let cols = vec![
+            ColumnData { col_type: ColumnType::Blob, values: key_col },
+            ColumnData { col_type: ColumnType::Blob, values: val_col },
+        ];
+        let pax = PaxBlock::write_with_codecs(
+            block_id,
+            commit_ts,
+            &cols,
+            &[CodecId::Zstd, CodecId::None],
+        )?;
+        block_id += 1;
+        let block_bytes = pax.serialize()?;
+        #[cfg(feature = "aegis-tde")]
+        let enc = compaction_encrypt(&block_bytes, tde)?;
+        #[cfg(not(feature = "aegis-tde"))]
+        let enc = compaction_encrypt(&block_bytes, None)?;
+
+        let offset = cur_data.len() as u64;
+        cur_index.add_block(offset, enc.len() as u32);
+        for (row_off, (k, _)) in chunk.iter().enumerate() {
+            if latest_ts.get(k) == Some(&commit_ts) {
+                cur_targets.push((k.clone(), cur_block_count, row_off as u32));
+            }
+        }
+        cur_data.extend_from_slice(&enc);
+        cur_block_count += 1;
+        i = end;
+
+        if cur_data.len() as u64 >= sst_size_bytes {
+            let index_offset = cur_data.len() as u64;
+            let footer = cur_index.serialize_with_footer(index_offset);
+            cur_data.extend_from_slice(&footer);
+            outputs.push(CompactionOutput {
+                bytes: std::mem::take(&mut cur_data),
+                art_targets: std::mem::take(&mut cur_targets),
+            });
+            cur_index = SstBlockIndex::new();
+            cur_block_count = 0;
+        }
+    }
+
+    if !cur_data.is_empty() {
+        let index_offset = cur_data.len() as u64;
+        let footer = cur_index.serialize_with_footer(index_offset);
+        cur_data.extend_from_slice(&footer);
+        outputs.push(CompactionOutput {
+            bytes: cur_data,
+            art_targets: cur_targets,
+        });
+    }
+
+    Ok(outputs)
+}
+
+impl Engine {
+    /// Install the source of pinned timestamps used by compaction's MVCC
+    /// garbage collector (see [`PinSource`]). The embedded `Database`
+    /// layer, which owns the version-tag catalog, calls this after open.
+    pub fn set_pin_source(&self, src: Arc<dyn PinSource>) {
+        *self.pin_source.write().expect("pin_source lock") = Some(src);
+    }
+
+    /// Number of SST files currently registered. Observability + tests.
+    pub fn sst_count(&self) -> usize {
+        self.sst_registry
+            .read()
+            .map(|r| r.entries.len())
+            .unwrap_or(0)
+    }
+
+    /// Run compaction iff the on-disk SST count has reached the configured
+    /// L0 trigger. Uses `try_lock` so a flush that triggers it never blocks
+    /// behind an already-running compaction. Returns whether it ran.
+    pub fn maybe_compact(&self) -> GalaxResult<bool> {
+        let count = self
+            .sst_registry
+            .read()
+            .map_err(|_| GalaxError::Internal("sst registry lock".into()))?
+            .entries
+            .len();
+        if count < self.config.l0_compaction_trigger {
+            return Ok(false);
+        }
+        match self.compaction_lock.try_lock() {
+            Ok(_guard) => {
+                self.compact_inner()?;
+                Ok(true)
+            }
+            Err(_) => Ok(false), // another compaction is already running
+        }
+    }
+
+    /// Merge every registered SST into a minimal set, applying MVCC GC.
+    /// Blocks until it can acquire the compaction lock. Intended for
+    /// explicit callers and tests; the flush path uses [`maybe_compact`].
+    pub fn compact(&self) -> GalaxResult<CompactionStats> {
+        let _guard = self
+            .compaction_lock
+            .lock()
+            .map_err(|_| GalaxError::Internal("compaction lock poisoned".into()))?;
+        self.compact_inner()
+    }
+
+    /// Decrypt an SST block read during compaction when it was written
+    /// encrypted. Plaintext blocks (and builds without the TDE feature)
+    /// pass through unchanged.
+    #[cfg(feature = "aegis-tde")]
+    fn compaction_decrypt(&self, raw: &[u8], encrypted: bool) -> GalaxResult<Vec<u8>> {
+        match (encrypted, self.tde.as_deref()) {
+            (true, Some(m)) => m.decrypt(raw),
+            _ => Ok(raw.to_vec()),
+        }
+    }
+
+    /// Core compaction, run while holding the compaction lock.
+    fn compact_inner(&self) -> GalaxResult<CompactionStats> {
+        // 1. Snapshot the input set (ids + paths + per-file encrypted flag).
+        let inputs: Vec<(u64, PathBuf, bool)> = {
+            let reg = self
+                .sst_registry
+                .read()
+                .map_err(|_| GalaxError::Internal("sst registry lock".into()))?;
+            reg.entries
+                .iter()
+                .map(|(id, e)| {
+                    #[cfg(feature = "aegis-tde")]
+                    let enc = e.encrypted;
+                    #[cfg(not(feature = "aegis-tde"))]
+                    let enc = {
+                        let _ = e;
+                        false
+                    };
+                    (*id, e.path.clone(), enc)
+                })
+                .collect()
+        };
+        if inputs.len() < 2 {
+            return Ok(CompactionStats {
+                input_ssts: inputs.len(),
+                output_ssts: inputs.len(),
+                keys_retained: 0,
+                versions_gc_dropped: 0,
+            });
+        }
+        let input_ids: HashSet<u64> = inputs.iter().map(|(id, _, _)| *id).collect();
+
+        // 2. Read every (key -> [(ts, value|tombstone)]) from the inputs.
+        let mut versions: BTreeMap<Vec<u8>, VersionList> = BTreeMap::new();
+        for (_, path, encrypted) in &inputs {
+            let data = std::fs::read(path).map_err(GalaxError::Io)?;
+            let index = crate::sst::SstBlockIndex::from_file_data(&data).unwrap_or_else(|_| {
+                let mut idx = crate::sst::SstBlockIndex::new();
+                idx.add_block(0, data.len() as u32);
+                idx
+            });
+            for be in &index.entries {
+                let start = be.file_offset as usize;
+                let end = start + be.block_len as usize;
+                if end > data.len() {
+                    continue;
+                }
+                #[cfg(feature = "aegis-tde")]
+                let block_bytes = self.compaction_decrypt(&data[start..end], *encrypted)?;
+                #[cfg(not(feature = "aegis-tde"))]
+                let block_bytes = {
+                    let _ = encrypted;
+                    data[start..end].to_vec()
+                };
+                let block = match crate::pax::PaxBlock::deserialize(&block_bytes) {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let ts = block.header.commit_timestamp;
+                let keys = match block.read_column(0) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let vals = match block.read_column(1) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                for (k, v) in keys.into_iter().zip(vals) {
+                    versions
+                        .entry(k)
+                        .or_default()
+                        .push((ts, if v.is_empty() { None } else { Some(v) }));
+                }
+            }
+        }
+
+        // 3. MVCC GC. Keep, per key: the latest version (always), plus the
+        //    newest version at or before each pinned timestamp so AT VERSION
+        //    reads still resolve. A key whose latest version is a tombstone
+        //    and that no pin needs history for is dropped entirely (it is
+        //    deleted and this is the bottom level — nothing below can
+        //    resurrect it).
+        let mut pins: Vec<Timestamp> = self
+            .pin_source
+            .read()
+            .expect("pin_source lock")
+            .as_ref()
+            .map(|p| p.pinned_timestamps())
+            .unwrap_or_default();
+        pins.sort_unstable();
+        pins.dedup();
+
+        let mut buckets: BTreeMap<Timestamp, Vec<BucketRow>> = BTreeMap::new();
+        let mut latest_ts: HashMap<Vec<u8>, Timestamp> = HashMap::new();
+        let mut keys_retained = 0usize;
+        let mut versions_gc_dropped = 0usize;
+
+        for (key, mut vers) in versions {
+            vers.sort_by_key(|(ts, _)| *ts);
+            // Collapse duplicate timestamps (last wins) — defensive; flush
+            // gives each SST a distinct commit ts.
+            vers.dedup_by_key(|(ts, _)| *ts);
+            let n = vers.len();
+            let latest_idx = n - 1;
+            let mut keep = vec![false; n];
+            keep[latest_idx] = true;
+            for &p in &pins {
+                if let Some(idx) = vers.iter().rposition(|(ts, _)| *ts <= p) {
+                    keep[idx] = true;
+                }
+            }
+            let latest_is_tombstone = vers[latest_idx].1.is_none();
+            let only_latest_kept = keep
+                .iter()
+                .enumerate()
+                .all(|(i, &k)| !k || i == latest_idx);
+            if latest_is_tombstone && only_latest_kept {
+                versions_gc_dropped += n;
+                continue;
+            }
+            keys_retained += 1;
+            latest_ts.insert(key.clone(), vers[latest_idx].0);
+            for (i, (ts, val)) in vers.into_iter().enumerate() {
+                if keep[i] {
+                    buckets.entry(ts).or_default().push((key.clone(), val));
+                } else {
+                    versions_gc_dropped += 1;
+                }
+            }
+        }
+
+        // Keys within each bucket must be sorted (read path + zone maps
+        // assume ascending key order within a block).
+        for rows in buckets.values_mut() {
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+        }
+
+        // 4. Build the output SSTs, fanning the timestamp buckets across
+        //    `compaction_concurrency` worker threads (the Req 12 knob).
+        let bucket_vec: Vec<(Timestamp, Vec<BucketRow>)> = buckets.into_iter().collect();
+        let mut all_outputs: Vec<CompactionOutput> = Vec::new();
+
+        if !bucket_vec.is_empty() {
+            let n_workers = self
+                .config
+                .compaction_concurrency
+                .max(1)
+                .min(bucket_vec.len());
+            let chunk_size = bucket_vec.len().div_ceil(n_workers).max(1);
+            let latest_ref = &latest_ts;
+            let sst_size = self.config.sst_size_bytes;
+            let max_rows = self.config.max_rows_per_sst;
+            #[cfg(feature = "aegis-tde")]
+            let tde_arc = self.tde.clone();
+
+            std::thread::scope(|scope| -> GalaxResult<()> {
+                let mut handles = Vec::new();
+                for chunk in bucket_vec.chunks(chunk_size) {
+                    #[cfg(feature = "aegis-tde")]
+                    let tde_arc = tde_arc.clone();
+                    let handle = scope.spawn(move || -> GalaxResult<Vec<CompactionOutput>> {
+                        let mut local = Vec::new();
+                        for (ts, rows) in chunk {
+                            #[cfg(feature = "aegis-tde")]
+                            let outs = build_bucket(
+                                *ts,
+                                rows,
+                                latest_ref,
+                                sst_size,
+                                max_rows,
+                                tde_arc.as_deref(),
+                            )?;
+                            #[cfg(not(feature = "aegis-tde"))]
+                            let outs = build_bucket(*ts, rows, latest_ref, sst_size, max_rows)?;
+                            local.extend(outs);
+                        }
+                        Ok(local)
+                    });
+                    handles.push(handle);
+                }
+                for handle in handles {
+                    let outs = handle
+                        .join()
+                        .map_err(|_| GalaxError::Internal("compaction worker panicked".into()))??;
+                    all_outputs.extend(outs);
+                }
+                Ok(())
+            })?;
+        }
+
+        // 5. Commit. Under the registry write lock (same registry→ART lock
+        //    order the read path uses): write + register each output SST,
+        //    relocate the ART entry for each latest-version key (only if it
+        //    still points into an input SST — never clobbering a concurrent
+        //    write/flush), then drop the input registry entries. Old files
+        //    are unlinked after the lock is released; by then no reader can
+        //    reach them through the registry.
+        let output_ssts = all_outputs.len();
+        {
+            let mut reg = self
+                .sst_registry
+                .write()
+                .map_err(|_| GalaxError::Internal("sst registry lock".into()))?;
+            for out in &all_outputs {
+                let sid = self.next_sst_id.fetch_add(1, Ordering::SeqCst);
+                // Draw the on-disk filename id from the same global counter
+                // the flush pipeline uses, so a compaction output file never
+                // collides with (and is never mistaken for / deleted as) a
+                // flush-written SST. The registry key stays `sid`
+                // (next_sst_id space), mirroring the flush path.
+                let fid = flush::allocate_block_id();
+                let path = self.config.data_dir.join(format!("sst_{}.pax", fid));
+                std::fs::write(&path, &out.bytes).map_err(GalaxError::Io)?;
+                #[cfg(feature = "aegis-tde")]
+                {
+                    if let Some(tde) = &self.tde {
+                        reg.register_encrypted(sid, path.clone(), tde);
+                    } else {
+                        reg.register(sid, path.clone());
+                    }
+                }
+                #[cfg(not(feature = "aegis-tde"))]
+                {
+                    reg.register(sid, path.clone());
+                }
+                for (key, block_index, row_offset) in &out.art_targets {
+                    self.art.relocate_if_points_to(
+                        key,
+                        &input_ids,
+                        RowLocation::SST {
+                            sst_id: sid,
+                            block_offset: *block_index as u64,
+                            row_offset: *row_offset,
+                        },
+                    );
+                }
+            }
+            for id in &input_ids {
+                reg.entries.remove(id);
+            }
+        }
+
+        // 6. Delete the merged input files (registry no longer references them).
+        for (_, path, _) in &inputs {
+            let _ = std::fs::remove_file(path);
+        }
+
+        Ok(CompactionStats {
+            input_ssts: inputs.len(),
+            output_ssts,
+            keys_retained,
+            versions_gc_dropped,
+        })
+    }
 }
 
 #[cfg(test)]

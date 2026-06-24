@@ -890,6 +890,7 @@ async fn run_coldcache(
         // maps block_offset → (file_offset, length) for O(1) lookup.
         sst_size_bytes: 8 * 1024 * 1024,
         max_rows_per_sst: 100, // ~62KB per block for fast point reads
+        ..Default::default()
     };
     let engine = Engine::new(config).unwrap();
 

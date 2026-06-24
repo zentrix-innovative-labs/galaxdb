@@ -77,6 +77,7 @@ async fn test_kill_mid_flush() -> TestResult {
         group_commit_interval: Duration::from_millis(5),
         checkpoint_size_bytes: 512 * 1024 * 1024,
         checkpoint_interval: Duration::from_secs(3600),
+        preallocate_bytes: 256 * 1024,
     };
 
     let wal_writer = match WalWriter::new(wal_config) {
@@ -336,6 +337,7 @@ async fn test_corrupt_wal_record() -> TestResult {
             group_commit_interval: Duration::from_millis(5),
             checkpoint_size_bytes: 512 * 1024 * 1024,
             checkpoint_interval: Duration::from_secs(3600),
+            preallocate_bytes: 256 * 1024,
         };
 
         let wal_writer = match WalWriter::new(wal_config) {

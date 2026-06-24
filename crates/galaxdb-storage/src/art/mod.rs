@@ -63,6 +63,37 @@ impl ArtIndex {
         tree.delete(key)
     }
 
+    /// Atomically relocate a key to `new_location`, but only if it
+    /// currently points into one of the SST files named in
+    /// `expected_sst_ids`.
+    ///
+    /// This is the safe primitive compaction uses to update the index
+    /// after rewriting SST files: it must move a key from an old (input)
+    /// SST to the new (output) SST, but it must never clobber a newer
+    /// location written concurrently by a foreground writer or a later
+    /// flush (which would point the key at the memtable or a newer SST).
+    /// The lookup + conditional insert happen under a single write lock so
+    /// no concurrent writer can interleave between the check and the swap.
+    ///
+    /// Returns `true` if the relocation was applied, `false` if the
+    /// current location was the memtable, a different SST, or absent
+    /// (in which case the entry is left untouched).
+    pub fn relocate_if_points_to(
+        &self,
+        key: &[u8],
+        expected_sst_ids: &std::collections::HashSet<u64>,
+        new_location: RowLocation,
+    ) -> bool {
+        let mut tree = self.inner.write().unwrap();
+        match tree.lookup(key) {
+            Some(RowLocation::SST { sst_id, .. }) if expected_sst_ids.contains(&sst_id) => {
+                tree.insert(key.to_vec(), new_location);
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Rebuild the index from an iterator of (key, location) pairs.
     ///
     /// This clears the existing tree and inserts all entries from the iterator.

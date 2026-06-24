@@ -179,6 +179,21 @@ pub struct Database {
     stmt_cache: Mutex<galaxdb_sql::StatementCache>,
 }
 
+/// Adapter exposing the version-tag catalog's pinned timestamps to the
+/// storage engine's runtime compaction MVCC garbage collector. Every tag's
+/// `version_timestamp` is GC-exempt so `AT VERSION` time-travel keeps
+/// resolving after a compaction (engineering-principles §2).
+struct TagCatalogPins(Arc<Mutex<TagCatalog>>);
+
+impl galaxdb_storage::engine::PinSource for TagCatalogPins {
+    fn pinned_timestamps(&self) -> Vec<u64> {
+        self.0
+            .lock()
+            .map(|tc| tc.all_pinned_timestamps())
+            .unwrap_or_default()
+    }
+}
+
 impl Database {
     /// Open (or create) a database at `path` without a sidecar.
     ///
@@ -208,6 +223,7 @@ impl Database {
         path: &str,
         memtable_size_bytes: u64,
         sst_cache_bytes: u64,
+        compaction_concurrency: usize,
     ) -> GalaxResult<Self> {
         let path = PathBuf::from(path);
         std::fs::create_dir_all(&path)?;
@@ -216,6 +232,7 @@ impl Database {
             wal_group_commit_ms: 1,
             memtable_size_bytes,
             sst_cache_bytes,
+            compaction_concurrency: compaction_concurrency.max(1),
             ..Default::default()
         };
         let engine = Engine::new(config)?;
@@ -226,12 +243,21 @@ impl Database {
     /// [`open`](Self::open) and [`open_with_tuning`](Self::open_with_tuning)
     /// so the handle's auxiliary state is constructed in exactly one place.
     fn from_engine(path: PathBuf, engine: Engine) -> Self {
+        let engine = Arc::new(engine);
+        let tag_catalog = Arc::new(Mutex::new(TagCatalog::new()));
+        // Make runtime compaction tag-aware: its MVCC garbage collector
+        // must never drop a row version a live version tag can still read
+        // through `AT VERSION` (engineering-principles §2). The tag catalog
+        // is the authoritative pin set; the engine queries it on every
+        // compaction. Without this, a flush-triggered compaction would GC
+        // unpinned historical versions and break time-travel reads.
+        engine.set_pin_source(Arc::new(TagCatalogPins(tag_catalog.clone())));
         Self {
             path,
-            engine: Arc::new(engine),
+            engine,
             sidecar: None,
             merkle_dag: Arc::new(Mutex::new(MerkleDag::new())),
-            tag_catalog: Arc::new(Mutex::new(TagCatalog::new())),
+            tag_catalog,
             vector_indexes: Arc::new(RwLock::new(HashMap::new())),
             catalog: Arc::new(galaxdb_sql::executor::Catalog::new()),
             session: None,

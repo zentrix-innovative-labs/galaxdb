@@ -69,7 +69,13 @@ pub fn peek_next_block_id() -> u64 {
 }
 
 /// Allocate a new unique block ID.
-fn allocate_block_id() -> BlockId {
+///
+/// Public so the runtime compaction driver names its output SST files
+/// from the *same* monotonic counter the flush pipeline uses, guaranteeing
+/// compaction output never collides with a flush-written `sst_<id>.pax`
+/// path (the registry key stays in the engine's `next_sst_id` space, just
+/// like flush — only the on-disk filename is drawn from this counter).
+pub fn allocate_block_id() -> BlockId {
     NEXT_BLOCK_ID.fetch_add(1, Ordering::SeqCst)
 }
 

@@ -171,16 +171,15 @@ pub async fn start(
 
     // Task 15 (Req 12): probe the host and resolve the effective auto-tune
     // configuration, then log it with the source of each value (auto-derived
-    // vs overridden vs static-default). The derived buffer-pool and memtable
-    // sizes are applied to the engine via open_with_tuning. The
-    // compaction-concurrency value is reported for operator visibility; the
-    // OSS engine does not yet run a background compaction driver that would
-    // consume it (tracked in docs/CONSOLIDATION.md), so it is surfaced but
-    // not yet wired to a runtime compactor.
+    // vs overridden vs static-default). The derived buffer-pool, memtable,
+    // and compaction-concurrency values are all applied to the engine via
+    // open_with_tuning — the last drives the runtime compaction driver's
+    // parallel build fan-out.
     let tuning = tuning::resolve_tuning(&config.auto_tune);
     tracing::info!("{}", tuning.describe());
     let memtable_bytes = tuning.memtable_size_bytes.value;
     let sst_cache_bytes = tuning.buffer_pool_bytes.value;
+    let compaction_concurrency = tuning.compaction_concurrency.value;
 
     let db = Arc::new(RwLock::new(
         // Task 40.1: spawn sidecar when configured. The sidecar binary
@@ -190,6 +189,7 @@ pub async fn start(
                 &config.data_dir,
                 memtable_bytes,
                 sst_cache_bytes,
+                compaction_concurrency,
             )
             .expect("failed to open database");
             if let (Some(sidecar_bin), Some(model)) = (
