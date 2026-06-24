@@ -19,6 +19,8 @@
 //! syntax (`local:`, `env:`, `command:`, `vault:`).
 
 pub mod aegis_tde;
+#[cfg(feature = "cloud-kms")]
+pub mod cloud_kms;
 pub mod key_provider;
 pub mod nonce;
 pub mod tde;
@@ -32,3 +34,6 @@ pub use tde::{CachedDataKey, TdeModule};
 
 #[cfg(feature = "vault")]
 pub use key_provider::HashicorpVaultKeyProvider;
+
+#[cfg(feature = "cloud-kms")]
+pub use cloud_kms::{AwsKmsKeyProvider, AzureKeyVaultKeyProvider, GcpKmsKeyProvider};

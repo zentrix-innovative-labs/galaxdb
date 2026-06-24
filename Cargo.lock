@@ -2627,9 +2627,14 @@ dependencies = [
  "base64 0.22.1",
  "criterion",
  "galaxdb-common",
+ "hmac",
  "rand 0.8.6",
+ "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "tracing",
+ "ureq",
  "vaultrs",
 ]
 

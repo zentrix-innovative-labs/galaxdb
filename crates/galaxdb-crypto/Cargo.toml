@@ -15,16 +15,28 @@ default = []
 # `vaultrs` crate and pulls in reqwest + rustls.
 vault = ["dep:vaultrs", "dep:base64", "dep:tokio"]
 
+# Enable the native cloud KMS key providers (AWS KMS, GCP KMS, Azure Key
+# Vault) over REST. No vendor SDK — requests are signed in-crate. Opt-in so
+# the core build stays lean.
+cloud-kms = ["dep:ureq", "dep:hmac", "dep:sha2", "dep:base64", "dep:serde_json"]
+
 [dependencies]
 galaxdb-common.workspace = true
 aes-gcm.workspace = true
 aegis.workspace = true
 rand.workspace = true
+tracing = { workspace = true }
 
 # Optional — only compiled when the `vault` feature is enabled.
 vaultrs = { version = "0.8", optional = true }
 base64 = { version = "0.22", optional = true }
 tokio = { workspace = true, optional = true }
+
+# Optional — only compiled when the `cloud-kms` feature is enabled.
+ureq = { version = "2", default-features = false, features = ["tls", "json"], optional = true }
+hmac = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

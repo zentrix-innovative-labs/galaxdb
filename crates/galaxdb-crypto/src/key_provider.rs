@@ -571,6 +571,12 @@ pub enum KeyProviderSpec {
     Env { var: String },
     Command { program: String, extra_args: Vec<String> },
     Vault { mount: String, key_name: String },
+    /// AWS KMS (`aws-kms:<key-id|alias|arn>`). Needs the `cloud-kms` feature.
+    AwsKms { key_id: String },
+    /// GCP Cloud KMS (`gcp-kms:projects/.../cryptoKeys/...`). Needs `cloud-kms`.
+    GcpKms { key_name: String },
+    /// Azure Key Vault (`azure-kv:<vault>/<key>`). Needs the `cloud-kms` feature.
+    AzureKv { vault: String, key_name: String },
 }
 
 impl KeyProviderSpec {
@@ -625,9 +631,34 @@ impl KeyProviderSpec {
             }
             return Ok(Self::Vault { mount, key_name });
         }
+        if let Some(key_id) = trimmed.strip_prefix("aws-kms:") {
+            if key_id.is_empty() {
+                return Err(GalaxError::Kms("aws-kms: missing key id/alias/arn".to_string()));
+            }
+            return Ok(Self::AwsKms { key_id: key_id.to_string() });
+        }
+        if let Some(key_name) = trimmed.strip_prefix("gcp-kms:") {
+            if key_name.is_empty() {
+                return Err(GalaxError::Kms("gcp-kms: missing crypto-key resource name".to_string()));
+            }
+            return Ok(Self::GcpKms { key_name: key_name.to_string() });
+        }
+        if let Some(rest) = trimmed.strip_prefix("azure-kv:") {
+            let (vault, key_name) = rest.split_once('/').ok_or_else(|| {
+                GalaxError::Kms("azure-kv: expected azure-kv:<vault>/<key>".to_string())
+            })?;
+            if vault.is_empty() || key_name.is_empty() {
+                return Err(GalaxError::Kms("azure-kv: empty vault or key".to_string()));
+            }
+            return Ok(Self::AzureKv {
+                vault: vault.to_string(),
+                key_name: key_name.to_string(),
+            });
+        }
         Err(GalaxError::Encryption(format!(
             "unrecognised key-provider spec '{spec}'; expected one of \
-             local:<path>, env[:<var>], command:<program>[:args], vault:[mount/]key"
+             local:<path>, env[:<var>], command:<program>[:args], vault:[mount/]key, \
+             aws-kms:<key>, gcp-kms:<resource>, azure-kv:<vault>/<key>"
         )))
     }
 
@@ -660,6 +691,52 @@ impl KeyProviderSpec {
                     let _ = (mount, key_name);
                     Err(GalaxError::Encryption(
                         "Vault key provider requires the 'vault' Cargo feature".to_string(),
+                    ))
+                }
+            }
+            Self::AwsKms { key_id } => {
+                #[cfg(feature = "cloud-kms")]
+                {
+                    Ok(Box::new(crate::cloud_kms::AwsKmsKeyProvider::from_key_id(
+                        key_id,
+                    )?))
+                }
+                #[cfg(not(feature = "cloud-kms"))]
+                {
+                    let _ = key_id;
+                    Err(GalaxError::Kms(
+                        "AWS KMS key provider requires the 'cloud-kms' Cargo feature".to_string(),
+                    ))
+                }
+            }
+            Self::GcpKms { key_name } => {
+                #[cfg(feature = "cloud-kms")]
+                {
+                    Ok(Box::new(crate::cloud_kms::GcpKmsKeyProvider::from_key_name(
+                        key_name,
+                    )?))
+                }
+                #[cfg(not(feature = "cloud-kms"))]
+                {
+                    let _ = key_name;
+                    Err(GalaxError::Kms(
+                        "GCP KMS key provider requires the 'cloud-kms' Cargo feature".to_string(),
+                    ))
+                }
+            }
+            Self::AzureKv { vault, key_name } => {
+                #[cfg(feature = "cloud-kms")]
+                {
+                    Ok(Box::new(
+                        crate::cloud_kms::AzureKeyVaultKeyProvider::from_spec(vault, key_name)?,
+                    ))
+                }
+                #[cfg(not(feature = "cloud-kms"))]
+                {
+                    let _ = (vault, key_name);
+                    Err(GalaxError::Kms(
+                        "Azure Key Vault key provider requires the 'cloud-kms' Cargo feature"
+                            .to_string(),
                     ))
                 }
             }
@@ -938,6 +1015,40 @@ mod tests {
         assert!(KeyProviderSpec::parse("random:thing").is_err());
         assert!(KeyProviderSpec::parse("").is_err());
         assert!(KeyProviderSpec::parse("vault:").is_err());
+    }
+
+    #[test]
+    fn spec_parse_cloud_kms() {
+        match KeyProviderSpec::parse("aws-kms:alias/galaxdb").unwrap() {
+            KeyProviderSpec::AwsKms { key_id } => assert_eq!(key_id, "alias/galaxdb"),
+            other => panic!("{:?}", other),
+        }
+        match KeyProviderSpec::parse(
+            "gcp-kms:projects/p/locations/l/keyRings/r/cryptoKeys/k",
+        )
+        .unwrap()
+        {
+            KeyProviderSpec::GcpKms { key_name } => {
+                assert_eq!(key_name, "projects/p/locations/l/keyRings/r/cryptoKeys/k")
+            }
+            other => panic!("{:?}", other),
+        }
+        match KeyProviderSpec::parse("azure-kv:myvault/mykey").unwrap() {
+            KeyProviderSpec::AzureKv { vault, key_name } => {
+                assert_eq!(vault, "myvault");
+                assert_eq!(key_name, "mykey");
+            }
+            other => panic!("{:?}", other),
+        }
+    }
+
+    #[test]
+    fn spec_parse_cloud_kms_malformed_fails() {
+        assert!(KeyProviderSpec::parse("aws-kms:").is_err());
+        assert!(KeyProviderSpec::parse("gcp-kms:").is_err());
+        assert!(KeyProviderSpec::parse("azure-kv:novault").is_err());
+        assert!(KeyProviderSpec::parse("azure-kv:/key").is_err());
+        assert!(KeyProviderSpec::parse("azure-kv:vault/").is_err());
     }
 
     // -----------------------------------------------------------------
