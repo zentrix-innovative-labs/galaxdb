@@ -1,0 +1,33 @@
+=== rustc/cargo versions ===
+rustc 1.96.0 (ac68faa20 2026-05-25)
+cargo 1.96.0 (30a34c682 2026-05-25)
+=== uname / cpu / mem ===
+Linux ip-172-31-8-213 6.17.0-1017-aws #17~24.04.1-Ubuntu SMP Tue May 26 21:30:32 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+16
+MemTotal:       32308504 kB
+=== release build: server + benchmarks ===
+=== networked wire_integration (--release): tasks 9/10/11 over real TCP ===
+
+running 15 tests
+test release_binary_size_under_70mb_when_built ... ok
+test scram_unknown_role_is_rejected_28p01 ... ok
+test tls_require_rejects_plaintext_startup ... ok
+test tls_allow_still_serves_plaintext ... ok
+test wire_server_accepts_sql_commenter_traceparent ... ok
+test scram_correct_password_connects ... ok
+test scram_wrong_password_is_rejected_28p01 ... ok
+test crud_round_trip_over_wire ... ok
+test wire_authz_denied_then_granted ... ok
+test http_observability_starts_alongside_wire_server ... ok
+test tls_require_connects_over_encrypted_channel ... ok
+test audit_log_records_auth_authz_and_admin_events ... ok
+test many_concurrent_inserts_do_not_panic ... ok
+test copy_protocol_round_trip_and_malformed_abort ... ok
+test extended_protocol_prepared_statements ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+
+=== single-row INSERT throughput (task 10): simple vs prepared ===
+=== GalaxDB single-row INSERT benchmark ===
+rows per phase: 200000
+(reproduce: cargo run --release -p galaxdb-benchmarks --bin single-row-insert-bench -- --rows 200000)
