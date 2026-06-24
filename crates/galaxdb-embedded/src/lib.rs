@@ -157,7 +157,7 @@ pub struct Database {
     /// Persisted catalog snapshot — mirrors the executor's context
     /// catalog. Carried here so `&self` read-only methods
     /// (`table_exists`, `table_count`) don't need to rebuild it.
-    catalog: galaxdb_sql::executor::Catalog,
+    catalog: Arc<galaxdb_sql::executor::Catalog>,
     /// The authenticated session this database handle runs statements
     /// under, if any (Req 3). `None` is trusted in-process embedded use:
     /// no authenticated principal, so the executor skips authorization
@@ -201,7 +201,7 @@ impl Database {
             merkle_dag: Arc::new(Mutex::new(MerkleDag::new())),
             tag_catalog: Arc::new(Mutex::new(TagCatalog::new())),
             vector_indexes: Arc::new(RwLock::new(HashMap::new())),
-            catalog: galaxdb_sql::executor::Catalog::new(),
+            catalog: Arc::new(galaxdb_sql::executor::Catalog::new()),
             session: None,
             audit: None,
             stmt_cache: Mutex::new(galaxdb_sql::StatementCache::new(256)),
@@ -356,6 +356,39 @@ impl Database {
         result
     }
 
+    /// Parse `sql`, using the statement cache but **without holding the cache
+    /// lock during parsing**. On a miss the mutex is released, the parser runs
+    /// (CPU-heavy), then the result is inserted. This lets concurrent
+    /// connections parse in parallel instead of serializing every statement on
+    /// the single cache mutex — critical for multi-client write throughput.
+    fn cached_parse(
+        &self,
+        sql: &str,
+    ) -> GalaxResult<std::sync::Arc<Vec<AuroraStatement>>> {
+        // Fast path: cache hit under a brief lock.
+        if let Some(hit) = {
+            let mut cache = self
+                .stmt_cache
+                .lock()
+                .map_err(|_| GalaxError::Internal("statement cache mutex poisoned".into()))?;
+            cache.get_cached(sql)
+        } {
+            return Ok(hit);
+        }
+        // Slow path: parse with NO lock held.
+        let parsed = std::sync::Arc::new(parser::parse(sql)?);
+        // Publish to the cache (brief lock). A concurrent racer may have
+        // inserted the same key meanwhile; last write wins and both are equal.
+        {
+            let mut cache = self
+                .stmt_cache
+                .lock()
+                .map_err(|_| GalaxError::Internal("statement cache mutex poisoned".into()))?;
+            cache.put_parsed(sql, parsed.clone());
+        }
+        Ok(parsed)
+    }
+
     /// DML-write path that takes `&self` (shared/read lock) instead of
     /// `&mut self` (exclusive write lock). Safe for concurrent callers
     /// because:
@@ -380,12 +413,9 @@ impl Database {
         session: Option<galaxdb_auth::SessionContext>,
     ) -> GalaxResult<QueryResult> {
         // Parse and classify — reject DDL before we even touch the engine.
-        let stmts = {
-            let mut cache = self.stmt_cache
-                .lock()
-                .map_err(|_| GalaxError::Internal("statement cache mutex poisoned".into()))?;
-            cache.get_or_parse(sql)?
-        };
+        // Parse OUTSIDE the cache lock so concurrent connections parse in
+        // parallel instead of serializing on the statement-cache mutex.
+        let stmts = self.cached_parse(sql)?;
 
         for stmt in stmts.iter() {
             match stmt {
@@ -824,11 +854,7 @@ impl Database {
             return self.exec_select_at_version(&stripped, at);
         }
 
-        let stmts = self
-            .stmt_cache
-            .lock()
-            .map_err(|_| GalaxError::Internal("statement cache mutex poisoned".into()))?
-            .get_or_parse(sql)?;
+        let stmts = self.cached_parse(sql)?;
         let mut last = QueryResult::Ok("OK".to_string());
         for stmt in stmts.iter() {
             last = self.exec_stmt(stmt)?;
@@ -865,11 +891,7 @@ impl Database {
             return self.select_at_version_readonly(&stripped, at, session.as_ref());
         }
 
-        let stmts = self
-            .stmt_cache
-            .lock()
-            .map_err(|_| GalaxError::Internal("statement cache mutex poisoned".into()))?
-            .get_or_parse(sql)?;
+        let stmts = self.cached_parse(sql)?;
         let mut last = QueryResult::Ok("OK".to_string());
         for stmt in stmts.iter() {
             last = self.dispatch_readonly_stmt(stmt, session.as_ref())?;

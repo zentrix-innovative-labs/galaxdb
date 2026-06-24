@@ -129,7 +129,7 @@ fn test_ctx() -> ExecutorContext {
 /// Build a context with the `users` table already registered.
 fn ctx_with_users() -> ExecutorContext {
     let mut ctx = test_ctx();
-    ctx.catalog
+    std::sync::Arc::make_mut(&mut ctx.catalog)
         .create_table("users".to_string(), users_entry())
         .unwrap();
     ctx
@@ -138,7 +138,7 @@ fn ctx_with_users() -> ExecutorContext {
 /// Build a context with the `docs(body)` text table.
 fn ctx_with_docs_body() -> ExecutorContext {
     let mut ctx = test_ctx();
-    ctx.catalog
+    std::sync::Arc::make_mut(&mut ctx.catalog)
         .create_table("docs".to_string(), docs_body_entry())
         .unwrap();
     ctx
@@ -379,7 +379,7 @@ fn context_update_changes_value() {
 #[test]
 fn context_update_rejects_embedding_source_column() {
     let mut ctx = test_ctx();
-    ctx.catalog
+    std::sync::Arc::make_mut(&mut ctx.catalog)
         .create_table("docs".to_string(), embedding_entry())
         .unwrap();
 
@@ -401,7 +401,7 @@ fn context_update_rejects_embedding_source_column() {
 #[test]
 fn context_update_non_embedding_column_on_embedding_table_succeeds() {
     let mut ctx = test_ctx();
-    ctx.catalog
+    std::sync::Arc::make_mut(&mut ctx.catalog)
         .create_table("docs".to_string(), embedding_entry())
         .unwrap();
 
@@ -653,7 +653,7 @@ fn context_restore_validates_and_copies() {
         CAPTURE.with(|c| *c.borrow_mut() = Some(captured.clone()));
 
         let mut ctx = test_ctx();
-        ctx.catalog
+        std::sync::Arc::make_mut(&mut ctx.catalog)
             .create_table("t".to_string(), users_entry())
             .unwrap();
         execute_with_context(
@@ -729,7 +729,7 @@ fn context_bulk_insert_writes_real_rows() {
 #[test]
 fn context_show_embedding_health_without_sidecar() {
     let mut ctx = test_ctx();
-    ctx.catalog
+    std::sync::Arc::make_mut(&mut ctx.catalog)
         .create_table("docs".to_string(), embedding_entry())
         .unwrap();
 
@@ -868,7 +868,7 @@ impl VectorSearchBackend for FailingVectorBackend {
 #[test]
 fn context_semantic_search_returns_results() {
     let mut ctx = test_ctx();
-    ctx.catalog
+    std::sync::Arc::make_mut(&mut ctx.catalog)
         .create_table("docs".to_string(), embedding_entry())
         .unwrap();
 
@@ -922,7 +922,7 @@ fn context_semantic_search_returns_results() {
 #[test]
 fn context_semantic_search_without_backend_returns_sidecar_unavailable() {
     let mut ctx = test_ctx();
-    ctx.catalog
+    std::sync::Arc::make_mut(&mut ctx.catalog)
         .create_table("docs".to_string(), embedding_entry())
         .unwrap();
     // No backend installed.
@@ -943,7 +943,7 @@ fn context_semantic_search_without_backend_returns_sidecar_unavailable() {
 #[test]
 fn context_semantic_search_backend_failure_propagates() {
     let mut ctx = test_ctx();
-    ctx.catalog
+    std::sync::Arc::make_mut(&mut ctx.catalog)
         .create_table("docs".to_string(), embedding_entry())
         .unwrap();
     ctx.vector_backend = Some(FailingVectorBackend::new());
@@ -965,7 +965,7 @@ fn context_semantic_search_backend_failure_propagates() {
 #[test]
 fn context_hybrid_search_brute_force_strategy() {
     let mut ctx = test_ctx();
-    ctx.catalog
+    std::sync::Arc::make_mut(&mut ctx.catalog)
         .create_table("docs".to_string(), embedding_entry())
         .unwrap();
     ctx.vector_backend = Some(StubVectorBackend::with(vec![VectorSearchResult {
@@ -1003,7 +1003,7 @@ fn context_hybrid_search_brute_force_strategy() {
 #[test]
 fn context_hybrid_search_hnsw_strategy() {
     let mut ctx = test_ctx();
-    ctx.catalog
+    std::sync::Arc::make_mut(&mut ctx.catalog)
         .create_table("docs".to_string(), embedding_entry())
         .unwrap();
     ctx.vector_backend = Some(StubVectorBackend::with(vec![
@@ -1131,7 +1131,7 @@ fn minhash_policy_skips_non_text_columns() {
         has_embedding: false,
             append_only: false,
     };
-    ctx.catalog.create_table("nums".to_string(), entry).unwrap();
+    std::sync::Arc::make_mut(&mut ctx.catalog).create_table("nums".to_string(), entry).unwrap();
 
     let sink = Arc::new(InMemorySystemColumnSink::new());
     ctx.minhash_policy = Some(MinHashPolicy::new(42, sink.clone()));
@@ -1193,7 +1193,7 @@ fn minhash_policy_handles_multiple_text_columns() {
         has_embedding: false,
             append_only: false,
     };
-    ctx.catalog.create_table("docs".to_string(), entry).unwrap();
+    std::sync::Arc::make_mut(&mut ctx.catalog).create_table("docs".to_string(), entry).unwrap();
 
     let sink = Arc::new(InMemorySystemColumnSink::new());
     ctx.minhash_policy = Some(MinHashPolicy::new(42, sink.clone()));
@@ -1306,7 +1306,7 @@ fn ctx_with_dedup_docs() -> ExecutorContext {
         has_embedding: false,
             append_only: false,
     };
-    ctx.catalog.create_table("docs".to_string(), entry).unwrap();
+    std::sync::Arc::make_mut(&mut ctx.catalog).create_table("docs".to_string(), entry).unwrap();
     ctx
 }
 

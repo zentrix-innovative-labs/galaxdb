@@ -233,8 +233,10 @@ pub struct ExecutorContext {
     /// registry. Shared as `Arc` so it can be cloned into async tasks.
     pub engine: Arc<Engine>,
 
-    /// Table metadata. The executor updates this on DDL.
-    pub catalog: Catalog,
+    /// Table metadata. The executor updates this on DDL via
+    /// `Arc::make_mut` (copy-on-write); DML clones the `Arc` (a refcount
+    /// bump) instead of deep-cloning the table map on every statement.
+    pub catalog: Arc<Catalog>,
 
     /// Optional sidecar manager for generating embeddings on INSERT and
     /// for SEMANTIC_MATCH queries. When `None`, INSERTs against tables
@@ -313,7 +315,7 @@ impl ExecutorContext {
     pub fn new(engine: Arc<Engine>) -> Self {
         Self {
             engine,
-            catalog: Catalog::new(),
+            catalog: Arc::new(Catalog::new()),
             sidecar: None,
             tag_catalog: None,
             merkle_dag: None,
@@ -796,12 +798,12 @@ fn exec_create_table(
         append_only: is_system_append_only_table(&stmt.table_name),
     };
 
-    ctx.catalog.create_table(stmt.table_name.clone(), entry)?;
+    Arc::make_mut(&mut ctx.catalog).create_table(stmt.table_name.clone(), entry)?;
     Ok(ExecuteResult::Ok(format!("CREATE TABLE {}", stmt.table_name)))
 }
 
 fn exec_drop_table(name: &str, if_exists: bool, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteResult> {
-    match ctx.catalog.drop_table(name) {
+    match Arc::make_mut(&mut ctx.catalog).drop_table(name) {
         Ok(_) => Ok(ExecuteResult::Ok(format!("DROP TABLE {}", name))),
         Err(GalaxError::TableNotFound(_)) if if_exists => {
             Ok(ExecuteResult::Ok(format!("DROP TABLE IF EXISTS {}", name)))

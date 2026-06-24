@@ -160,6 +160,27 @@ impl StatementCache {
         Ok(parsed)
     }
 
+    /// Cache-only lookup: return the cached parse for `sql` (marking it
+    /// most-recently-used) or `None` on a miss. Unlike [`Self::get_or_parse`]
+    /// this never parses, so callers can release the cache lock and run the
+    /// (CPU-heavy) parser without serializing every connection on the mutex.
+    pub fn get_cached(&mut self, sql: &str) -> Option<Arc<Vec<AuroraStatement>>> {
+        let key = Self::normalize(sql);
+        if let Some(v) = self.map.get(&key).cloned() {
+            self.touch(&key);
+            Some(v)
+        } else {
+            None
+        }
+    }
+
+    /// Insert an already-parsed statement under its normalized key. Used with
+    /// [`Self::get_cached`] to implement parse-outside-the-lock.
+    pub fn put_parsed(&mut self, sql: &str, parsed: Arc<Vec<AuroraStatement>>) {
+        let key = Self::normalize(sql);
+        self.insert(key, parsed);
+    }
+
     /// Number of distinct statements currently cached.
     pub fn len(&self) -> usize {
         self.map.len()
