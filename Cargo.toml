@@ -10,6 +10,7 @@ members = [
     "crates/galaxdb-sql",
     "crates/galaxdb-wire",
     "crates/galaxdb-versioning",
+    "crates/galaxdb-backup",
     "crates/galaxdb-sidecar",
     "crates/galaxdb-observe",
     "crates/galaxdb-server",

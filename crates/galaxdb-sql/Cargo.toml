@@ -13,6 +13,7 @@ galaxdb-versioning.workspace = true
 galaxdb-vector = { path = "../galaxdb-vector" }
 galaxdb-sidecar = { path = "../galaxdb-sidecar" }
 galaxdb-auth = { path = "../galaxdb-auth" }
+galaxdb-backup = { path = "../galaxdb-backup" }
 sqlparser.workspace = true
 xxhash-rust.workspace = true
 tracing.workspace = true

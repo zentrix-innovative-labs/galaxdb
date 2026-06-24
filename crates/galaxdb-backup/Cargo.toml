@@ -1,0 +1,22 @@
+[package]
+name = "galaxdb-backup"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Backup/restore object-store abstraction: local FS + S3/GCS/Azure over REST (no vendor SDKs)"
+
+[dependencies]
+galaxdb-common.workspace = true
+# Blocking HTTP with rustls (no OpenSSL). Used for the S3/GCS/Azure REST calls.
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+# Cloud request signing (SigV4 / Azure SharedKey) — pure Rust, no vendor SDKs.
+hmac.workspace = true
+sha2.workspace = true
+base64.workspace = true
+url = "2"
+serde_json.workspace = true
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

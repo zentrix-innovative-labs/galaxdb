@@ -1474,6 +1474,29 @@ fn exec_analyze(table: &str, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteRe
 /// the default 64 MB seal threshold, but real timings are exercised
 /// by the storage-crate tests rather than asserted here.
 fn exec_backup(path: &str, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteResult> {
+    // Object-store target (s3://, gs://, az://): back up to a local staging
+    // directory first (reusing the engine's flush + checksum-clean file set),
+    // then upload every file to the store. Credentials are sourced from the
+    // environment by the store and never logged.
+    if galaxdb_backup::is_object_store_url(path) {
+        let store = galaxdb_backup::object_store_for_target(path)?;
+        let staging = backup_staging_dir();
+        let _ = std::fs::remove_dir_all(&staging);
+        let copied = ctx.engine.backup_to_sync(&staging);
+        let result = copied.and_then(|files| {
+            let uploaded = galaxdb_backup::upload_dir(store.as_ref(), &staging)?;
+            Ok((files.len(), uploaded.len()))
+        });
+        let _ = std::fs::remove_dir_all(&staging);
+        let (_local, uploaded) = result?;
+        return Ok(ExecuteResult::Ok(format!(
+            "BACKUP TO '{}': {} files uploaded to {} object store",
+            path,
+            uploaded,
+            store.scheme()
+        )));
+    }
+
     let target = std::path::PathBuf::from(path);
     let copied = ctx.engine.backup_to_sync(&target)?;
 
@@ -1482,6 +1505,19 @@ fn exec_backup(path: &str, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteResu
         path,
         copied.len()
     )))
+}
+
+/// A unique local staging directory for an object-store backup/restore.
+fn backup_staging_dir() -> std::path::PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "galaxdb_backup_{}_{}",
+        std::process::id(),
+        nanos
+    ))
 }
 
 /// RESTORE FROM '/path' (Req 27 / task 37.4–37.5).
@@ -1494,9 +1530,35 @@ fn exec_backup(path: &str, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteResu
 /// reopen the engine after a successful RESTORE so that WAL replay
 /// and ART rebuild pick up the newly-copied files.
 fn exec_restore(path: &str, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteResult> {
-    let source = std::path::PathBuf::from(path);
     let target = ctx.engine.data_dir().to_path_buf();
 
+    // Object-store source: download every backup object into a local staging
+    // directory, then validate + restore from it exactly as for a local path
+    // (so the checksum-abort-on-corruption guarantee is preserved).
+    if galaxdb_backup::is_object_store_url(path) {
+        let store = galaxdb_backup::object_store_for_target(path)?;
+        let staging = backup_staging_dir();
+        let _ = std::fs::remove_dir_all(&staging);
+        let outcome = (|| {
+            galaxdb_backup::download_dir(store.as_ref(), &staging)?;
+            let (sst_count, block_count) = Engine::validate_backup(&staging)?;
+            let copied = Engine::restore_from(&staging, &target)?;
+            Ok::<_, GalaxError>((copied.len(), sst_count, block_count))
+        })();
+        let _ = std::fs::remove_dir_all(&staging);
+        let (copied, sst_count, block_count) = outcome?;
+        return Ok(ExecuteResult::Ok(format!(
+            "RESTORE FROM '{}': {} files restored from {} object store \
+             ({} SSTs / {} blocks validated). Reopen the engine to complete WAL replay.",
+            path,
+            copied,
+            store.scheme(),
+            sst_count,
+            block_count
+        )));
+    }
+
+    let source = std::path::PathBuf::from(path);
     let (sst_count, block_count) = Engine::validate_backup(&source)?;
     let copied = Engine::restore_from(&source, &target)?;
 
