@@ -194,7 +194,39 @@ impl Database {
             ..Default::default()
         };
         let engine = Engine::new(config)?;
-        Ok(Self {
+        Ok(Self::from_engine(path, engine))
+    }
+
+    /// Open (or create) a database applying auto-tuned sizes (Req 12).
+    ///
+    /// `memtable_size_bytes` and `sst_cache_bytes` are the values the
+    /// server derived from the host (or that the operator overrode); they
+    /// replace the static [`EngineConfig`] defaults so the running engine
+    /// actually uses the tuned configuration. Every other field keeps its
+    /// default (including the embedded-mode `wal_group_commit_ms = 1`).
+    pub fn open_with_tuning(
+        path: &str,
+        memtable_size_bytes: u64,
+        sst_cache_bytes: u64,
+    ) -> GalaxResult<Self> {
+        let path = PathBuf::from(path);
+        std::fs::create_dir_all(&path)?;
+        let config = EngineConfig {
+            data_dir: path.clone(),
+            wal_group_commit_ms: 1,
+            memtable_size_bytes,
+            sst_cache_bytes,
+            ..Default::default()
+        };
+        let engine = Engine::new(config)?;
+        Ok(Self::from_engine(path, engine))
+    }
+
+    /// Assemble a [`Database`] around an already-opened engine. Shared by
+    /// [`open`](Self::open) and [`open_with_tuning`](Self::open_with_tuning)
+    /// so the handle's auxiliary state is constructed in exactly one place.
+    fn from_engine(path: PathBuf, engine: Engine) -> Self {
+        Self {
             path,
             engine: Arc::new(engine),
             sidecar: None,
@@ -205,7 +237,7 @@ impl Database {
             session: None,
             audit: None,
             stmt_cache: Mutex::new(galaxdb_sql::StatementCache::new(256)),
-        })
+        }
     }
 
     /// Open a database with an embedding sidecar attached.
@@ -226,13 +258,24 @@ impl Database {
         model_id: &str,
     ) -> GalaxResult<Self> {
         let mut db = Self::open(path)?;
+        db.attach_sidecar(sidecar_binary, model_id)?;
+        Ok(db)
+    }
 
-        let socket_path = db.path.join("sidecar.sock");
+    /// Attach an embedding sidecar to an already-open handle.
+    ///
+    /// Extracted from [`open_with_sidecar`](Self::open_with_sidecar) so the
+    /// auto-tuned open path can reuse it without duplicating the sidecar
+    /// boot + socket-wait logic. There is no mock fallback — every
+    /// embedding is computed by the real model, and a sidecar that fails to
+    /// come up surfaces a typed error.
+    pub fn attach_sidecar(&mut self, sidecar_binary: &str, model_id: &str) -> GalaxResult<()> {
+        let socket_path = self.path.join("sidecar.sock");
         let sidecar_config = SidecarConfig {
             binary_path: PathBuf::from(sidecar_binary),
             socket_path: socket_path.clone(),
             model_id: model_id.to_string(),
-            data_dir: db.path.clone(),
+            data_dir: self.path.clone(),
         };
 
         let mgr = SidecarManager::new(sidecar_config);
@@ -253,8 +296,8 @@ impl Database {
             ));
         }
 
-        db.sidecar = Some(Arc::new(mgr));
-        Ok(db)
+        self.sidecar = Some(Arc::new(mgr));
+        Ok(())
     }
 
     /// Attach an authenticated session to this database handle so every

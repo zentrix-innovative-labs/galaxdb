@@ -25,6 +25,10 @@ tokio = { workspace = true, features = ["full", "signal"] }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tempfile = { workspace = true }
+# Auto-tune host probe (Req 12): total RAM. CPU count comes from std
+# (`std::thread::available_parallelism`). Minimal feature set — only the
+# system/memory probe, no processes/disks/networks/components collectors.
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tokio-postgres = "0.7"

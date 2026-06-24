@@ -21,6 +21,8 @@ use galaxdb_wire::messages::*;
 use galaxdb_wire::pg_catalog;
 use galaxdb_wire::tls::{self, Prologue, ReexportedTlsAcceptor as TlsAcceptor, TlsMode};
 
+pub mod tuning;
+
 /// Server configuration.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
@@ -78,6 +80,11 @@ pub struct ServerConfig {
     /// role/grant/DDL changes via a [`galaxdb_auth::FileAuditSink`]. When
     /// `None`, audit events are discarded (no-op).
     pub audit_log_path: Option<String>,
+    /// Auto-tuned configuration (Req 12). At startup the server probes the
+    /// host (RAM + CPU) and derives buffer-pool / memtable / compaction
+    /// concurrency, unless an explicit override is set here. Defaults to
+    /// auto-tune enabled with no overrides.
+    pub auto_tune: galaxdb_common::AutoTuneConfig,
 }
 
 impl Default for ServerConfig {
@@ -95,6 +102,7 @@ impl Default for ServerConfig {
             tls_cert_path: None,
             tls_key_path: None,
             audit_log_path: None,
+            auto_tune: galaxdb_common::AutoTuneConfig::default(),
         }
     }
 }
@@ -161,11 +169,30 @@ pub async fn start(
         None => Arc::new(NoOpAuditSink),
     };
 
+    // Task 15 (Req 12): probe the host and resolve the effective auto-tune
+    // configuration, then log it with the source of each value (auto-derived
+    // vs overridden vs static-default). The derived buffer-pool and memtable
+    // sizes are applied to the engine via open_with_tuning. The
+    // compaction-concurrency value is reported for operator visibility; the
+    // OSS engine does not yet run a background compaction driver that would
+    // consume it (tracked in docs/CONSOLIDATION.md), so it is surfaced but
+    // not yet wired to a runtime compactor.
+    let tuning = tuning::resolve_tuning(&config.auto_tune);
+    tracing::info!("{}", tuning.describe());
+    let memtable_bytes = tuning.memtable_size_bytes.value;
+    let sst_cache_bytes = tuning.buffer_pool_bytes.value;
+
     let db = Arc::new(RwLock::new(
         // Task 40.1: spawn sidecar when configured. The sidecar binary
         // and model id are optional — scalar SQL works without them.
         {
-            let base = if let (Some(sidecar_bin), Some(model)) = (
+            let mut base = Database::open_with_tuning(
+                &config.data_dir,
+                memtable_bytes,
+                sst_cache_bytes,
+            )
+            .expect("failed to open database");
+            if let (Some(sidecar_bin), Some(model)) = (
                 config.sidecar_binary.as_deref(),
                 config.model_id.as_deref(),
             ) {
@@ -174,11 +201,9 @@ pub async fn start(
                     model = %model,
                     "opening database with embedding sidecar"
                 );
-                Database::open_with_sidecar(&config.data_dir, sidecar_bin, model)
-                    .expect("failed to open database with sidecar")
-            } else {
-                Database::open(&config.data_dir).expect("failed to open database")
-            };
+                base.attach_sidecar(sidecar_bin, model)
+                    .expect("failed to attach embedding sidecar");
+            }
             // Attach the audit sink so the executor records authz denials
             // and role/grant/DDL changes (Req 4).
             base.with_audit_sink(audit_sink.clone())

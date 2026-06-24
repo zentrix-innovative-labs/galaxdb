@@ -88,6 +88,25 @@ async fn main() {
         .and_then(|i| std::env::args().nth(i + 1))
         .or_else(|| std::env::var("GALAXDB_AUDIT_LOG").ok());
 
+    // Task 15 (Req 12): auto-tune is on by default. Operators can disable it
+    // with GALAXDB_AUTOTUNE=off, or override any single derived value with
+    // GALAXDB_BUFFER_POOL_BYTES / GALAXDB_MEMTABLE_BYTES /
+    // GALAXDB_COMPACTION_CONCURRENCY (an explicit value always wins, AC2).
+    let auto_tune = {
+        let enabled = std::env::var("GALAXDB_AUTOTUNE")
+            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "false"))
+            .unwrap_or(true);
+        let parse_u64 = |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<u64>().ok());
+        let parse_usize =
+            |k: &str| std::env::var(k).ok().and_then(|v| v.trim().parse::<usize>().ok());
+        galaxdb_common::AutoTuneConfig {
+            enabled,
+            buffer_pool_bytes: parse_u64("GALAXDB_BUFFER_POOL_BYTES"),
+            memtable_size_bytes: parse_u64("GALAXDB_MEMTABLE_BYTES"),
+            compaction_concurrency: parse_usize("GALAXDB_COMPACTION_CONCURRENCY"),
+        }
+    };
+
     let cfg = ServerConfig {
         bind_addr: format!("0.0.0.0:{port}"),
         data_dir,
@@ -103,6 +122,7 @@ async fn main() {
         tls_cert_path,
         tls_key_path,
         audit_log_path,
+        auto_tune,
     };
 
     // Task 40.1: start the HTTP observability server (/health + /metrics)
