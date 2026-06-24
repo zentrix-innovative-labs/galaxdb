@@ -142,6 +142,14 @@ pub enum GalaxError {
     },
 
     // -- Generic catch-all --
+    /// A SQL feature the engine does not support (by design, not merely
+    /// "not yet"). GalaxDB's SQL surface is single-table scans with `WHERE`
+    /// filters plus vector search; JOINs, `GROUP BY`/aggregates, `HAVING`,
+    /// `DISTINCT`, set operations, and subqueries are rejected with this
+    /// typed error rather than silently mis-executed.
+    #[error("feature not supported: {0}")]
+    FeatureNotSupported(String),
+
     /// An internal error that doesn't fit other categories.
     #[error("internal error: {0}")]
     Internal(String),
@@ -175,6 +183,7 @@ impl GalaxError {
             // Class 0A — feature not supported.
             GalaxError::SemanticSnapshotNotSupported
             | GalaxError::SemanticConsistencyRequired
+            | GalaxError::FeatureNotSupported(_)
             | GalaxError::NotYetAvailable { .. } => "0A000", // feature_not_supported
 
             // Class 42 — restricted/generated column update (the embedding

@@ -1010,6 +1010,7 @@ impl Database {
         q: &sqlparser::ast::Query,
         session: Option<&galaxdb_auth::SessionContext>,
     ) -> GalaxResult<QueryResult> {
+        check_select_supported(q)?;
         // Detect SEMANTIC_MATCH in WHERE and route to vector search.
         if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
             let table = extract_table(q);
@@ -1367,6 +1368,7 @@ impl Database {
     }
 
     fn exec_select(&mut self, q: &sqlparser::ast::Query) -> GalaxResult<QueryResult> {
+        check_select_supported(q)?;
         let table = extract_table(q);
 
         // Detect SEMANTIC_MATCH(...) in the WHERE clause and route to
@@ -1425,6 +1427,7 @@ impl Database {
             ));
         };
 
+        check_select_supported(q)?;
         let table = extract_table(q);
         let (columns, filter) = extract_projection_and_filter(q);
         let plan = QueryPlan::FullScanAtVersion {
@@ -1464,6 +1467,7 @@ impl Database {
             ));
         };
 
+        check_select_supported(q)?;
         let table = extract_table(q);
         let (columns, filter) = extract_projection_and_filter(q);
         if table != "unknown" && !self.catalog.table_exists(&table) {
@@ -2352,6 +2356,79 @@ fn extract_table(q: &sqlparser::ast::Query) -> String {
     "unknown".to_string()
 }
 
+/// If `q` uses a SQL construct the engine does not execute, return a
+/// human-readable reason. GalaxDB's SQL surface is single-table scans with
+/// `WHERE` filters plus vector search; JOINs, set operations, subqueries in
+/// `FROM`, `GROUP BY`/aggregates, `HAVING`, and `DISTINCT` are not
+/// supported. Callers reject such queries with a typed error instead of
+/// silently scanning the first table and returning wrong results
+/// (engineering-principles §2 — no silent fallback).
+fn unsupported_select_reason(q: &sqlparser::ast::Query) -> Option<&'static str> {
+    use sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr};
+
+    let select = match q.body.as_ref() {
+        SetExpr::Select(s) => s,
+        SetExpr::Query(_) => return Some("subqueries"),
+        SetExpr::SetOperation { .. } => {
+            return Some("set operations (UNION/INTERSECT/EXCEPT)")
+        }
+        SetExpr::Values(_) => return Some("VALUES in SELECT position"),
+        _ => return Some("this query form"),
+    };
+
+    if select.from.len() > 1 {
+        return Some("comma-joined / multiple tables");
+    }
+    if let Some(t) = select.from.first() {
+        if !t.joins.is_empty() {
+            return Some("JOIN");
+        }
+    }
+    match &select.group_by {
+        GroupByExpr::Expressions(exprs, _) if !exprs.is_empty() => return Some("GROUP BY"),
+        GroupByExpr::All(_) => return Some("GROUP BY ALL"),
+        _ => {}
+    }
+    if select.having.is_some() {
+        return Some("HAVING");
+    }
+    if select.distinct.is_some() {
+        return Some("DISTINCT");
+    }
+    // Aggregate function calls in the projection (e.g. COUNT/SUM/AVG).
+    for item in &select.projection {
+        let expr = match item {
+            SelectItem::UnnamedExpr(e) => Some(e),
+            SelectItem::ExprWithAlias { expr, .. } => Some(expr),
+            _ => None,
+        };
+        if let Some(Expr::Function(f)) = expr {
+            let name = f.name.to_string().to_ascii_lowercase();
+            if matches!(
+                name.as_str(),
+                "count" | "sum" | "avg" | "min" | "max" | "array_agg" | "string_agg"
+                    | "stddev" | "variance" | "var_samp" | "var_pop"
+            ) {
+                return Some("aggregate functions");
+            }
+        }
+    }
+    None
+}
+
+/// Reject an unsupported `SELECT` with a typed, SQLSTATE-mapped error so a
+/// client sees a clear "feature not supported" instead of silently wrong
+/// rows. Used at every SELECT planning entry point.
+fn check_select_supported(q: &sqlparser::ast::Query) -> GalaxResult<()> {
+    if let Some(reason) = unsupported_select_reason(q) {
+        return Err(GalaxError::FeatureNotSupported(format!(
+            "{reason} not supported: GalaxDB executes single-table scans with WHERE \
+             filters and vector search; rewrite the query against one table"
+        )));
+    }
+    Ok(())
+}
+
 /// Extract the projection column list and the WHERE filter from a
 /// `SELECT` query. `SELECT *` / unsupported projection items yield
 /// an empty column list (which the executor interprets as "all
@@ -3172,6 +3249,36 @@ mod tests {
         db3.create_training_snapshot("snap", None).unwrap();
         let root3 = db3.tag_catalog.lock().unwrap().get_tag("snap").unwrap().root;
         assert_ne!(root1, root3, "different data must yield a different root");
+    }
+
+    #[test]
+    fn unsupported_select_constructs_are_rejected_not_silently_wrong() {
+        let mut db = test_db();
+        db.execute("CREATE TABLE a (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE b (id INT PRIMARY KEY, a_id INT)").unwrap();
+        db.execute("INSERT INTO a (id, name) VALUES (1, 'x')").unwrap();
+
+        // Each of these must error with a typed "not supported" — never
+        // silently scan one table and return wrong rows.
+        for sql in [
+            "SELECT a.name, b.id FROM a JOIN b ON a.id = b.a_id",
+            "SELECT a.id, b.id FROM a, b",
+            "SELECT COUNT(*) FROM a",
+            "SELECT name FROM a GROUP BY name",
+            "SELECT DISTINCT name FROM a",
+            "SELECT id FROM a UNION SELECT id FROM b",
+        ] {
+            let err = db.execute(sql).unwrap_err();
+            assert!(
+                matches!(err, GalaxError::FeatureNotSupported(_)),
+                "query {sql:?} should be FeatureNotSupported, got {err:?}"
+            );
+            assert_eq!(err.sqlstate(), "0A000");
+        }
+
+        // A plain single-table scan + WHERE still works.
+        let ok = db.execute("SELECT id, name FROM a WHERE id = 1").unwrap();
+        assert!(matches!(ok, QueryResult::Rows { .. }));
     }
 
     /// End-to-end SEMANTIC_MATCH test using the real model. Gated behind
