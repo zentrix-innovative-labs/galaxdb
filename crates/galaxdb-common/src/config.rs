@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::autotune::AutoTuneConfig;
+
 /// Top-level GalaxDB engine configuration.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GalaxConfig {
@@ -19,6 +21,9 @@ pub struct GalaxConfig {
     pub observe: ObserveConfig,
     /// Embedding sidecar settings.
     pub sidecar: SidecarConfig,
+    /// Auto-tuned configuration (buffer pool / memtable / compaction concurrency).
+    #[serde(default)]
+    pub auto_tune: AutoTuneConfig,
 }
 
 /// Storage engine configuration.
