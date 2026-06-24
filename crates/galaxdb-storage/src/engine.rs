@@ -840,7 +840,14 @@ impl Engine {
         &self,
         key_prefix: Option<&[u8]>,
     ) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let mut out: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
+        // Track the per-key winning version with its MVCC timestamp so that
+        // when the same key appears in multiple SST blocks (e.g. an update
+        // flushed after the original insert, before they are compacted) the
+        // newest version wins regardless of the registry's iteration order.
+        let mut out: HashMap<Vec<u8>, (Vec<u8>, Timestamp)> = HashMap::new();
+        // Keys whose newest visible version is a tombstone — kept so a later
+        // (older-ts) block cannot resurrect a deleted key.
+        let mut tombstoned: HashMap<Vec<u8>, Timestamp> = HashMap::new();
 
         if let Ok(registry) = self.sst_registry.read() {
             for (_sst_id, entry) in registry.entries.iter() {
@@ -874,6 +881,7 @@ impl Engine {
                         }
                     }
 
+                    let header_ts = block.header.commit_timestamp;
                     let keys = match block.read_column(0) {
                         Ok(v) => v,
                         Err(_) => continue,
@@ -882,21 +890,46 @@ impl Engine {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    for (k, v) in keys.into_iter().zip(vals) {
+                    let row_ts: Vec<Timestamp> = if block.header.column_count >= 3 {
+                        match block.read_column(crate::flush::ROW_TS_COLUMN) {
+                            Ok(col) => col
+                                .iter()
+                                .map(|b| crate::flush::decode_row_ts(b).unwrap_or(header_ts))
+                                .collect(),
+                            Err(_) => vec![header_ts; keys.len()],
+                        }
+                    } else {
+                        vec![header_ts; keys.len()]
+                    };
+                    for (idx, (k, v)) in keys.into_iter().zip(vals).enumerate() {
                         if let Some(prefix) = key_prefix {
                             if !k.starts_with(prefix) {
                                 continue;
                             }
                         }
+                        let ts = row_ts.get(idx).copied().unwrap_or(header_ts);
+                        // A newer version (live or tombstone) for this key
+                        // always wins over an older one.
+                        let live_ts = out.get(&k).map(|(_, t)| *t);
+                        let tomb_ts = tombstoned.get(&k).copied();
+                        let newest_seen = live_ts.max(tomb_ts).unwrap_or(0);
+                        if ts < newest_seen {
+                            continue;
+                        }
                         if v.is_empty() {
                             out.remove(&k);
+                            tombstoned.insert(k, ts);
                         } else {
-                            out.insert(k, v);
+                            tombstoned.remove(&k);
+                            out.insert(k, (v, ts));
                         }
                     }
                 }
             }
         }
+
+        let mut out: HashMap<Vec<u8>, Vec<u8>> =
+            out.into_iter().map(|(k, (v, _))| (k, v)).collect();
 
         let active = self.memtable_mgr.active();
         let mem_entries = match key_prefix {
@@ -907,6 +940,8 @@ impl Engine {
             Some(prefix) => active.iter_prefix(prefix),
             None => active.iter_all(),
         };
+        // The active memtable always holds versions newer than any SST, so
+        // its entries override the SST-resolved values unconditionally.
         for (key, versioned) in mem_entries {
             match versioned.value {
                 Some(v) => {
@@ -969,8 +1004,13 @@ impl Engine {
                         Ok(b) => b,
                         Err(_) => continue,
                     };
-                    let block_ts = block.header.commit_timestamp;
-                    if block_ts > read_ts {
+                    let header_ts = block.header.commit_timestamp;
+                    // Block-level fast skip: the header timestamp is the
+                    // newest MVCC commit in the block, so if it is already
+                    // beyond the snapshot, no row in the block is visible.
+                    if header_ts > read_ts && block.header.column_count < 3 {
+                        // Legacy 2-column block carries no per-row timestamps;
+                        // the header is the only timestamp, so skip wholesale.
                         continue;
                     }
                     let keys = match block.read_column(0) {
@@ -981,14 +1021,32 @@ impl Engine {
                         Ok(v) => v,
                         Err(_) => continue,
                     };
-                    for (k, v) in keys.into_iter().zip(vals) {
-                        // Merge by taking the latest visible version.
+                    // Per-row MVCC timestamps (column 2) when present; legacy
+                    // two-column blocks fall back to the block header ts.
+                    let row_ts: Vec<Timestamp> = if block.header.column_count >= 3 {
+                        match block.read_column(crate::flush::ROW_TS_COLUMN) {
+                            Ok(col) => col
+                                .iter()
+                                .map(|b| crate::flush::decode_row_ts(b).unwrap_or(header_ts))
+                                .collect(),
+                            Err(_) => vec![header_ts; keys.len()],
+                        }
+                    } else {
+                        vec![header_ts; keys.len()]
+                    };
+                    for (idx, (k, v)) in keys.into_iter().zip(vals).enumerate() {
+                        let ts = row_ts.get(idx).copied().unwrap_or(header_ts);
+                        // Rows committed after the snapshot are invisible.
+                        if ts > read_ts {
+                            continue;
+                        }
+                        // Merge by taking the latest visible version per key.
                         let existing_ts = out.get(&k).map(|(_, ts)| *ts).unwrap_or(0);
-                        if block_ts >= existing_ts {
+                        if ts >= existing_ts {
                             if v.is_empty() {
                                 out.remove(&k);
                             } else {
-                                out.insert(k, (v, block_ts));
+                                out.insert(k, (v, ts));
                             }
                         }
                     }
@@ -1315,8 +1373,11 @@ pub fn decode_kv(payload: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
 /// One key's version history read out of the input SSTs: `(timestamp,
 /// value-or-tombstone)` pairs, oldest first after sorting.
 type VersionList = Vec<(Timestamp, Option<Vec<u8>>)>;
-/// A single row queued for an output bucket: `(key, value-or-tombstone)`.
-type BucketRow = (Vec<u8>, Option<Vec<u8>>);
+/// A surviving row queued for output: `(key, mvcc_timestamp,
+/// value-or-tombstone)`. Multiple versions of one key (latest + pinned)
+/// appear as separate rows; per-row timestamps are written to the SST's
+/// timestamp column so one block can hold rows committed at different times.
+type SurvivorRow = (Vec<u8>, Timestamp, Option<Vec<u8>>);
 
 /// One output SST produced by compaction: its raw on-disk bytes and the ART
 /// relocation targets for the rows that are the *latest* version of their
@@ -1347,14 +1408,18 @@ fn compaction_encrypt(bytes: &[u8], _tde: Option<&()>) -> GalaxResult<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-/// Build the output SST(s) for a single timestamp bucket. All rows in the
-/// bucket committed at `commit_ts`; they are packed into PAX blocks
-/// (≤ `max_rows_per_block` rows each) and SST files (≤ `sst_size_bytes`),
-/// exactly as the flush pipeline does, so the read path is unchanged.
+/// Build the output SST(s) for one contiguous run of surviving rows
+/// (sorted by key, then timestamp). Rows are packed into PAX blocks
+/// (≤ `max_rows_per_block` each) and SST files (≤ `sst_size_bytes`) using
+/// the same three-column format the flush pipeline writes (key, value,
+/// per-row MVCC timestamp), so the read path is identical. A single block
+/// can hold rows committed at different timestamps because visibility is
+/// resolved per row from the timestamp column. The block header timestamp
+/// is the newest row in the block (a real MVCC value), used as a fast
+/// upper bound on reads.
 #[allow(clippy::too_many_arguments)]
-fn build_bucket(
-    commit_ts: Timestamp,
-    rows: &[BucketRow],
+fn build_run(
+    rows: &[SurvivorRow],
     latest_ts: &HashMap<Vec<u8>, Timestamp>,
     sst_size_bytes: u64,
     max_rows_per_block: usize,
@@ -1379,19 +1444,24 @@ fn build_bucket(
 
         let mut key_col: Vec<Vec<u8>> = Vec::with_capacity(chunk.len());
         let mut val_col: Vec<Vec<u8>> = Vec::with_capacity(chunk.len());
-        for (k, v) in chunk {
+        let mut ts_col: Vec<Vec<u8>> = Vec::with_capacity(chunk.len());
+        let mut block_max_ts: Timestamp = 0;
+        for (k, ts, v) in chunk {
             key_col.push(k.clone());
             val_col.push(v.clone().unwrap_or_default());
+            ts_col.push(ts.to_le_bytes().to_vec());
+            block_max_ts = block_max_ts.max(*ts);
         }
         let cols = vec![
             ColumnData { col_type: ColumnType::Blob, values: key_col },
             ColumnData { col_type: ColumnType::Blob, values: val_col },
+            ColumnData { col_type: ColumnType::Blob, values: ts_col },
         ];
         let pax = PaxBlock::write_with_codecs(
             block_id,
-            commit_ts,
+            block_max_ts,
             &cols,
-            &[CodecId::Zstd, CodecId::None],
+            &[CodecId::Zstd, CodecId::None, CodecId::None],
         )?;
         block_id += 1;
         let block_bytes = pax.serialize()?;
@@ -1402,8 +1472,11 @@ fn build_bucket(
 
         let offset = cur_data.len() as u64;
         cur_index.add_block(offset, enc.len() as u32);
-        for (row_off, (k, _)) in chunk.iter().enumerate() {
-            if latest_ts.get(k) == Some(&commit_ts) {
+        // Only the latest version of each key gets an ART entry; an older
+        // pinned version of the same key (also in this run) is reachable
+        // only through scan_all_at.
+        for (row_off, (k, ts, _)) in chunk.iter().enumerate() {
+            if latest_ts.get(k) == Some(ts) {
                 cur_targets.push((k.clone(), cur_block_count, row_off as u32));
             }
         }
@@ -1555,7 +1628,7 @@ impl Engine {
                     Ok(b) => b,
                     Err(_) => continue,
                 };
-                let ts = block.header.commit_timestamp;
+                let header_ts = block.header.commit_timestamp;
                 let keys = match block.read_column(0) {
                     Ok(v) => v,
                     Err(_) => continue,
@@ -1564,7 +1637,21 @@ impl Engine {
                     Ok(v) => v,
                     Err(_) => continue,
                 };
-                for (k, v) in keys.into_iter().zip(vals) {
+                // Per-row MVCC timestamps (column 2) when present; legacy
+                // two-column SSTs fall back to the block header timestamp.
+                let row_ts: Vec<Timestamp> = if block.header.column_count >= 3 {
+                    match block.read_column(crate::flush::ROW_TS_COLUMN) {
+                        Ok(col) => col
+                            .iter()
+                            .map(|b| crate::flush::decode_row_ts(b).unwrap_or(header_ts))
+                            .collect(),
+                        Err(_) => vec![header_ts; keys.len()],
+                    }
+                } else {
+                    vec![header_ts; keys.len()]
+                };
+                for (idx, (k, v)) in keys.into_iter().zip(vals).enumerate() {
+                    let ts = row_ts.get(idx).copied().unwrap_or(header_ts);
                     versions
                         .entry(k)
                         .or_default()
@@ -1589,15 +1676,15 @@ impl Engine {
         pins.sort_unstable();
         pins.dedup();
 
-        let mut buckets: BTreeMap<Timestamp, Vec<BucketRow>> = BTreeMap::new();
+        let mut survivors: Vec<SurvivorRow> = Vec::new();
         let mut latest_ts: HashMap<Vec<u8>, Timestamp> = HashMap::new();
         let mut keys_retained = 0usize;
         let mut versions_gc_dropped = 0usize;
 
         for (key, mut vers) in versions {
             vers.sort_by_key(|(ts, _)| *ts);
-            // Collapse duplicate timestamps (last wins) — defensive; flush
-            // gives each SST a distinct commit ts.
+            // Collapse duplicate timestamps (last wins) — defensive; each
+            // write gets a distinct MVCC timestamp.
             vers.dedup_by_key(|(ts, _)| *ts);
             let n = vers.len();
             let latest_idx = n - 1;
@@ -1621,31 +1708,32 @@ impl Engine {
             latest_ts.insert(key.clone(), vers[latest_idx].0);
             for (i, (ts, val)) in vers.into_iter().enumerate() {
                 if keep[i] {
-                    buckets.entry(ts).or_default().push((key.clone(), val));
+                    survivors.push((key.clone(), ts, val));
                 } else {
                     versions_gc_dropped += 1;
                 }
             }
         }
 
-        // Keys within each bucket must be sorted (read path + zone maps
-        // assume ascending key order within a block).
-        for rows in buckets.values_mut() {
-            rows.sort_by(|a, b| a.0.cmp(&b.0));
-        }
+        // Sort by (key, then timestamp) so each output block holds ascending
+        // keys (the read path + zone maps assume this); multiple kept
+        // versions of one key sit adjacently. Per-row timestamps live in the
+        // SST timestamp column, so one block can hold rows committed at
+        // different times — no need to split output by timestamp.
+        survivors.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
 
-        // 4. Build the output SSTs, fanning the timestamp buckets across
-        //    `compaction_concurrency` worker threads (the Req 12 knob).
-        let bucket_vec: Vec<(Timestamp, Vec<BucketRow>)> = buckets.into_iter().collect();
+        // 4. Build the output SSTs, splitting the sorted survivor run across
+        //    `compaction_concurrency` worker threads (the Req 12 knob). Each
+        //    worker owns a contiguous slice, so their outputs never conflict.
         let mut all_outputs: Vec<CompactionOutput> = Vec::new();
 
-        if !bucket_vec.is_empty() {
+        if !survivors.is_empty() {
             let n_workers = self
                 .config
                 .compaction_concurrency
                 .max(1)
-                .min(bucket_vec.len());
-            let chunk_size = bucket_vec.len().div_ceil(n_workers).max(1);
+                .min(survivors.len());
+            let chunk_size = survivors.len().div_ceil(n_workers).max(1);
             let latest_ref = &latest_ts;
             let sst_size = self.config.sst_size_bytes;
             let max_rows = self.config.max_rows_per_sst;
@@ -1654,26 +1742,18 @@ impl Engine {
 
             std::thread::scope(|scope| -> GalaxResult<()> {
                 let mut handles = Vec::new();
-                for chunk in bucket_vec.chunks(chunk_size) {
+                for chunk in survivors.chunks(chunk_size) {
                     #[cfg(feature = "aegis-tde")]
                     let tde_arc = tde_arc.clone();
                     let handle = scope.spawn(move || -> GalaxResult<Vec<CompactionOutput>> {
-                        let mut local = Vec::new();
-                        for (ts, rows) in chunk {
-                            #[cfg(feature = "aegis-tde")]
-                            let outs = build_bucket(
-                                *ts,
-                                rows,
-                                latest_ref,
-                                sst_size,
-                                max_rows,
-                                tde_arc.as_deref(),
-                            )?;
-                            #[cfg(not(feature = "aegis-tde"))]
-                            let outs = build_bucket(*ts, rows, latest_ref, sst_size, max_rows)?;
-                            local.extend(outs);
+                        #[cfg(feature = "aegis-tde")]
+                        {
+                            build_run(chunk, latest_ref, sst_size, max_rows, tde_arc.as_deref())
                         }
-                        Ok(local)
+                        #[cfg(not(feature = "aegis-tde"))]
+                        {
+                            build_run(chunk, latest_ref, sst_size, max_rows)
+                        }
                     });
                     handles.push(handle);
                 }

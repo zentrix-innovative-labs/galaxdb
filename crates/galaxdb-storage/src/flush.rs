@@ -156,15 +156,20 @@ pub fn decrypt_block_data(
 
 /// Convert memtable entries into columnar ColumnData for PAX block writing.
 ///
-/// For v1, each row is treated as having two columns:
-/// - Column 0: key (Blob type)
-/// - Column 1: value (Blob type)
+/// Each row is stored as three columns:
+/// - Column 0: key (Blob)
+/// - Column 1: value (Blob; empty for a tombstone)
+/// - Column 2: the row's MVCC commit timestamp (Blob, 8-byte little-endian)
 ///
-/// Tombstones (entries where the latest value is `None`) are stored with
-/// an empty value column to preserve the deletion marker in the SST.
+/// The per-row timestamp column is what makes `AT VERSION <ts>` correct at
+/// an arbitrary snapshot: a single flush packs rows committed at different
+/// MVCC timestamps into one block, so a single block-level timestamp cannot
+/// express per-row visibility. Readers that predate this column (legacy
+/// two-column SSTs) fall back to the block header's `commit_timestamp`.
 fn entries_to_columns(entries: &[(Vec<u8>, VersionedValue)]) -> Vec<ColumnData> {
     let mut key_values: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
     let mut val_values: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
+    let mut ts_values: Vec<Vec<u8>> = Vec::with_capacity(entries.len());
 
     for (key, versioned) in entries {
         key_values.push(key.clone());
@@ -172,6 +177,7 @@ fn entries_to_columns(entries: &[(Vec<u8>, VersionedValue)]) -> Vec<ColumnData> 
         // The actual tombstone semantics are tracked by the version chain;
         // at the SST level we just need the key present.
         val_values.push(versioned.value.clone().unwrap_or_default());
+        ts_values.push(versioned.timestamp.to_le_bytes().to_vec());
     }
 
     vec![
@@ -183,7 +189,27 @@ fn entries_to_columns(entries: &[(Vec<u8>, VersionedValue)]) -> Vec<ColumnData> 
             col_type: ColumnType::Blob,
             values: val_values,
         },
+        ColumnData {
+            col_type: ColumnType::Blob,
+            values: ts_values,
+        },
     ]
+}
+
+/// The per-row MVCC timestamp column index in an SST PAX block written by
+/// [`entries_to_columns`]. Blocks with fewer columns are legacy two-column
+/// SSTs and fall back to the block header timestamp.
+pub const ROW_TS_COLUMN: usize = 2;
+
+/// Decode a row's MVCC commit timestamp from the 8-byte little-endian
+/// encoding written into [`ROW_TS_COLUMN`]. A malformed or short value
+/// yields `None` so the caller can fall back to the block header.
+pub fn decode_row_ts(bytes: &[u8]) -> Option<Timestamp> {
+    if bytes.len() == 8 {
+        Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    } else {
+        None
+    }
 }
 
 /// Split sorted entries into chunks that respect the SST size target.
@@ -328,8 +354,19 @@ async fn flush_memtable_inner(
         // Create the PAX block with KV-optimized codecs:
         // Key column (0): Zstd — keys are small, compression helps.
         // Value column (1): None — uncompressed for fast single-row reads.
-        let kv_codecs = [CodecId::Zstd, CodecId::None];
-        let pax_block = PaxBlock::write_with_codecs(block_id, commit_timestamp, &columns, &kv_codecs)?;
+        // Timestamp column (2): None — fixed 8-byte values.
+        let kv_codecs = [CodecId::Zstd, CodecId::None, CodecId::None];
+        // The block header timestamp is the newest MVCC commit in this
+        // block (a real row timestamp, not a flush sequence number). Per-row
+        // visibility comes from the timestamp column; the header is a fast
+        // upper bound and the legacy fallback. `commit_timestamp` (the flush
+        // argument) is used only when a chunk somehow has no rows.
+        let block_ts = chunk
+            .iter()
+            .map(|(_, v)| v.timestamp)
+            .max()
+            .unwrap_or(commit_timestamp);
+        let pax_block = PaxBlock::write_with_codecs(block_id, block_ts, &columns, &kv_codecs)?;
         let block_bytes = pax_block.serialize()?;
         let encrypted_bytes = encrypt_block_data(&block_bytes, tde)?;
 
@@ -444,8 +481,13 @@ async fn flush_memtable_inner(
         let block_id = allocate_block_id();
         let columns = entries_to_columns(chunk);
 
-        let kv_codecs = [CodecId::Zstd, CodecId::None];
-        let pax_block = PaxBlock::write_with_codecs(block_id, commit_timestamp, &columns, &kv_codecs)?;
+        let kv_codecs = [CodecId::Zstd, CodecId::None, CodecId::None];
+        let block_ts = chunk
+            .iter()
+            .map(|(_, v)| v.timestamp)
+            .max()
+            .unwrap_or(commit_timestamp);
+        let pax_block = PaxBlock::write_with_codecs(block_id, block_ts, &columns, &kv_codecs)?;
         let block_bytes = pax_block.serialize()?;
 
         let block_file_offset = current_sst_data.len() as u64;
@@ -625,16 +667,27 @@ mod tests {
                 let block = PaxBlock::deserialize(block_bytes)
                     .expect("each block in SST should be a valid PAX block");
 
-                // Verify block metadata
-                assert_eq!(block.header.commit_timestamp, 42);
-                assert_eq!(block.header.column_count, 2); // key + value columns
+                // Verify block metadata. The header timestamp is now the
+                // newest MVCC commit in the block (real row timestamps
+                // 1..=100), not the flush argument (42).
+                assert_eq!(block.header.column_count, 3); // key + value + ts
                 assert!(block.header.row_count > 0);
 
                 // Verify we can read back the columns
                 let keys = block.read_column(0).unwrap();
                 let values = block.read_column(1).unwrap();
+                let timestamps = block.read_column(2).unwrap();
                 assert_eq!(keys.len(), block.header.row_count as usize);
                 assert_eq!(values.len(), block.header.row_count as usize);
+                assert_eq!(timestamps.len(), block.header.row_count as usize);
+
+                // The header timestamp equals the max per-row timestamp.
+                let max_ts = timestamps
+                    .iter()
+                    .map(|b| super::decode_row_ts(b).unwrap())
+                    .max()
+                    .unwrap();
+                assert_eq!(block.header.commit_timestamp, max_ts);
 
                 // Verify keys are sorted
                 for window in keys.windows(2) {
@@ -968,7 +1021,7 @@ mod tests {
         ];
 
         let columns = entries_to_columns(&entries);
-        assert_eq!(columns.len(), 2);
+        assert_eq!(columns.len(), 3);
 
         // Key column
         assert_eq!(columns[0].col_type, ColumnType::Blob);
@@ -983,5 +1036,12 @@ mod tests {
         assert_eq!(columns[1].values[0], b"val-a");
         assert!(columns[1].values[1].is_empty()); // tombstone → empty
         assert_eq!(columns[1].values[2], b"val-c");
+
+        // Timestamp column (2): per-row MVCC commit timestamps, 8-byte LE.
+        assert_eq!(columns[2].col_type, ColumnType::Blob);
+        assert_eq!(columns[2].values.len(), 3);
+        assert_eq!(decode_row_ts(&columns[2].values[0]), Some(1));
+        assert_eq!(decode_row_ts(&columns[2].values[1]), Some(2));
+        assert_eq!(decode_row_ts(&columns[2].values[2]), Some(3));
     }
 }
