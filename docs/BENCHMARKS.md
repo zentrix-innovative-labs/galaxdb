@@ -44,47 +44,47 @@ Confirmed on the same hardware as the vector benchmarks, release build:
 
 ---
 
-## Storage Engine
+## Storage Engine — durable write path
 
-**Hardware:** AWS c6id.4xlarge, NVMe storage.
+**Hardware:** AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM), instance-store NVMe (XFS, noatime). GalaxDB and PostgreSQL 16 run on the **same NVMe** with `synchronous_commit=on` / `fdatasync`. Both use prepared statements. Date: 2026-06-18. Full findings: `bench-results/wal-inline-20260618/results.md`.
 
-### Write throughput
+### Concurrent INSERT vs PostgreSQL 16 (apples-to-apples)
 
-| Workload | Throughput | Durability |
-|----------|-----------|------------|
-| OLTP — 16 threads, 1M rows, 60 s | **258,555 TPS** | Relaxed (group commit) |
-| Embedded INSERT — batched 100/stmt | **20,267 rows/sec** | Relaxed |
-| Wire INSERT — 4 clients | **454 rows/sec** | Strict |
+| Clients | GalaxDB | PostgreSQL 16 |
+|---------|---------|---------------|
+| 1  | 10,269 rows/s | 11,810 rows/s |
+| 4  | 30,637 rows/s | 34,431 rows/s |
+| 8  | 36,062 rows/s | 53,397 rows/s |
+| 16 | 36,264 rows/s | 82,232 rows/s |
 
-### Read latency (warm cache)
+GalaxDB is competitive at low concurrency (0.87× PostgreSQL at 1 client, 0.89× at 4); PostgreSQL's
+process-per-connection model scales better past 8 clients (GalaxDB 0.44× at 16). The remaining gap is
+the async server's per-query `spawn_blocking` hand-off (24.5% futex in a `perf` profile of the
+16-client run), not the storage engine.
 
-| Metric | Value |
-|--------|-------|
-| Point read p50 | 3 µs |
-| Point read p99 | 47 µs |
+```bash
+TMPDIR=/mnt/nvme/tmp cargo run --release -p galaxdb-benchmarks --bin concurrent-insert-bench \
+    -- --rows 2000 --clients 1,4,8,16 --pg-port 5432
+```
 
-### Read latency (cold cache, 50M rows × 600 B ≈ 30 GB)
+### Bulk load and engine write path
 
-| Metric | Value |
-|--------|-------|
-| Missing keys | 0 / 100,000 |
-| Read p50 | 147 µs |
-| Read p99 | 308 µs |
+| Path | Throughput | What it measures |
+|------|-----------|------------------|
+| `COPY FROM STDIN` (wire) | 129,368 rows/s, 11.2 MiB/s | bulk ingest, chunked group commit |
+| `put_sync` (engine, 1 fsync/row) | 24,517 rows/s (40.8 µs/row) | strict per-row durability |
+| `put_batch_sync` (engine, 1 fsync/batch) | ~1.9M rows/s (0.5 µs/row) | in-memory path, amortized fsync |
 
-### OLAP scan throughput
+```bash
+TMPDIR=/mnt/nvme/tmp cargo run --release -p galaxdb-benchmarks --bin copy-bench -- --rows 5000
+TMPDIR=/mnt/nvme/tmp cargo run --release -p galaxdb-benchmarks --bin engine-microbench -- --max 4000
+```
 
-| Metric | Value |
-|--------|-------|
-| Scan throughput | 4.49 GB/s |
-| Zone-map skip rate | 80% |
+### NVMe fsync ceiling (context)
 
-### Mixed OLTP + OLAP (HotSet/ScanBuffer isolation)
-
-| Metric | Value |
-|--------|-------|
-| OLTP p99 during concurrent scan | 191 µs |
-| p99 degradation vs OLTP-alone | 0% |
-| HotSet evictions caused by scan | 0 |
+`pg_test_fsync` on the same instance-store NVMe: `open_datasync` 1,611 ops/s, `fdatasync` 1,091 ops/s,
+`fsync` 366 ops/s. Single-client strict-durability write throughput is bounded by this fsync latency
+on both engines; concurrent clients exceed it because group commit shares one fsync across writers.
 
 ---
 

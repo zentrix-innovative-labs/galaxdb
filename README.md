@@ -141,16 +141,21 @@ Measured on AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM, 88
 
 For methodology and the full SIFT-1M run, see the [GalaxDB paper on Zenodo](https://doi.org/10.5281/zenodo.20355229).
 
-### Storage Engine
+### Storage Engine — durable write path
 
-| Metric | GalaxDB | PostgreSQL 16 | RocksDB |
-|--------|---------|---------------|---------|
-| Write TPS | **258,555** | ~3,200 | ~80,000 |
-| Read p50 | **3 µs** | ~95 µs | ~180 µs |
-| Read p99 | **47 µs** | ~300 µs | ~500 µs |
-| Scan throughput | **4.49 GB/s** | ~0.9 GB/s | — |
+Measured with GalaxDB and PostgreSQL 16 on the **same instance-store NVMe**, `synchronous_commit=on` / `fdatasync`, both using prepared statements — an apples-to-apples comparison.
 
-**740 Rust tests passing. 7 chaos scenarios in 10.9 s.** See [BENCHMARKS.md](docs/BENCHMARKS.md).
+| Workload | GalaxDB | PostgreSQL 16 |
+|----------|---------|---------------|
+| Concurrent INSERT, 1 client | 10,269 rows/s | 11,810 rows/s |
+| Concurrent INSERT, 4 clients | 30,637 rows/s | 34,431 rows/s |
+| Concurrent INSERT, 8 clients | 36,062 rows/s | 53,397 rows/s |
+| Concurrent INSERT, 16 clients | 36,264 rows/s | 82,232 rows/s |
+| `COPY` bulk load | 129,368 rows/s (11.2 MiB/s) | — |
+
+On durable single-client and low-concurrency writes GalaxDB is competitive with PostgreSQL (within ~10%); PostgreSQL's mature process-per-connection model still scales better past 8 concurrent clients. Bulk ingestion via `COPY` reaches 129k rows/s. The in-memory storage path (memtable + ART) sustains ~1.9M rows/s when an fsync is amortized across a batch. See [BENCHMARKS.md](docs/BENCHMARKS.md) for reproduction commands.
+
+**740 Rust tests passing. 7 chaos scenarios in 10.9 s.**
 
 ---
 

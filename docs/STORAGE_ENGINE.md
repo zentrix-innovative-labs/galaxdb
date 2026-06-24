@@ -10,9 +10,9 @@ An AI-native storage engine that unifies transactional row storage, columnar ana
 
 GalaxDB's storage engine handles everything between "application writes a row" and "bits hit NVMe":
 
-1. **Sub-microsecond point reads** via an Adaptive Radix Tree primary key index
-2. **250K+ write TPS** with group-commit WAL and concurrent memtable
-3. **4+ GB/s analytical scans** with columnar PAX blocks and zone-map pruning
+1. **O(k) point reads** via an Adaptive Radix Tree primary key index
+2. **Durable writes competitive with PostgreSQL 16** on the same NVMe; ~1.9M rows/s in-memory path when fsync is amortized across a batch
+3. **Columnar analytics** with PAX blocks and zone-map pruning
 4. **Zero data loss on crash** — WAL replay, checksum verification, atomic compaction
 5. **Encryption at rest** — AES-256-GCM on every block and WAL record
 6. **Write stall prevention** — auto-tuned RateLimiter + WriteController
@@ -47,32 +47,28 @@ GalaxDB's storage engine handles everything between "application writes a row" a
 
 ## Performance
 
-All numbers measured on AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM, 884 GB NVMe), Ubuntu 24.04, release build. See [BENCHMARKS.md](BENCHMARKS.md) for full details and reproduction commands.
+All numbers measured on AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM, 884 GB NVMe), Ubuntu 24.04, release build. GalaxDB and PostgreSQL 16 run on the **same instance-store NVMe**, `synchronous_commit=on` / `fdatasync`, both with prepared statements. See [BENCHMARKS.md](BENCHMARKS.md) for full details and reproduction commands.
 
-### OLTP (1M rows, 16 threads, 60 s)
+### Durable write path (concurrent INSERT vs PostgreSQL 16)
 
-| Metric | GalaxDB | RocksDB | PostgreSQL 16 | SQLite |
-|--------|---------|---------|---------------|--------|
-| **Write TPS** | **258,555** | ~80,000 | ~3,200 | ~50,000 |
-| **Read p50** | **3 µs** | ~180 µs | ~95 µs | ~50 µs |
-| **Read p99** | **47 µs** | ~500 µs | ~300 µs | ~200 µs |
-| **Write p99** | **377 µs** | 1–10 s* | — | — |
+| Clients | GalaxDB | PostgreSQL 16 |
+|---------|---------|---------------|
+| 1  | 10,269 rows/s | 11,810 rows/s |
+| 4  | 30,637 rows/s | 34,431 rows/s |
+| 8  | 36,062 rows/s | 53,397 rows/s |
+| 16 | 36,264 rows/s | 82,232 rows/s |
 
-*RocksDB without write pacing (vLSM, arXiv 2024)
+GalaxDB is competitive at low concurrency; PostgreSQL scales better past 8 clients. The gap is the
+async server's per-query thread hand-off, not the storage engine — the engine's in-memory path
+(`put_batch_sync`) sustains ~1.9M rows/s.
 
-### OLAP Column Scan (10M rows, 16 threads, 60 s)
+### Bulk load and engine micro-path
 
-| Metric | GalaxDB | PostgreSQL 16 | DuckDB |
-|--------|---------|---------------|--------|
-| **Scan throughput** | **4.49 GB/s** | ~0.9 GB/s | ~5–10 GB/s |
-| **Zone-map skip rate** | **80%** | N/A (heap scan) | similar |
-
-### Mixed OLTP + OLAP (concurrent, 60 s)
-
-| Metric | Result |
-|--------|--------|
-| OLTP p99 during concurrent scan | **191 µs** — no degradation |
-| HotSet evictions from scan storm | **0** — ScanBuffer isolation works |
+| Path | Throughput |
+|------|-----------|
+| `COPY FROM STDIN` (wire) | 129,368 rows/s (11.2 MiB/s) |
+| `put_sync` (engine, 1 fsync/row) | 24,517 rows/s (40.8 µs/row) |
+| `put_batch_sync` (engine, 1 fsync/batch) | ~1.9M rows/s (0.5 µs/row) |
 
 ### Crash Safety
 
@@ -101,8 +97,7 @@ PostgreSQL is a general-purpose relational database. pgvector is a bolt-on exten
 | Time-travel queries | ✅ `AT VERSION` | ❌ |
 | Training export | ✅ Lance format, one SQL command | ❌ |
 | Near-dedup | ✅ MinHash LSH | ❌ |
-| Write throughput | **258K TPS** | ~3.2K TPS |
-| Scan throughput | **4.49 GB/s** | ~0.9 GB/s |
+| Durable write throughput | competitive (same NVMe, see above) | baseline |
 | Embedded mode | ✅ (like SQLite) | ❌ |
 
 ### vs Pinecone / Weaviate
@@ -125,8 +120,6 @@ DuckDB is an excellent analytical database. It doesn't do vector search, embeddi
 
 | Capability | GalaxDB | DuckDB |
 |---|---|---|
-| OLAP scan | 4.49 GB/s | ~5–10 GB/s |
-| OLTP writes | **258K TPS** | ~50K TPS |
 | Vector search | ✅ | ❌ |
 | Embeddings | ✅ | ❌ |
 | Training export | ✅ | ❌ |
@@ -172,8 +165,8 @@ Column-oriented storage blocks. Every byte of GalaxDB data lives in this format.
 ```
 
 - 6 record types: ROW_PUT, ROW_DELETE, DELTA_INSERT, DELTA_TOMBSTONE, CHECKPOINT, BLOB_REF
-- Group commit: batches writes over 10 ms window, single fsync per batch → 250K+ TPS
-- DURABILITY STRICT: fsync per commit → ~5K TPS (for financial workloads)
+- Pre-allocated, zero-filled WAL written in place (PostgreSQL segment model) so `fdatasync` flushes only dirty data pages (~37 µs on NVMe), not extent/inode metadata.
+- Group commit batches concurrent writers into a single fsync; engine `put_sync` reaches 24,517 commits/s (one fsync per row), `put_batch_sync` ~1.9M rows/s (one fsync per batch).
 - Recovery: replay from last checkpoint, verify XXH3-64 per record, stop at first corruption
 
 **Reference:** PostgreSQL WAL design with XXH3-64 replacing CRC-32 (3× faster hashing).
@@ -192,8 +185,7 @@ Lock-free concurrent skip map with per-key MVCC version chains.
 
 Adaptive Radix Tree (Leis et al., ICDE 2013) with Node4/Node16/Node48/Node256 and path compression.
 
-- 213 ns/lookup (sequential keys, warm cache)
-- 752 ns/lookup (random keys, warm cache)
+- Warm-cache point lookups in the low hundreds of nanoseconds (O(k) in key length, independent of dataset size)
 - O(k) lookup where k is key length, independent of dataset size
 
 **Reference:** Leis et al., "The Adaptive Radix Tree" (ICDE 2013).
@@ -254,7 +246,7 @@ Every PAX block and WAL record encrypted before hitting storage.
   - `ExternalCommandKeyProvider` — delegate to any shell command (AWS CLI, gcloud, az, vault CLI, custom HSM)
   - `HashicorpVaultKeyProvider` — Vault Transit engine over rustls
 - Counter-based 96-bit nonces: 4-byte random prefix + 8-byte atomic counter
-- AES-NI accelerated: 680 MB/s encrypt, 709 MB/s decrypt
+- AES-NI / AVX2 accelerated; see [BENCHMARKS.md](BENCHMARKS.md) for measured cipher throughput (`cargo bench -p galaxdb-crypto`)
 
 ### 10. Write Stall Mitigation
 

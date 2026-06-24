@@ -42,8 +42,7 @@ After GalaxDB:
 | **Encryption at rest** | ✅ AES-256-GCM | ✅ OS-level | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
 | **Backup / restore** | ✅ SQL command | ✅ pg_dump | ✅ | ✅ | ✅ | ❌ | ❌ | ✅ | ❌ |
 | **Single binary** | ✅ | ❌ | ❌ | ✅ | ❌ | ✅ | ✅ | ❌ | ✅ |
-| **Write TPS** | **258,555** | ~3,200 | N/A | N/A | N/A | N/A | N/A | N/A | ~50,000 |
-| **Scan throughput** | **4.49 GB/s** | ~0.9 GB/s | N/A | N/A | N/A | N/A | N/A | N/A | ~5–10 GB/s |
+| **Durable write throughput** | competitive (same NVMe) | baseline | N/A | N/A | N/A | N/A | N/A | N/A | high (OLAP) |
 | **Open source** | ✅ Apache 2.0 | ✅ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ¹ LanceDB OSS uses a Python/Arrow API. SQL is available via a DuckDB bridge or Enterprise tier only — not native.  
@@ -58,13 +57,19 @@ After GalaxDB:
 
 ### Performance comparison
 
+GalaxDB and PostgreSQL 16 measured on the **same instance-store NVMe**, `synchronous_commit=on`, both prepared statements (apples-to-apples). See [BENCHMARKS.md](BENCHMARKS.md).
+
 | Metric | GalaxDB | PostgreSQL 16 + pgvector |
 |--------|---------|--------------------------|
-| Write TPS (16 threads, 1M rows) | **258,555** | ~3,200 |
-| Read p50 | **3 µs** | ~95 µs |
-| Read p99 | **47 µs** | ~300 µs |
-| Scan throughput | **4.49 GB/s** | ~0.9 GB/s |
-| HNSW recall@10 (SIFT-1M, ef=200) | **0.990** | ~0.95 |
+| Concurrent INSERT, 1 client | 10,269 rows/s | 11,810 rows/s |
+| Concurrent INSERT, 4 clients | 30,637 rows/s | 34,431 rows/s |
+| Concurrent INSERT, 16 clients | 36,264 rows/s | 82,232 rows/s |
+| `COPY` bulk load | 129,368 rows/s | (PostgreSQL `COPY` is also fast; not benchmarked head-to-head) |
+| HNSW recall@10 (SIFT-1M, ef=200) | **0.990** | ~0.92–0.95 (pgvector, published) |
+
+On durable OLTP writes, PostgreSQL and GalaxDB are close at low concurrency and PostgreSQL scales
+better past 8 clients. GalaxDB's edge is not raw write TPS — it is native HNSW vector search with
+higher recall, local embeddings, training export, and time-travel in the same engine.
 
 ### Where pgvector falls short
 
@@ -72,7 +77,7 @@ After GalaxDB:
 - No local embedding generation — you still need an external API (OpenAI, Cohere) or a separate embedding service.
 - No training export — getting data into PyTorch requires a custom pipeline.
 - No time-travel queries.
-- Write throughput is limited by PostgreSQL's MVCC heap — ~3,200 TPS vs GalaxDB's 258,555 TPS.
+- Durable write throughput is competitive with GalaxDB at low concurrency; PostgreSQL scales better past 8 concurrent clients (see table above). Neither system is dramatically faster than the other at synchronous OLTP on the same NVMe.
 
 ### When to stay with PostgreSQL + pgvector
 
@@ -244,7 +249,7 @@ Pinecone's Enterprise plan has a $500/month minimum commitment. At scale, self-h
 - Small-scale RAG applications.
 - You want the fastest path from zero to working semantic search.
 
-**GalaxDB advantage:** Production-grade storage engine (258K TPS, 4.49 GB/s scans), SQL, PostgreSQL wire protocol, training export, encryption, backup/restore. ChromaDB is great for prototyping; GalaxDB is for production.
+**GalaxDB advantage:** Production-grade storage engine (durable writes competitive with PostgreSQL, `COPY` at 129k rows/s), SQL, PostgreSQL wire protocol, training export, encryption, backup/restore. ChromaDB is great for prototyping; GalaxDB is for production.
 
 ---
 
@@ -288,8 +293,6 @@ Pinecone's Enterprise plan has a $500/month minimum commitment. At scale, self-h
 
 | Metric | GalaxDB | DuckDB |
 |--------|---------|--------|
-| OLAP scan throughput | 4.49 GB/s | ~5–10 GB/s |
-| OLTP write TPS | **258,555** | ~50,000 |
 | Vector search | ✅ HNSW | ❌ |
 | Embeddings | ✅ Local | ❌ |
 | Training export | ✅ Lance | ❌ |
