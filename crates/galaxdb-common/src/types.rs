@@ -14,6 +14,29 @@ pub type RowId = u64;
 /// Logical timestamp used for MVCC versioning and commit ordering.
 pub type Timestamp = u64;
 
+/// How a SQL table's rows are physically laid out in PAX storage
+/// (HTAP query engine, ADR-0002).
+///
+/// This is per-table catalog metadata. It selects the write/scan path the
+/// storage engine uses for the table; it does not change the logical schema
+/// or query results (see HTAP Property 3: the two modes return identical
+/// results, differing only in performance).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum StorageMode {
+    /// Each row is one opaque `col=v|...` UTF-8 blob keyed by primary key
+    /// (the format every table used before the columnar path). Scanned via
+    /// the decode-on-scan bridge. This is the default until the columnar
+    /// write path (HTAP task 5) lands, and remains the format of any table
+    /// created by an earlier build.
+    #[default]
+    Legacy,
+    /// One typed PAX column per SQL column, so analytical scans read Arrow
+    /// directly with no per-row string parse and predicates push down to
+    /// per-column zone maps (HTAP tasks 5–7). OLTP point reads still resolve
+    /// a single row via the ART.
+    Columnar,
+}
+
 /// Describes the data type of a column in a GalaxDB table.
 ///
 /// Covers standard integer, float, text, and binary types, plus an

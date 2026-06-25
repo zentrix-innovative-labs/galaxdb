@@ -13,4 +13,4 @@ pub mod types;
 pub use autotune::{AutoTuneConfig, EffectiveTuning, SystemResources, TuningSource};
 pub use config::GalaxConfig;
 pub use error::{GalaxError, GalaxResult};
-pub use types::{BlockId, ColumnType, RowId, TableId, Timestamp};
+pub use types::{BlockId, ColumnType, RowId, StorageMode, TableId, Timestamp};

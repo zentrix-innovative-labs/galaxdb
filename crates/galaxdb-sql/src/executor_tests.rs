@@ -47,6 +47,7 @@ fn users_entry() -> TableEntry {
         ],
         has_embedding: false,
             append_only: false,
+            storage_mode: galaxdb_common::StorageMode::Legacy,
     }
 }
 
@@ -79,6 +80,7 @@ fn embedding_entry() -> TableEntry {
         ],
         has_embedding: true,
             append_only: false,
+            storage_mode: galaxdb_common::StorageMode::Legacy,
     }
 }
 
@@ -103,6 +105,7 @@ fn docs_body_entry() -> TableEntry {
         ],
         has_embedding: false,
             append_only: false,
+            storage_mode: galaxdb_common::StorageMode::Legacy,
     }
 }
 
@@ -194,6 +197,40 @@ fn legacy_drop_table_succeeds() {
     let result = execute_legacy(&plan, &mut catalog);
     assert!(matches!(result, ExecuteResult::Ok(_)));
     assert!(!catalog.table_exists("users"));
+}
+
+#[test]
+fn create_table_records_storage_mode_in_catalog() {
+    // HTAP task 4: a newly created table carries a StorageMode in the
+    // catalog. The default is Legacy until the columnar write path (task 5)
+    // exists, so the catalog never claims a columnar layout storage cannot
+    // yet produce (engineering-principles §2).
+    let mut ctx = test_ctx();
+    let stmt = CreateTableStmt {
+        table_name: "t".to_string(),
+        columns: vec![ColumnDef {
+            name: "id".to_string(),
+            data_type: "INT".to_string(),
+            nullable: false,
+            primary_key: true,
+            embedding: None,
+        }],
+        if_not_exists: false,
+    };
+    let plan = plan_create_table(stmt);
+    execute_with_context(&plan, &mut ctx).unwrap();
+
+    let entry = ctx.catalog.get_table("t").expect("table in catalog");
+    assert_eq!(entry.storage_mode, galaxdb_common::StorageMode::Legacy);
+}
+
+#[test]
+fn storage_mode_default_is_legacy() {
+    // The Default impl matches the current on-disk reality.
+    assert_eq!(
+        galaxdb_common::StorageMode::default(),
+        galaxdb_common::StorageMode::Legacy
+    );
 }
 
 #[test]
@@ -1130,6 +1167,7 @@ fn minhash_policy_skips_non_text_columns() {
         ],
         has_embedding: false,
             append_only: false,
+            storage_mode: galaxdb_common::StorageMode::Legacy,
     };
     std::sync::Arc::make_mut(&mut ctx.catalog).create_table("nums".to_string(), entry).unwrap();
 
@@ -1192,6 +1230,7 @@ fn minhash_policy_handles_multiple_text_columns() {
         ],
         has_embedding: false,
             append_only: false,
+            storage_mode: galaxdb_common::StorageMode::Legacy,
     };
     std::sync::Arc::make_mut(&mut ctx.catalog).create_table("docs".to_string(), entry).unwrap();
 
@@ -1305,6 +1344,7 @@ fn ctx_with_dedup_docs() -> ExecutorContext {
         ],
         has_embedding: false,
             append_only: false,
+            storage_mode: galaxdb_common::StorageMode::Legacy,
     };
     std::sync::Arc::make_mut(&mut ctx.catalog).create_table("docs".to_string(), entry).unwrap();
     ctx

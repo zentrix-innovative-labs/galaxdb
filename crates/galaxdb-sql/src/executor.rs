@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use galaxdb_common::{GalaxError, GalaxResult};
+use galaxdb_common::{GalaxError, GalaxResult, StorageMode};
 use galaxdb_sidecar::manager::SidecarManager;
 use galaxdb_sidecar::protocol::EmbedRequest;
 use galaxdb_storage::engine::Engine;
@@ -145,6 +145,11 @@ pub struct TableEntry {
     /// for system lineage tables like `_galaxdb_training_exports` that
     /// must remain auditable.
     pub append_only: bool,
+    /// Physical storage layout for this table's rows (HTAP ADR-0002).
+    /// `Legacy` = one `col=v|...` blob per row (today's format); `Columnar`
+    /// = one typed PAX column per SQL column. Defaults to `Legacy`; the
+    /// columnar write path (HTAP task 5) flips the default for new tables.
+    pub storage_mode: StorageMode,
 }
 
 /// Canonical name of the training-export lineage system table
@@ -796,10 +801,23 @@ fn exec_create_table(
         columns,
         has_embedding,
         append_only: is_system_append_only_table(&stmt.table_name),
+        storage_mode: default_storage_mode_for_new_table(),
     };
 
     Arc::make_mut(&mut ctx.catalog).create_table(stmt.table_name.clone(), entry)?;
     Ok(ExecuteResult::Ok(format!("CREATE TABLE {}", stmt.table_name)))
+}
+
+/// The physical storage layout assigned to a newly created table.
+///
+/// Today this is [`StorageMode::Legacy`] because the columnar write path
+/// (HTAP task 5) does not exist yet — marking a table `Columnar` while
+/// storage still writes the `col=v|...` row format would make the catalog
+/// lie about the on-disk layout (engineering-principles §2). When task 5
+/// lands the columnar write path, this flips to [`StorageMode::Columnar`]
+/// in exactly one place.
+fn default_storage_mode_for_new_table() -> StorageMode {
+    StorageMode::Legacy
 }
 
 fn exec_drop_table(name: &str, if_exists: bool, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteResult> {
@@ -2340,6 +2358,7 @@ pub fn execute_legacy(plan: &QueryPlan, catalog: &mut Catalog) -> ExecuteResult 
                 columns,
                 has_embedding,
                 append_only: is_system_append_only_table(&stmt.table_name),
+                storage_mode: default_storage_mode_for_new_table(),
             };
             match catalog.create_table(stmt.table_name.clone(), entry) {
                 Ok(()) => ExecuteResult::Ok(format!("CREATE TABLE {}", stmt.table_name)),

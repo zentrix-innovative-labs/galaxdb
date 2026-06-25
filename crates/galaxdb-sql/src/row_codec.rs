@@ -332,6 +332,7 @@ mod tests {
             ],
             has_embedding: false,
             append_only: false,
+            storage_mode: galaxdb_common::StorageMode::Legacy,
         }
     }
 
@@ -411,6 +412,7 @@ mod tests {
             }],
             has_embedding: false,
             append_only: false,
+            storage_mode: galaxdb_common::StorageMode::Legacy,
         };
         let ordered = vec![("msg".to_string(), Value::Text("hello".into()))];
         let key = build_primary_key("events", &entry, &ordered).unwrap();
