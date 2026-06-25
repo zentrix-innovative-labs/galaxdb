@@ -53,10 +53,10 @@ All numbers measured on AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32
 
 | Clients | GalaxDB | PostgreSQL 16 |
 |---------|---------|---------------|
-| 1  | 10,269 rows/s | 11,810 rows/s |
-| 4  | 30,637 rows/s | 34,431 rows/s |
-| 8  | 36,062 rows/s | 53,397 rows/s |
-| 16 | 36,264 rows/s | 82,232 rows/s |
+| 1  | 10,450 rows/s | 11,891 rows/s |
+| 4  | 30,468 rows/s | 34,298 rows/s |
+| 8  | 36,632 rows/s | 54,432 rows/s |
+| 16 | 37,448 rows/s | 84,747 rows/s |
 
 GalaxDB is competitive at low concurrency; PostgreSQL scales better past 8 clients. The gap is the
 async server's per-query thread hand-off, not the storage engine — the engine's in-memory path
@@ -66,8 +66,8 @@ async server's per-query thread hand-off, not the storage engine — the engine'
 
 | Path | Throughput |
 |------|-----------|
-| `COPY FROM STDIN` (wire) | 129,368 rows/s (11.2 MiB/s) |
-| `put_sync` (engine, 1 fsync/row) | 24,517 rows/s (40.8 µs/row) |
+| `COPY FROM STDIN` (wire) | 190,287 rows/s (17.1 MiB/s) |
+| `put_sync` (engine, 1 fsync/row) | 26,500 rows/s (37.7 µs/row) |
 | `put_batch_sync` (engine, 1 fsync/batch) | ~1.9M rows/s (0.5 µs/row) |
 
 ### Crash Safety
@@ -166,7 +166,7 @@ Column-oriented storage blocks. Every byte of GalaxDB data lives in this format.
 
 - 6 record types: ROW_PUT, ROW_DELETE, DELTA_INSERT, DELTA_TOMBSTONE, CHECKPOINT, BLOB_REF
 - Pre-allocated, zero-filled WAL written in place (PostgreSQL segment model) so `fdatasync` flushes only dirty data pages (~37 µs on NVMe), not extent/inode metadata.
-- Group commit batches concurrent writers into a single fsync; engine `put_sync` reaches 24,517 commits/s (one fsync per row), `put_batch_sync` ~1.9M rows/s (one fsync per batch).
+- Group commit batches concurrent writers into a single fsync; engine `put_sync` reaches 26,500 commits/s (one fsync per row), `put_batch_sync` ~1.9M rows/s (one fsync per batch).
 - Recovery: replay from last checkpoint, verify XXH3-64 per record, stop at first corruption
 
 **Reference:** PostgreSQL WAL design with XXH3-64 replacing CRC-32 (3× faster hashing).

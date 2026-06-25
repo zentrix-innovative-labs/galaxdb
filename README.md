@@ -135,27 +135,28 @@ Measured on AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM, 88
 
 | ef_search | recall@10 | mean latency | p99 latency |
 |-----------|-----------|--------------|-------------|
-| 50        | 0.959     | 158 µs       | 228 µs      |
-| 100       | 0.983     | 267 µs       | 364 µs      |
-| **200**   | **0.990** | **459 µs**   | **616 µs**  |
+| 50        | 0.959     | 143 µs       | 208 µs      |
+| 100       | 0.983     | 247 µs       | 334 µs      |
+| **200**   | **0.990** | **432 µs**   | **572 µs**  |
 
 For methodology and the full SIFT-1M run, see the [GalaxDB paper on Zenodo](https://doi.org/10.5281/zenodo.20355229).
 
 ### Storage Engine — durable write path
 
-Measured with GalaxDB and PostgreSQL 16 on the **same instance-store NVMe**, `synchronous_commit=on` / `fdatasync`, both using prepared statements — an apples-to-apples comparison.
+Measured with GalaxDB and PostgreSQL 16.14 on the **same instance-store NVMe** (PostgreSQL's data directory relocated to the NVMe), `fsync=on`, both using prepared statements — an apples-to-apples comparison.
 
 | Workload | GalaxDB | PostgreSQL 16 |
 |----------|---------|---------------|
-| Concurrent INSERT, 1 client | 10,269 rows/s | 11,810 rows/s |
-| Concurrent INSERT, 4 clients | 30,637 rows/s | 34,431 rows/s |
-| Concurrent INSERT, 8 clients | 36,062 rows/s | 53,397 rows/s |
-| Concurrent INSERT, 16 clients | 36,264 rows/s | 82,232 rows/s |
-| `COPY` bulk load | 129,368 rows/s (11.2 MiB/s) | — |
+| Concurrent INSERT, 1 client | 10,450 rows/s | 11,891 rows/s |
+| Concurrent INSERT, 4 clients | 30,468 rows/s | 34,298 rows/s |
+| Concurrent INSERT, 8 clients | 36,632 rows/s | 54,432 rows/s |
+| Concurrent INSERT, 16 clients | 37,448 rows/s | 84,747 rows/s |
+| `COPY` bulk load | 190,287 rows/s (17.1 MiB/s) | — |
 
-On durable single-client and low-concurrency writes GalaxDB is competitive with PostgreSQL (within ~10%); PostgreSQL's mature process-per-connection model still scales better past 8 concurrent clients. Bulk ingestion via `COPY` reaches 129k rows/s. The in-memory storage path (memtable + ART) sustains ~1.9M rows/s when an fsync is amortized across a batch. See [BENCHMARKS.md](docs/BENCHMARKS.md) for reproduction commands.
+On durable single-client and low-concurrency writes GalaxDB is competitive with PostgreSQL (within ~12%); PostgreSQL's mature process-per-connection model still scales better past 8 concurrent clients. Bulk ingestion via `COPY` reaches 190k rows/s (25.97× row-by-row INSERT). The in-memory storage path (memtable + ART) sustains ~1.9M rows/s when an fsync is amortized across a batch. See [BENCHMARKS.md](docs/BENCHMARKS.md) for reproduction commands.
 
-**740 Rust tests passing. 7 chaos scenarios in 10.9 s.**
+**730 Rust tests passing (`--release`, AWS c6id.4xlarge, commit `f1825c5`).**
+
 
 ---
 

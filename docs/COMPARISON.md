@@ -61,10 +61,10 @@ GalaxDB and PostgreSQL 16 measured on the **same instance-store NVMe**, `synchro
 
 | Metric | GalaxDB | PostgreSQL 16 + pgvector |
 |--------|---------|--------------------------|
-| Concurrent INSERT, 1 client | 10,269 rows/s | 11,810 rows/s |
-| Concurrent INSERT, 4 clients | 30,637 rows/s | 34,431 rows/s |
-| Concurrent INSERT, 16 clients | 36,264 rows/s | 82,232 rows/s |
-| `COPY` bulk load | 129,368 rows/s | (PostgreSQL `COPY` is also fast; not benchmarked head-to-head) |
+| Concurrent INSERT, 1 client | 10,450 rows/s | 11,891 rows/s |
+| Concurrent INSERT, 4 clients | 30,468 rows/s | 34,298 rows/s |
+| Concurrent INSERT, 16 clients | 37,448 rows/s | 84,747 rows/s |
+| `COPY` bulk load | 190,287 rows/s | (PostgreSQL `COPY` is also fast; not benchmarked head-to-head) |
 | HNSW recall@10 (SIFT-1M, ef=200) | **0.990** | ~0.92–0.95 (pgvector, published) |
 
 On durable OLTP writes, PostgreSQL and GalaxDB are close at low concurrency and PostgreSQL scales

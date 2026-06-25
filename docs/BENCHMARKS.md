@@ -12,72 +12,82 @@ All numbers in this document are measured on real hardware against real datasets
 Source: `ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz`  
 SHA256: `92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a`
 
-**Build:** M=16, ef_construction=200 → 66.2 s (15,114 vec/sec)
+**Build:** M=16, ef_construction=200 → 64.0 s (15,631 vec/sec)
 
 | ef_search | recall@10 | mean latency | p99 latency |
 |-----------|-----------|--------------|-------------|
-| 10        | 0.762     | 57.6 µs      | 101 µs      |
-| 50        | 0.959     | 158.1 µs     | 228 µs      |
-| 100       | 0.983     | 266.5 µs     | 364 µs      |
-| **200**   | **0.990** | **459.4 µs** | **616 µs**  |
+| 10        | 0.759     | 50.0 µs      | 92 µs       |
+| 50        | 0.959     | 143.3 µs     | 208 µs      |
+| 100       | 0.983     | 246.6 µs     | 334 µs      |
+| **200**   | **0.990** | **432.1 µs** | **572 µs**  |
 
 **Reproducing these numbers:**
 
 ```bash
-cargo run --release -p galaxdb-benchmarks -- \
-    --sift-dir /path/to/sift \
-    --ef-sweep 10,50,100,200 \
+cargo build --release -p galaxdb-benchmarks
+./target/release/galaxdb-sift-bench \
+    --dataset /path/to/sift \
+    --ef-search 10,50,100,200 \
+    --commit-sha "$(git rev-parse HEAD)" \
+    --instance-type c6id.4xlarge \
+    --dataset-sha256 92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a \
+    --timestamp-utc "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --output bench-results/sift_bench.json
 ```
 
+> Verified 2026-06-25, commit `f1825c5`, against the SHA256-pinned SIFT-1M dataset.
+> Full provenance JSON: `bench-results/aws-live-20260625/sift_bench.json`.
+
 ---
 
-## Test Suite — v1 Release (AWS c6id.4xlarge)
+## Test Suite — release (AWS c6id.4xlarge)
 
-Confirmed on the same hardware as the vector benchmarks, release build:
+Confirmed on the same hardware as the vector benchmarks, release build, commit `f1825c5`
+(2026-06-25):
 
 | Metric | Result |
 |--------|--------|
-| Rust unit tests | **740 passed / 0 failed** |
-| Chaos scenarios | **7 passed / 0 failed** |
-| Total chaos suite time | **10.91 s** (all recovery scenarios < 30 s each) |
+| Rust tests (common, crypto, storage, sql, embedded, vector, wire) | **730 passed / 0 failed** |
+| ↳ includes storage `compaction_driver` (5) + `mvcc_timestamps` (3) integration tests | |
+| Credential-gated cloud-KMS / Vault integration tests | skipped cleanly (no creds) |
 
 ---
 
 ## Storage Engine — durable write path
 
-**Hardware:** AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM), instance-store NVMe (XFS, noatime). GalaxDB and PostgreSQL 16 run on the **same NVMe** with `synchronous_commit=on` / `fdatasync`. Both use prepared statements. Date: 2026-06-18. Full findings: `bench-results/wal-inline-20260618/results.md`.
+**Hardware:** AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM), instance-store NVMe (XFS, noatime). GalaxDB and PostgreSQL 16.14 run on the **same NVMe** (PostgreSQL's data directory relocated to `/mnt/nvme/pgdata`) with `fsync=on`. Both use prepared statements. Date: 2026-06-25, commit `f1825c5`. Full findings: `bench-results/aws-live-20260625/results.md`.
 
 ### Concurrent INSERT vs PostgreSQL 16 (apples-to-apples)
 
 | Clients | GalaxDB | PostgreSQL 16 |
 |---------|---------|---------------|
-| 1  | 10,269 rows/s | 11,810 rows/s |
-| 4  | 30,637 rows/s | 34,431 rows/s |
-| 8  | 36,062 rows/s | 53,397 rows/s |
-| 16 | 36,264 rows/s | 82,232 rows/s |
+| 1  | 10,450 rows/s | 11,891 rows/s |
+| 4  | 30,468 rows/s | 34,298 rows/s |
+| 8  | 36,632 rows/s | 54,432 rows/s |
+| 16 | 37,448 rows/s | 84,747 rows/s |
 
-GalaxDB is competitive at low concurrency (0.87× PostgreSQL at 1 client, 0.89× at 4); PostgreSQL's
+GalaxDB is competitive at low concurrency (0.88× PostgreSQL at 1 client, 0.89× at 4); PostgreSQL's
 process-per-connection model scales better past 8 clients (GalaxDB 0.44× at 16). The remaining gap is
-the async server's per-query `spawn_blocking` hand-off (24.5% futex in a `perf` profile of the
-16-client run), not the storage engine.
+the async server's per-query `spawn_blocking` hand-off, not the storage engine.
 
 ```bash
-TMPDIR=/mnt/nvme/tmp cargo run --release -p galaxdb-benchmarks --bin concurrent-insert-bench \
-    -- --rows 2000 --clients 1,4,8,16 --pg-port 5432
+TMPDIR=/mnt/nvme/tmp ./target/release/concurrent-insert-bench \
+    --rows 5000 --clients 1,4,8,16 --pg-port 5432
 ```
 
 ### Bulk load and engine write path
 
 | Path | Throughput | What it measures |
 |------|-----------|------------------|
-| `COPY FROM STDIN` (wire) | 129,368 rows/s, 11.2 MiB/s | bulk ingest, chunked group commit |
-| `put_sync` (engine, 1 fsync/row) | 24,517 rows/s (40.8 µs/row) | strict per-row durability |
-| `put_batch_sync` (engine, 1 fsync/batch) | ~1.9M rows/s (0.5 µs/row) | in-memory path, amortized fsync |
+| `COPY FROM STDIN` (wire) | 190,287 rows/s, 17.1 MiB/s | bulk ingest, chunked group commit (25.97× vs row INSERT) |
+| single-row `INSERT` (wire) | ~8,525 rows/s | per-row roundtrip over the PostgreSQL protocol |
+| `put_sync` (engine, 1 fsync/row) | ~26,500 rows/s (37.7 µs/row) | strict per-row durability |
+| `put_batch_sync` (engine, 1 fsync/batch) | ~1.4–2.1M rows/s (0.5–0.7 µs/row) | in-memory path, amortized fsync |
 
 ```bash
-TMPDIR=/mnt/nvme/tmp cargo run --release -p galaxdb-benchmarks --bin copy-bench -- --rows 5000
-TMPDIR=/mnt/nvme/tmp cargo run --release -p galaxdb-benchmarks --bin engine-microbench -- --max 4000
+TMPDIR=/mnt/nvme/tmp ./target/release/copy-bench --rows 200000
+TMPDIR=/mnt/nvme/tmp ./target/release/single-row-insert-bench --rows 20000
+TMPDIR=/mnt/nvme/tmp ./target/release/engine-microbench --max 200000
 ```
 
 ### NVMe fsync ceiling (context)
