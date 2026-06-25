@@ -8,6 +8,7 @@ members = [
     "crates/galaxdb-auth",
     "crates/galaxdb-vector",
     "crates/galaxdb-sql",
+    "crates/galaxdb-query",
     "crates/galaxdb-wire",
     "crates/galaxdb-versioning",
     "crates/galaxdb-backup",
@@ -102,6 +103,11 @@ pyo3 = { version = "0.24", features = ["extension-module"] }
 # SQL parsing
 sqlparser = { version = "0.50", features = ["visitor"] }
 
+# Apache Arrow — columnar interchange for the query layer (galaxdb-query).
+# Pinned to the version DataFusion 52.5.0 resolves so no duplicate arrow
+# major enters the graph (see galaxdb-query / HTAP spec Req 7.2).
+arrow = "=57.3.1"
+
 # HTTP server
 axum = "0.7"
 
@@ -122,6 +128,7 @@ galaxdb-crypto = { path = "crates/galaxdb-crypto" }
 galaxdb-auth = { path = "crates/galaxdb-auth" }
 galaxdb-vector = { path = "crates/galaxdb-vector" }
 galaxdb-sql = { path = "crates/galaxdb-sql" }
+galaxdb-query = { path = "crates/galaxdb-query" }
 galaxdb-wire = { path = "crates/galaxdb-wire" }
 galaxdb-versioning = { path = "crates/galaxdb-versioning" }
 galaxdb-sidecar = { path = "crates/galaxdb-sidecar" }

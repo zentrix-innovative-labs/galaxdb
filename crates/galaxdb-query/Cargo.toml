@@ -1,0 +1,21 @@
+[package]
+name = "galaxdb-query"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Anti-corruption boundary for the relational/analytical query layer. The ONLY crate permitted to depend on Apache DataFusion (HTAP spec Req 7)."
+
+[dependencies]
+galaxdb-common.workspace = true
+galaxdb-sql.workspace = true
+arrow.workspace = true
+tracing.workspace = true
+
+# NOTE: `datafusion` is intentionally NOT yet a dependency. The GalaxDB-owned
+# trait surface (this skeleton, HTAP task 2) carries no DataFusion types. The
+# `=52.5.0` pin and the `DataFusionBackend` implementation are added by HTAP
+# tasks 3/11, at which point this is the ONLY crate in the workspace allowed to
+# declare it (enforced by the containment guard, task 2.1).
+
+[dev-dependencies]

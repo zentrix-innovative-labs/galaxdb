@@ -9,6 +9,7 @@ publish = false
 galaxdb-common = { path = "../crates/galaxdb-common" }
 galaxdb-observe = { path = "../crates/galaxdb-observe" }
 galaxdb-storage = { path = "../crates/galaxdb-storage" }
+galaxdb-sql = { path = "../crates/galaxdb-sql" }
 galaxdb-io = { path = "../crates/galaxdb-io" }
 galaxdb-vector = { path = "../crates/galaxdb-vector" }
 galaxdb-sidecar = { path = "../crates/galaxdb-sidecar" }

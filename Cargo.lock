@@ -2584,6 +2584,7 @@ dependencies = [
  "galaxdb-observe",
  "galaxdb-server",
  "galaxdb-sidecar",
+ "galaxdb-sql",
  "galaxdb-storage",
  "galaxdb-vector",
  "hdrhistogram",
@@ -2702,6 +2703,16 @@ dependencies = [
  "sqlparser 0.50.0",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "galaxdb-query"
+version = "0.2.0"
+dependencies = [
+ "arrow",
+ "galaxdb-common",
+ "galaxdb-sql",
+ "tracing",
 ]
 
 [[package]]
