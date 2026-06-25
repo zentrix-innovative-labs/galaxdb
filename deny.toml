@@ -43,6 +43,13 @@ deny = [
     { name = "azure_identity" },
     { name = "azure_storage" },
     { name = "azure_security_keyvault" },
+    # HTAP query engine (Req 7.2): exactly ONE version of DataFusion and of
+    # Arrow may enter the graph. DataFusion is confined to `galaxdb-query`
+    # and exact-pinned there; this stops a transitive bump from silently
+    # introducing a duplicate major that breaks the anti-corruption boundary.
+    # Global `multiple-versions` stays "allow" for everything else.
+    { name = "datafusion", deny-multiple-versions = true },
+    { name = "arrow", deny-multiple-versions = true },
 ]
 
 # Never warn on `rand`, `ring`, etc. being present in multiple versions —

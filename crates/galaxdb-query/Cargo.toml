@@ -12,10 +12,13 @@ galaxdb-sql.workspace = true
 arrow.workspace = true
 tracing.workspace = true
 
-# NOTE: `datafusion` is intentionally NOT yet a dependency. The GalaxDB-owned
-# trait surface (this skeleton, HTAP task 2) carries no DataFusion types. The
-# `=52.5.0` pin and the `DataFusionBackend` implementation are added by HTAP
-# tasks 3/11, at which point this is the ONLY crate in the workspace allowed to
-# declare it (enforced by the containment guard, task 2.1).
+# Apache DataFusion — the relational/analytical execution engine. This is
+# the ONLY crate in the workspace permitted to depend on it (HTAP spec
+# ADR-0001, Req 7.1; enforced by tests/containment.rs). The exact pin
+# `=52.5.0` matches the version `lance` already resolves so no duplicate
+# DataFusion/Arrow major enters the graph (Req 7.2; enforced by deny.toml).
+# Upgrades are deliberate and gated by the SQL conformance corpus (Req 7.4).
+datafusion = "=52.5.0"
 
 [dev-dependencies]
+tokio = { workspace = true }
