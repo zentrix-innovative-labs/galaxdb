@@ -188,6 +188,23 @@ pub fn value_display(v: &Value) -> String {
             }
             s
         }
+        Value::Array(items) => {
+            // PostgreSQL array text form: `{e1,e2,...}`. Elements are
+            // rendered with their own display form; NULL becomes the
+            // unquoted literal `NULL`. This is the on-disk/text rendering;
+            // the logical element type lives on the column's `SqlType`
+            // (see `crate::types`).
+            let mut s = String::with_capacity(items.len() * 8 + 2);
+            s.push('{');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push_str(&value_display(item));
+            }
+            s.push('}');
+            s
+        }
     }
 }
 

@@ -126,6 +126,14 @@ impl IndexDef {
 /// escaped so the terminator stays unambiguous.
 pub fn encode_index_value(value: &Value) -> Vec<u8> {
     let mut raw = Vec::new();
+    encode_index_value_raw(value, &mut raw);
+    escape_zeros(&raw)
+}
+
+/// Append the pre-escape (unescaped) order/identity encoding of `value` to
+/// `raw`. Escaping is applied once by [`encode_index_value`]; this lets
+/// composite values (arrays) nest element encodings without double-escaping.
+fn encode_index_value_raw(value: &Value, raw: &mut Vec<u8>) {
     match value {
         Value::Null => raw.push(b'0'),
         Value::Integer(n) => {
@@ -159,8 +167,25 @@ pub fn encode_index_value(value: &Value) -> Vec<u8> {
             raw.push(b'x');
             raw.extend_from_slice(bytes);
         }
+        Value::Array(items) => {
+            // Deterministic, collision-free encoding for equality lookups:
+            // tag `b'a'`, element count, then a 4-byte big-endian length
+            // prefix + the raw element encoding for each item. The length
+            // prefixes make concatenated variable-width elements (text,
+            // blob) unambiguous, so `{1,2}` and `{12}` never collide. This
+            // is identity-preserving (the common array-index use); it is not
+            // lexicographically order-preserving across arrays of differing
+            // length, which array columns do not rely on for range scans.
+            raw.push(b'a');
+            raw.extend_from_slice(&(items.len() as u32).to_be_bytes());
+            for item in items {
+                let mut elem = Vec::new();
+                encode_index_value_raw(item, &mut elem);
+                raw.extend_from_slice(&(elem.len() as u32).to_be_bytes());
+                raw.extend_from_slice(&elem);
+            }
+        }
     }
-    escape_zeros(&raw)
 }
 
 /// Escape `0x00` as `0x00 0xFF` so that a `0x00 0x00` sequence is reserved

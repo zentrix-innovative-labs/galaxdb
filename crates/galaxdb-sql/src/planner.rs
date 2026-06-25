@@ -199,6 +199,11 @@ pub enum Value {
     Bool(bool),
     Null,
     Blob(Vec<u8>),
+    /// A 1-dimensional SQL array (e.g. `int[]`, `text[]`). Elements share
+    /// the array's logical element type; the per-element `Value` carries
+    /// the physical representation. Introduced with the HTAP type-system
+    /// extension (Req 5.3). Multi-dimensional arrays are not represented.
+    Array(Vec<Value>),
 }
 
 /// Statistics hint for the adaptive planner.

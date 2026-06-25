@@ -9,9 +9,11 @@ pub mod row_codec;
 pub mod secondary_index;
 pub mod stmt_cache;
 pub mod transaction;
+pub mod types;
 
 pub use auth_store::{AuthStore, RoleRecord};
 pub use stmt_cache::{bind_placeholders, BoundValue, StatementCache};
+pub use types::SqlType;
 pub use executor::{
     execute_legacy, execute_with_context, is_text_column, Catalog, CatalogColumn, ExecuteResult,
     ExecutorContext, InMemorySystemColumnSink, MinHashPolicy, Row, SystemColumnSink,
