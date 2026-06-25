@@ -4,6 +4,7 @@ pub mod art;
 pub mod blob_log;
 pub mod bloom;
 pub mod buffer_pool;
+pub mod columnar;
 pub mod compaction;
 pub mod disk_full;
 pub mod engine;

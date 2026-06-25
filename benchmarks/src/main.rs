@@ -285,7 +285,7 @@ async fn run_oltp(
         sst_size_bytes: 64 * 1024 * 1024,
         max_rows_per_block: 100_000,
     };
-    let _ = galaxdb_storage::flush::flush_memtable(&flush_memtable, &flush_config, 1, &galaxdb_io::TokioScheduler::new()).await;
+    let _ = galaxdb_storage::flush::flush_memtable(&flush_memtable, &flush_config, 1, &galaxdb_io::TokioScheduler::new(), &[]).await;
 
     // Update ART entries for flushed rows to point to SST
     for i in 0..flush_count {

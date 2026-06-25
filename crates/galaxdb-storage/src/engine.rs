@@ -14,6 +14,7 @@ use galaxdb_common::{GalaxError, GalaxResult, Timestamp};
 use galaxdb_io::{IoScheduler, IoPriority};
 
 use crate::art::{ArtIndex, RowLocation};
+use crate::columnar::{ColumnarRegistration, RowColumnSplitter};
 use crate::flush::{self, FlushConfig};
 use crate::memtable::MemtableManager;
 use crate::write_controller::{WriteAdmission, WriteController, WriteControllerConfig};
@@ -278,6 +279,11 @@ pub struct Engine {
     /// tests); when `true`, the flush only signals the worker so it never
     /// blocks on a merge.
     bg_worker_active: AtomicBool,
+    /// Per-table columnar storage registrations (HTAP ADR-0002). The SQL
+    /// layer registers a [`RowColumnSplitter`] per columnar table's key
+    /// prefix; flush consults this to append one typed PAX column per SQL
+    /// column. Empty by default, so legacy tables are unaffected.
+    columnar: RwLock<Vec<ColumnarRegistration>>,
     /// Optional AEGIS-256 TDE module for encrypting/decrypting PAX blocks.
     #[cfg(feature = "aegis-tde")]
     tde: Option<Arc<galaxdb_crypto::AegisTdeModule>>,
@@ -455,6 +461,7 @@ impl Engine {
             write_controller: WriteController::new(WriteControllerConfig::default()),
             compaction_wake: Arc::new((Mutex::new((false, false)), Condvar::new())),
             bg_worker_active: AtomicBool::new(false),
+            columnar: RwLock::new(Vec::new()),
             #[cfg(feature = "aegis-tde")]
             tde: None,
         })
@@ -639,6 +646,34 @@ impl Engine {
         }
     }
 
+    /// Register a table's key prefix for columnar storage (HTAP ADR-0002).
+    ///
+    /// After registration, flush writes one typed PAX column per SQL column
+    /// for rows under `prefix`, in addition to the legacy `[key, value, ts]`
+    /// columns (which keep every existing read/compaction path working). The
+    /// SQL layer calls this on CREATE TABLE for a `Columnar`-mode table and
+    /// on catalog reload. Re-registering the same prefix replaces the
+    /// splitter.
+    pub fn register_columnar_table(&self, prefix: Vec<u8>, splitter: Arc<dyn RowColumnSplitter>) {
+        let mut regs = self.columnar.write().expect("columnar registry lock");
+        regs.retain(|r| r.prefix != prefix);
+        regs.push(ColumnarRegistration { prefix, splitter });
+    }
+
+    /// Remove a columnar registration (e.g. on DROP TABLE). No-op if absent.
+    pub fn unregister_columnar_table(&self, prefix: &[u8]) {
+        let mut regs = self.columnar.write().expect("columnar registry lock");
+        regs.retain(|r| r.prefix != prefix);
+    }
+
+    /// Snapshot the current columnar registrations for a flush/compaction run.
+    fn columnar_registrations(&self) -> Vec<ColumnarRegistration> {
+        self.columnar
+            .read()
+            .map(|r| r.clone())
+            .unwrap_or_default()
+    }
+
     /// Flush the active memtable to an SST file on disk.
     /// Updates ART entries to point to the SST instead of the memtable.
     pub async fn flush_memtable(&self) -> GalaxResult<u64> {
@@ -659,17 +694,18 @@ impl Engine {
         };
 
         let result = {
+            let regs = self.columnar_registrations();
             #[cfg(feature = "aegis-tde")]
             {
                 if let Some(tde) = &self.tde {
-                    flush::flush_memtable_encrypted(&active, &flush_config, sst_id, tde, self.io_scheduler.as_ref()).await?
+                    flush::flush_memtable_encrypted(&active, &flush_config, sst_id, tde, self.io_scheduler.as_ref(), &regs).await?
                 } else {
-                    flush::flush_memtable(&active, &flush_config, sst_id, self.io_scheduler.as_ref()).await?
+                    flush::flush_memtable(&active, &flush_config, sst_id, self.io_scheduler.as_ref(), &regs).await?
                 }
             }
             #[cfg(not(feature = "aegis-tde"))]
             {
-                flush::flush_memtable(&active, &flush_config, sst_id, self.io_scheduler.as_ref()).await?
+                flush::flush_memtable(&active, &flush_config, sst_id, self.io_scheduler.as_ref(), &regs).await?
             }
         };
 
@@ -1470,6 +1506,7 @@ fn build_run(
     latest_ts: &HashMap<Vec<u8>, Timestamp>,
     sst_size_bytes: u64,
     max_rows_per_block: usize,
+    registrations: &[ColumnarRegistration],
     #[cfg(feature = "aegis-tde")] tde: Option<&galaxdb_crypto::AegisTdeModule>,
 ) -> GalaxResult<Vec<CompactionOutput>> {
     use crate::pax::{CodecId, ColumnData, PaxBlock};
@@ -1486,7 +1523,32 @@ fn build_run(
 
     let mut i = 0;
     while i < rows.len() {
-        let end = (i + max_rows).min(rows.len());
+        let mut end = (i + max_rows).min(rows.len());
+        // Keep each block to a single table so a columnar block carries one
+        // schema. If the run at `i` belongs to a columnar table, stop the
+        // block at the first row of a different table; if it is legacy
+        // (unregistered), stop before the first row that IS columnar.
+        match crate::columnar::registration_for(registrations, &rows[i].0) {
+            Some(reg) => {
+                if let Some(off) =
+                    rows[i..end].iter().position(|(k, _, _)| !reg.matches(k))
+                {
+                    if off > 0 {
+                        end = i + off;
+                    }
+                }
+            }
+            None => {
+                if let Some(off) = rows[i..end]
+                    .iter()
+                    .position(|(k, _, _)| crate::columnar::registration_for(registrations, k).is_some())
+                {
+                    if off > 0 {
+                        end = i + off;
+                    }
+                }
+            }
+        }
         let chunk = &rows[i..end];
 
         let mut key_col: Vec<Vec<u8>> = Vec::with_capacity(chunk.len());
@@ -1499,16 +1561,32 @@ fn build_run(
             ts_col.push(ts.to_le_bytes().to_vec());
             block_max_ts = block_max_ts.max(*ts);
         }
-        let cols = vec![
+        let mut cols = vec![
             ColumnData { col_type: ColumnType::Blob, values: key_col },
             ColumnData { col_type: ColumnType::Blob, values: val_col },
             ColumnData { col_type: ColumnType::Blob, values: ts_col },
         ];
+        let mut codecs = vec![CodecId::Zstd, CodecId::None, CodecId::None];
+        // Preserve the columnar layout across compaction: if this block's
+        // rows belong to a columnar table, append the typed per-SQL-column
+        // chunks, exactly as the flush pipeline does (HTAP ADR-0002). The
+        // chunk boundary above already keeps each block to one table, so a
+        // single registration applies to every row in the chunk.
+        if let Some(reg) = crate::columnar::registration_for(registrations, &chunk[0].0) {
+            let values: Vec<Option<Vec<u8>>> =
+                chunk.iter().map(|(_, _, v)| v.clone()).collect();
+            if let Some((data_cols, data_codecs)) =
+                crate::columnar::columnar_data_columns(&values, reg.splitter.as_ref())
+            {
+                cols.extend(data_cols);
+                codecs.extend(data_codecs);
+            }
+        }
         let pax = PaxBlock::write_with_codecs(
             block_id,
             block_max_ts,
             &cols,
-            &[CodecId::Zstd, CodecId::None, CodecId::None],
+            &codecs,
         )?;
         block_id += 1;
         let block_bytes = pax.serialize()?;
@@ -1909,6 +1987,12 @@ impl Engine {
             let latest_ref = &latest_ts;
             let sst_size = self.config.sst_size_bytes;
             let max_rows = self.config.max_rows_per_sst;
+            // Columnar registrations preserved across compaction (HTAP
+            // ADR-0002): build_run re-emits typed per-SQL-column chunks so
+            // the columnar layout survives merges instead of reverting to
+            // legacy 3-column blocks.
+            let regs = self.columnar_registrations();
+            let regs_ref = regs.as_slice();
             #[cfg(feature = "aegis-tde")]
             let tde_arc = self.tde.clone();
 
@@ -1920,11 +2004,11 @@ impl Engine {
                     let handle = scope.spawn(move || -> GalaxResult<Vec<CompactionOutput>> {
                         #[cfg(feature = "aegis-tde")]
                         {
-                            build_run(chunk, latest_ref, sst_size, max_rows, tde_arc.as_deref())
+                            build_run(chunk, latest_ref, sst_size, max_rows, regs_ref, tde_arc.as_deref())
                         }
                         #[cfg(not(feature = "aegis-tde"))]
                         {
-                            build_run(chunk, latest_ref, sst_size, max_rows)
+                            build_run(chunk, latest_ref, sst_size, max_rows, regs_ref)
                         }
                     });
                     handles.push(handle);
@@ -2018,6 +2102,158 @@ mod tests {
         // Leak the tempdir so it persists for the test
         std::mem::forget(dir);
         Engine::new(config).unwrap()
+    }
+
+    /// A test [`RowColumnSplitter`] that splits a row value of the form
+    /// `id_le(8 bytes) ++ name_bytes` into an `Int64` column and a `Text`
+    /// column. Stands in for the real SQL-layer splitter (which uses the
+    /// row codec + type system); this exercises the storage columnar path
+    /// in isolation, in a `#[cfg(test)]` block (engineering-principles §1).
+    struct IdNameSplitter;
+    impl crate::columnar::RowColumnSplitter for IdNameSplitter {
+        fn column_types(&self) -> Vec<galaxdb_common::ColumnType> {
+            vec![galaxdb_common::ColumnType::Int64, galaxdb_common::ColumnType::Text]
+        }
+        fn split(&self, value: &[u8]) -> Option<Vec<Vec<u8>>> {
+            if value.len() < 8 {
+                return None;
+            }
+            Some(vec![value[0..8].to_vec(), value[8..].to_vec()])
+        }
+    }
+
+    fn id_name_value(id: i64, name: &str) -> Vec<u8> {
+        let mut v = id.to_le_bytes().to_vec();
+        v.extend_from_slice(name.as_bytes());
+        v
+    }
+
+    #[tokio::test]
+    async fn columnar_flush_appends_typed_columns_and_keeps_base_columns() {
+        let engine = test_engine();
+        engine.register_columnar_table(b"t:".to_vec(), Arc::new(IdNameSplitter));
+
+        // Three rows of the columnar table `t`.
+        let rows = [(1i64, "alice"), (2, "bob"), (3, "carol")];
+        for (id, name) in rows {
+            let key = format!("t:{id}").into_bytes();
+            engine.put_sync(key, id_name_value(id, name)).unwrap();
+        }
+        engine.flush_memtable().await.unwrap();
+
+        // Base columns must still serve point reads + scans unchanged.
+        assert_eq!(engine.get(b"t:1"), Some(id_name_value(1, "alice")));
+        assert_eq!(engine.scan_all().len(), 3);
+
+        // Inspect the on-disk SST: the columnar block must carry the base
+        // [key, value, ts] columns PLUS [id(Int64), name(Text)].
+        let mut checked_columnar = false;
+        for entry in std::fs::read_dir(engine.data_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            if !(name.starts_with("sst_") && name.ends_with(".pax")) {
+                continue;
+            }
+            let data = std::fs::read(&path).unwrap();
+            let index = crate::sst::SstBlockIndex::from_file_data(&data).unwrap();
+            for be in &index.entries {
+                let start = be.file_offset as usize;
+                let end = start + be.block_len as usize;
+                let block = crate::pax::PaxBlock::deserialize(&data[start..end]).unwrap();
+                assert_eq!(
+                    block.header.column_count, 5,
+                    "columnar block = key,value,ts,id,name"
+                );
+                let ids = block.read_column(crate::columnar::FIRST_DATA_COLUMN).unwrap();
+                let names = block
+                    .read_column(crate::columnar::FIRST_DATA_COLUMN + 1)
+                    .unwrap();
+                // Row order within the block is primary-key sorted: t:1,t:2,t:3.
+                assert_eq!(i64::from_le_bytes(ids[0].clone().try_into().unwrap()), 1);
+                assert_eq!(names[0], b"alice");
+                assert_eq!(i64::from_le_bytes(ids[2].clone().try_into().unwrap()), 3);
+                assert_eq!(names[2], b"carol");
+                checked_columnar = true;
+            }
+        }
+        assert!(checked_columnar, "expected at least one columnar SST block");
+    }
+
+    #[tokio::test]
+    async fn unregistered_table_stays_three_column_legacy() {
+        let engine = test_engine();
+        // No columnar registration → legacy 3-column blocks, unchanged.
+        engine.put_sync(b"u:1".to_vec(), b"hello".to_vec()).unwrap();
+        engine.flush_memtable().await.unwrap();
+
+        assert_eq!(engine.get(b"u:1"), Some(b"hello".to_vec()));
+        for entry in std::fs::read_dir(engine.data_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            if !(name.starts_with("sst_") && name.ends_with(".pax")) {
+                continue;
+            }
+            let data = std::fs::read(&path).unwrap();
+            let index = crate::sst::SstBlockIndex::from_file_data(&data).unwrap();
+            for be in &index.entries {
+                let start = be.file_offset as usize;
+                let end = start + be.block_len as usize;
+                let block = crate::pax::PaxBlock::deserialize(&data[start..end]).unwrap();
+                assert_eq!(block.header.column_count, 3, "legacy block = key,value,ts");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn columnar_layout_survives_compaction() {
+        let engine = test_engine();
+        engine.register_columnar_table(b"t:".to_vec(), Arc::new(IdNameSplitter));
+
+        // Two flushes → two SSTs, each a columnar block.
+        engine.put_sync(b"t:1".to_vec(), id_name_value(1, "alice")).unwrap();
+        engine.put_sync(b"t:2".to_vec(), id_name_value(2, "bob")).unwrap();
+        engine.flush_memtable().await.unwrap();
+        engine.put_sync(b"t:3".to_vec(), id_name_value(3, "carol")).unwrap();
+        engine.put_sync(b"t:4".to_vec(), id_name_value(4, "dave")).unwrap();
+        engine.flush_memtable().await.unwrap();
+
+        // Explicitly merge.
+        engine.compact().unwrap();
+
+        // Data still correct after compaction.
+        assert_eq!(engine.get(b"t:1"), Some(id_name_value(1, "alice")));
+        assert_eq!(engine.get(b"t:4"), Some(id_name_value(4, "dave")));
+        assert_eq!(engine.scan_all().len(), 4);
+
+        // Every columnar block in the (post-compaction) SSTs must still carry
+        // the appended typed columns — the layout is preserved, not reverted.
+        let mut saw_columnar_block = false;
+        for entry in std::fs::read_dir(engine.data_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_str().unwrap().to_string();
+            if !(name.starts_with("sst_") && name.ends_with(".pax")) {
+                continue;
+            }
+            let data = std::fs::read(&path).unwrap();
+            let Ok(index) = crate::sst::SstBlockIndex::from_file_data(&data) else {
+                continue;
+            };
+            for be in &index.entries {
+                let start = be.file_offset as usize;
+                let end = start + be.block_len as usize;
+                let block = crate::pax::PaxBlock::deserialize(&data[start..end]).unwrap();
+                // All rows here belong to columnar table `t`, so every block
+                // that holds rows must be a 5-column columnar block.
+                if block.header.row_count > 0 {
+                    assert_eq!(
+                        block.header.column_count, 5,
+                        "compacted columnar block must keep key,value,ts,id,name"
+                    );
+                    saw_columnar_block = true;
+                }
+            }
+        }
+        assert!(saw_columnar_block, "expected a columnar block after compaction");
     }
 
     #[tokio::test]

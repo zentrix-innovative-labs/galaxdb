@@ -27,6 +27,7 @@ use galaxdb_common::{BlockId, ColumnType, GalaxError, GalaxResult, Timestamp};
 use galaxdb_io::{IoScheduler, IoPriority};
 
 use crate::memtable::{Memtable, VersionedValue};
+use crate::columnar::{registration_for, ColumnarRegistration, RowColumnSplitter};
 use crate::pax::{CodecId, ColumnData, PaxBlock};
 use crate::wal::WalWriter;
 
@@ -214,30 +215,47 @@ pub fn decode_row_ts(bytes: &[u8]) -> Option<Timestamp> {
 
 /// Split sorted entries into chunks that respect the SST size target.
 ///
-/// Each chunk will become one PAX block / SST file.
+/// Each chunk will become one PAX block / SST file. When a chunk's rows
+/// belong to a table registered for columnar storage, the chunk is also cut
+/// at the table's key-prefix boundary so a single block never mixes a
+/// columnar table's rows with another table's — a PAX block's columns are
+/// aligned across all its rows, so per-SQL-column chunks require one schema
+/// per block (HTAP ADR-0002).
 fn split_into_blocks<'a>(
     entries: &'a [(Vec<u8>, VersionedValue)],
     config: &FlushConfig,
+    registrations: &[ColumnarRegistration],
 ) -> Vec<&'a [(Vec<u8>, VersionedValue)]> {
     if entries.is_empty() {
         return Vec::new();
     }
+
+    // Index of the matching registration for a key (None = unregistered).
+    let reg_of = |key: &[u8]| -> Option<usize> {
+        registrations.iter().position(|r| r.matches(key))
+    };
 
     let mut blocks = Vec::new();
     let mut start = 0;
     let mut current_size: u64 = 0;
 
     for (i, (key, versioned)) in entries.iter().enumerate() {
-        let entry_size = key.len() as u64
+        let _ = key;
+        let entry_size = entries[i].0.len() as u64
             + versioned.value.as_ref().map_or(0, |v| v.len()) as u64
             + 16; // overhead
 
         current_size += entry_size;
 
         let row_count = i - start + 1;
-        let should_split = (current_size >= config.sst_size_bytes
+        // Cut the block when the NEXT row crosses a columnar table boundary,
+        // so each block holds rows of at most one registered table.
+        let next_crosses_table = i + 1 < entries.len()
+            && reg_of(&entries[i + 1].0) != reg_of(&entries[start].0);
+        let should_split = ((current_size >= config.sst_size_bytes
             || row_count >= config.max_rows_per_block)
-            && row_count > 0;
+            && row_count > 0)
+            || next_crosses_table;
 
         if should_split && i + 1 < entries.len() {
             blocks.push(&entries[start..=i]);
@@ -252,6 +270,58 @@ fn split_into_blocks<'a>(
     }
 
     blocks
+}
+
+/// Build the PAX columns and per-column codecs for one block.
+///
+/// For a block whose rows belong to a columnar-registered table, this
+/// returns the base `[key, value, ts]` columns plus one typed column per
+/// SQL column (HTAP ADR-0002). For every other block — and as a safe
+/// fallback if any row fails to split — it returns the legacy three-column
+/// layout, so no data is ever lost or mis-shaped.
+fn build_block_columns(
+    chunk: &[(Vec<u8>, VersionedValue)],
+    registrations: &[ColumnarRegistration],
+) -> (Vec<ColumnData>, Vec<CodecId>) {
+    let legacy = || {
+        (
+            entries_to_columns(chunk),
+            vec![CodecId::Zstd, CodecId::None, CodecId::None],
+        )
+    };
+    let Some(first) = chunk.first() else {
+        return legacy();
+    };
+    let Some(reg) = registration_for(registrations, &first.0) else {
+        return legacy();
+    };
+    match entries_to_columns_columnar(chunk, reg.splitter.as_ref()) {
+        Some(res) => res,
+        None => {
+            tracing::warn!(
+                prefix = ?String::from_utf8_lossy(&reg.prefix),
+                "columnar split failed for a block; writing legacy 3-column block (scan falls back to decode bridge)"
+            );
+            legacy()
+        }
+    }
+}
+
+/// Build base + per-SQL-column PAX columns for a columnar block. Returns
+/// `None` if any row's value cannot be split into the expected number of
+/// columns, so the caller falls back to the legacy layout.
+fn entries_to_columns_columnar(
+    chunk: &[(Vec<u8>, VersionedValue)],
+    splitter: &dyn RowColumnSplitter,
+) -> Option<(Vec<ColumnData>, Vec<CodecId>)> {
+    let mut base = entries_to_columns(chunk); // [key, value, ts]
+    let values: Vec<Option<Vec<u8>>> = chunk.iter().map(|(_, v)| v.value.clone()).collect();
+    let (data_cols, data_codecs) = crate::columnar::columnar_data_columns(&values, splitter)?;
+
+    let mut codecs = vec![CodecId::Zstd, CodecId::None, CodecId::None];
+    codecs.extend(data_codecs);
+    base.extend(data_cols);
+    Some((base, codecs))
 }
 
 /// Flush a sealed memtable to SST files on disk.
@@ -275,8 +345,9 @@ pub async fn flush_memtable(
     config: &FlushConfig,
     commit_timestamp: Timestamp,
     io: &dyn IoScheduler,
+    registrations: &[ColumnarRegistration],
 ) -> GalaxResult<FlushResult> {
-    flush_memtable_inner(memtable, config, commit_timestamp, None, io).await
+    flush_memtable_inner(memtable, config, commit_timestamp, None, io, registrations).await
 }
 
 /// Flush a sealed memtable with AEGIS-256 TDE encryption.
@@ -287,8 +358,9 @@ pub async fn flush_memtable_encrypted(
     commit_timestamp: Timestamp,
     tde: &galaxdb_crypto::AegisTdeModule,
     io: &dyn IoScheduler,
+    registrations: &[ColumnarRegistration],
 ) -> GalaxResult<FlushResult> {
-    flush_memtable_inner(memtable, config, commit_timestamp, Some(tde), io).await
+    flush_memtable_inner(memtable, config, commit_timestamp, Some(tde), io, registrations).await
 }
 
 #[cfg(not(feature = "aegis-tde"))]
@@ -297,8 +369,9 @@ pub async fn flush_memtable(
     config: &FlushConfig,
     commit_timestamp: Timestamp,
     io: &dyn IoScheduler,
+    registrations: &[ColumnarRegistration],
 ) -> GalaxResult<FlushResult> {
-    flush_memtable_inner(memtable, config, commit_timestamp, None, io).await
+    flush_memtable_inner(memtable, config, commit_timestamp, None, io, registrations).await
 }
 
 #[cfg(feature = "aegis-tde")]
@@ -308,6 +381,7 @@ async fn flush_memtable_inner(
     commit_timestamp: Timestamp,
     tde: Option<&galaxdb_crypto::AegisTdeModule>,
     io: &dyn IoScheduler,
+    registrations: &[ColumnarRegistration],
 ) -> GalaxResult<FlushResult> {
     // Step 1: Get all entries sorted by primary key
     let entries = memtable.iter_all();
@@ -332,7 +406,7 @@ async fn flush_memtable_inner(
     // Following RocksDB's BlockBasedTable pattern: each SST file contains
     // multiple small data blocks with a block index at the end. A point read
     // loads one block (~64KB) from NVMe instead of the entire SST file.
-    let chunks = split_into_blocks(&entries, config);
+    let chunks = split_into_blocks(&entries, config, registrations);
 
     let mut sst_paths: Vec<PathBuf> = Vec::new();
     let mut block_ids: Vec<BlockId> = Vec::new();
@@ -349,13 +423,13 @@ async fn flush_memtable_inner(
 
     for chunk in &chunks {
         let block_id = allocate_block_id();
-        let columns = entries_to_columns(chunk);
 
-        // Create the PAX block with KV-optimized codecs:
-        // Key column (0): Zstd — keys are small, compression helps.
-        // Value column (1): None — uncompressed for fast single-row reads.
-        // Timestamp column (2): None — fixed 8-byte values.
-        let kv_codecs = [CodecId::Zstd, CodecId::None, CodecId::None];
+        // Build PAX columns for this block: legacy [key, value, ts], plus
+        // one typed column per SQL column when the block belongs to a
+        // columnar-registered table (HTAP ADR-0002). Codecs: key=Zstd,
+        // value=None (fast single-row reads), ts=None, then a per-type codec
+        // for each appended data column.
+        let (columns, codecs) = build_block_columns(chunk, registrations);
         // The block header timestamp is the newest MVCC commit in this
         // block (a real row timestamp, not a flush sequence number). Per-row
         // visibility comes from the timestamp column; the header is a fast
@@ -366,7 +440,7 @@ async fn flush_memtable_inner(
             .map(|(_, v)| v.timestamp)
             .max()
             .unwrap_or(commit_timestamp);
-        let pax_block = PaxBlock::write_with_codecs(block_id, block_ts, &columns, &kv_codecs)?;
+        let pax_block = PaxBlock::write_with_codecs(block_id, block_ts, &columns, &codecs)?;
         let block_bytes = pax_block.serialize()?;
         let encrypted_bytes = encrypt_block_data(&block_bytes, tde)?;
 
@@ -442,6 +516,7 @@ async fn flush_memtable_inner(
     commit_timestamp: Timestamp,
     _tde: Option<&()>,
     io: &dyn IoScheduler,
+    registrations: &[ColumnarRegistration],
 ) -> GalaxResult<FlushResult> {
     // Step 1: Get all entries sorted by primary key
     let entries = memtable.iter_all();
@@ -463,7 +538,7 @@ async fn flush_memtable_inner(
         .map_err(GalaxError::Io)?;
 
     // Step 2: Split entries into small block-sized chunks (~100 rows each).
-    let chunks = split_into_blocks(&entries, config);
+    let chunks = split_into_blocks(&entries, config, registrations);
 
     let mut sst_paths: Vec<PathBuf> = Vec::new();
     let mut block_ids: Vec<BlockId> = Vec::new();
@@ -479,15 +554,16 @@ async fn flush_memtable_inner(
 
     for chunk in &chunks {
         let block_id = allocate_block_id();
-        let columns = entries_to_columns(chunk);
 
-        let kv_codecs = [CodecId::Zstd, CodecId::None, CodecId::None];
+        // Legacy [key, value, ts] plus one typed column per SQL column when
+        // the block belongs to a columnar-registered table (HTAP ADR-0002).
+        let (columns, codecs) = build_block_columns(chunk, registrations);
         let block_ts = chunk
             .iter()
             .map(|(_, v)| v.timestamp)
             .max()
             .unwrap_or(commit_timestamp);
-        let pax_block = PaxBlock::write_with_codecs(block_id, block_ts, &columns, &kv_codecs)?;
+        let pax_block = PaxBlock::write_with_codecs(block_id, block_ts, &columns, &codecs)?;
         let block_bytes = pax_block.serialize()?;
 
         let block_file_offset = current_sst_data.len() as u64;
@@ -564,8 +640,9 @@ pub async fn flush_memtable_with_wal(
     wal_writer: &WalWriter,
     io: &dyn IoScheduler,
 ) -> GalaxResult<FlushResult> {
-    // Step 1: Flush memtable to SST files
-    let mut result = flush_memtable(memtable, config, commit_timestamp, io).await?;
+    // Step 1: Flush memtable to SST files (no columnar registrations on the
+    // WAL-checkpoint convenience path; the engine's flush threads them).
+    let mut result = flush_memtable(memtable, config, commit_timestamp, io, &[]).await?;
 
     // Step 2: Write CHECKPOINT record to WAL
     let checkpoint_seq_no = wal_writer
@@ -620,7 +697,7 @@ mod tests {
         };
 
         let memtable = Memtable::new(1024 * 1024 * 1024);
-        let result = flush_memtable(&memtable, &config, 100, &test_io()).await.unwrap();
+        let result = flush_memtable(&memtable, &config, 100, &test_io(), &[]).await.unwrap();
 
         assert!(result.sst_paths.is_empty());
         assert!(result.block_ids.is_empty());
@@ -642,7 +719,7 @@ mod tests {
         let memtable = create_test_memtable(num_entries);
         memtable.seal();
 
-        let result = flush_memtable(&memtable, &config, 42, &test_io()).await.unwrap();
+        let result = flush_memtable(&memtable, &config, 42, &test_io(), &[]).await.unwrap();
 
         assert_eq!(result.rows_flushed, num_entries);
         assert!(!result.sst_paths.is_empty());
@@ -711,7 +788,7 @@ mod tests {
         let memtable = create_test_memtable(num_entries);
         memtable.seal();
 
-        let result = flush_memtable(&memtable, &config, 1, &test_io()).await.unwrap();
+        let result = flush_memtable(&memtable, &config, 1, &test_io(), &[]).await.unwrap();
 
         // Should have multiple SST files
         assert!(
@@ -746,7 +823,7 @@ mod tests {
         };
 
         let memtable = create_test_memtable(10);
-        let result = flush_memtable(&memtable, &config, 1, &test_io()).await.unwrap();
+        let result = flush_memtable(&memtable, &config, 1, &test_io(), &[]).await.unwrap();
 
         // SST files should follow the sst_N.pax naming convention
         for path in &result.sst_paths {
@@ -773,7 +850,7 @@ mod tests {
         // Insert another live value
         memtable.put(b"key-c".to_vec(), 3, Some(b"value-c".to_vec()));
 
-        let result = flush_memtable(&memtable, &config, 10, &test_io()).await.unwrap();
+        let result = flush_memtable(&memtable, &config, 10, &test_io(), &[]).await.unwrap();
 
         assert_eq!(result.rows_flushed, 3);
         assert_eq!(result.sst_paths.len(), 1);
@@ -964,7 +1041,7 @@ mod tests {
             })
             .collect();
 
-        let blocks = split_into_blocks(&entries, &config);
+        let blocks = split_into_blocks(&entries, &config, &[]);
 
         // 12 entries with max 5 per block → 3 blocks (5, 5, 2)
         assert_eq!(blocks.len(), 3);
@@ -990,7 +1067,7 @@ mod tests {
             })
             .collect();
 
-        let blocks = split_into_blocks(&entries, &config);
+        let blocks = split_into_blocks(&entries, &config, &[]);
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].len(), 10);
     }
@@ -999,7 +1076,7 @@ mod tests {
     fn split_into_blocks_empty_entries() {
         let config = FlushConfig::default();
         let entries: Vec<(Vec<u8>, VersionedValue)> = Vec::new();
-        let blocks = split_into_blocks(&entries, &config);
+        let blocks = split_into_blocks(&entries, &config, &[]);
         assert!(blocks.is_empty());
     }
 
