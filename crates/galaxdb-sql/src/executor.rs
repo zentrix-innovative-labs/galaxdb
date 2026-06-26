@@ -804,25 +804,51 @@ fn exec_create_table(
         storage_mode: default_storage_mode_for_new_table(),
     };
 
+    // If this table uses columnar storage, register a splitter so flush /
+    // compaction lay its rows out as typed PAX columns (HTAP ADR-0002).
+    register_columnar_if_enabled(&stmt.table_name, &entry, ctx);
+
     Arc::make_mut(&mut ctx.catalog).create_table(stmt.table_name.clone(), entry)?;
     Ok(ExecuteResult::Ok(format!("CREATE TABLE {}", stmt.table_name)))
 }
 
+/// Register a [`crate::columnar::CatalogRowSplitter`] on the engine when the
+/// table uses [`StorageMode::Columnar`] and all its column types are
+/// recognized. A no-op for legacy tables or unrecognized schemas.
+fn register_columnar_if_enabled(table: &str, entry: &TableEntry, ctx: &ExecutorContext) {
+    if entry.storage_mode != StorageMode::Columnar {
+        return;
+    }
+    if let Some(splitter) = crate::columnar::CatalogRowSplitter::from_table_entry(entry) {
+        let prefix = format!("{table}:").into_bytes();
+        ctx.engine
+            .register_columnar_table(prefix, std::sync::Arc::new(splitter));
+    }
+}
+
 /// The physical storage layout assigned to a newly created table.
 ///
-/// Today this is [`StorageMode::Legacy`] because the columnar write path
-/// (HTAP task 5) does not exist yet — marking a table `Columnar` while
-/// storage still writes the `col=v|...` row format would make the catalog
-/// lie about the on-disk layout (engineering-principles §2). When task 5
-/// lands the columnar write path, this flips to [`StorageMode::Columnar`]
-/// in exactly one place.
+/// Defaults to [`StorageMode::Columnar`]: the columnar write path (flush +
+/// compaction) and the SQL splitter now exist, so new tables persist one
+/// typed PAX column per SQL column (HTAP ADR-0002). This is read-transparent
+/// today — point reads, scans, and the wire path still use the row `value`
+/// blob; the appended typed columns get their reader when the analytical
+/// `scan_arrow` path lands (HTAP task 7). Tables whose column types are not
+/// all recognized silently stay effectively legacy (the splitter declines to
+/// register), and any block whose rows fail to coerce is written legacy — so
+/// correctness never depends on the columnar columns.
 fn default_storage_mode_for_new_table() -> StorageMode {
-    StorageMode::Legacy
+    StorageMode::Columnar
 }
 
 fn exec_drop_table(name: &str, if_exists: bool, ctx: &mut ExecutorContext) -> GalaxResult<ExecuteResult> {
     match Arc::make_mut(&mut ctx.catalog).drop_table(name) {
-        Ok(_) => Ok(ExecuteResult::Ok(format!("DROP TABLE {}", name))),
+        Ok(_) => {
+            // Drop any columnar registration for this table's key prefix.
+            ctx.engine
+                .unregister_columnar_table(format!("{name}:").as_bytes());
+            Ok(ExecuteResult::Ok(format!("DROP TABLE {}", name)))
+        }
         Err(GalaxError::TableNotFound(_)) if if_exists => {
             Ok(ExecuteResult::Ok(format!("DROP TABLE IF EXISTS {}", name)))
         }

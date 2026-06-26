@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod auth_store;
+pub mod columnar;
 pub mod executor;
 pub mod parser;
 pub mod planner;

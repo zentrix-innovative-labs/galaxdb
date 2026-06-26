@@ -201,10 +201,9 @@ fn legacy_drop_table_succeeds() {
 
 #[test]
 fn create_table_records_storage_mode_in_catalog() {
-    // HTAP task 4: a newly created table carries a StorageMode in the
-    // catalog. The default is Legacy until the columnar write path (task 5)
-    // exists, so the catalog never claims a columnar layout storage cannot
-    // yet produce (engineering-principles §2).
+    // HTAP task 4/5: a newly created table is Columnar by default now that
+    // the columnar write path + SQL splitter exist (read-transparent until
+    // scan_arrow lands).
     let mut ctx = test_ctx();
     let stmt = CreateTableStmt {
         table_name: "t".to_string(),
@@ -221,16 +220,95 @@ fn create_table_records_storage_mode_in_catalog() {
     execute_with_context(&plan, &mut ctx).unwrap();
 
     let entry = ctx.catalog.get_table("t").expect("table in catalog");
-    assert_eq!(entry.storage_mode, galaxdb_common::StorageMode::Legacy);
+    assert_eq!(entry.storage_mode, galaxdb_common::StorageMode::Columnar);
 }
 
 #[test]
 fn storage_mode_default_is_legacy() {
-    // The Default impl matches the current on-disk reality.
+    // The type-level Default stays Legacy: a table loaded from an older
+    // catalog with no recorded mode is treated as legacy row storage.
     assert_eq!(
         galaxdb_common::StorageMode::default(),
         galaxdb_common::StorageMode::Legacy
     );
+}
+
+#[test]
+fn columnar_table_flush_writes_typed_columns_end_to_end() {
+    // Full path: CREATE TABLE (columnar by default) registers a splitter on
+    // the engine; INSERT writes the row blob; flush lays out typed PAX
+    // columns with the DATE coerced to its physical Int32 days encoding.
+    let mut ctx = test_ctx();
+    let create = CreateTableStmt {
+        table_name: "events".into(),
+        columns: vec![
+            ColumnDef {
+                name: "id".into(),
+                data_type: "BIGINT".into(),
+                nullable: false,
+                primary_key: true,
+                embedding: None,
+            },
+            ColumnDef {
+                name: "created".into(),
+                data_type: "DATE".into(),
+                nullable: true,
+                primary_key: false,
+                embedding: None,
+            },
+        ],
+        if_not_exists: false,
+    };
+    execute_with_context(&plan_create_table(create), &mut ctx).unwrap();
+
+    // INSERT a row; DATE arrives as a text literal (as the parser produces).
+    let insert = plan_insert(
+        "events".to_string(),
+        vec!["id".to_string(), "created".to_string()],
+        vec![Value::Integer(1), Value::Text("2000-01-01".into())],
+    );
+    execute_with_context(&insert, &mut ctx).unwrap();
+
+    // SELECT/point-read still returns the original value (read-transparent).
+    assert!(ctx.engine.get(b"events:1").is_some());
+
+    // Flush and inspect the on-disk columnar block.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(ctx.engine.flush_memtable()).unwrap();
+
+    let dir = ctx.engine.data_dir().to_path_buf();
+    let mut checked = false;
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        let fname = path.file_name().unwrap().to_str().unwrap().to_string();
+        if !(fname.starts_with("sst_") && fname.ends_with(".pax")) {
+            continue;
+        }
+        let data = std::fs::read(&path).unwrap();
+        let Ok(index) = galaxdb_storage::sst::SstBlockIndex::from_file_data(&data) else {
+            continue;
+        };
+        for be in &index.entries {
+            let start = be.file_offset as usize;
+            let end = start + be.block_len as usize;
+            let block = galaxdb_storage::pax::PaxBlock::deserialize(&data[start..end]).unwrap();
+            if block.header.row_count == 0 {
+                continue;
+            }
+            // 2 SQL columns → 3 base + 2 (data,validity) pairs = 7 columns.
+            assert_eq!(block.header.column_count, 7);
+            let created = block
+                .read_column(galaxdb_storage::columnar::data_column_index(1))
+                .unwrap();
+            // 2000-01-01 = day 10957 since the Unix epoch, as 4-byte LE i32.
+            assert_eq!(
+                i32::from_le_bytes(created[0].clone().try_into().unwrap()),
+                10957
+            );
+            checked = true;
+        }
+    }
+    assert!(checked, "expected a columnar SST block for events");
 }
 
 #[test]
