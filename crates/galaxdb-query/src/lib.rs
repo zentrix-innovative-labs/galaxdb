@@ -37,6 +37,7 @@ use galaxdb_sql::planner::Value;
 
 pub mod schema;
 pub mod arrow_batch;
+pub mod error;
 pub mod source;
 pub mod backend;
 

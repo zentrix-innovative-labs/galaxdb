@@ -29,11 +29,10 @@ use crate::{
     ResultStream, ScanRequest,
 };
 
-/// Wrap a DataFusion error as a GalaxDB-owned [`GalaxError::Query`]. The
-/// underlying text is kept for diagnostics; sanitizing it to a stable
-/// SQLSTATE-coded message is HTAP task 12.
+/// Wrap a DataFusion error as a GalaxDB-owned [`GalaxError::Query`] with a
+/// PostgreSQL SQLSTATE and a sanitized message (HTAP task 12, Req 7.3).
 fn query_err(e: DataFusionError) -> GalaxError {
-    GalaxError::Query(e.to_string())
+    crate::error::map_datafusion_error(e)
 }
 
 /// Adapts a GalaxDB [`ArrowSource`] to a DataFusion `TableProvider`.
@@ -136,8 +135,9 @@ impl QueryBackend for DataFusionBackend {
                 .lock()
                 .map_err(|_| GalaxError::Internal("query backend registry lock".into()))?;
             for table in &plan.referenced_tables {
-                let source = sources.get(table).ok_or_else(|| {
-                    GalaxError::Query(format!("table '{table}' is not registered with the query engine"))
+                let source = sources.get(table).ok_or_else(|| GalaxError::Query {
+                    sqlstate: "42P01",
+                    message: format!("table '{table}' is not registered with the query engine"),
                 })?;
                 let schema = source.schema(table)?;
                 let provider = GalaxTableProvider {
@@ -346,7 +346,7 @@ mod tests {
             body: PlanBody::AnalyticalSql("SELECT * FROM ghost".into()),
         };
         let result = backend.execute(plan, &QueryContext::default()).await;
-        assert!(matches!(result, Err(GalaxError::Query(_))));
+        assert!(matches!(result, Err(GalaxError::Query { .. })));
     }
 
     // ---- Full-stack integration: real engine → columnar → Arrow → JOIN ----

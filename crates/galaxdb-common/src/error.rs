@@ -151,10 +151,16 @@ pub enum GalaxError {
     FeatureNotSupported(String),
 
     /// A relational/analytical query failed in the query engine
-    /// (`galaxdb-query`). The message is GalaxDB-phrased; the underlying
-    /// DataFusion error text is confined to logs, never the wire (Req 7.3).
-    #[error("query error: {0}")]
-    Query(String),
+    /// (`galaxdb-query`). `sqlstate` is the PostgreSQL error class the wire
+    /// reports; `message` is GalaxDB-phrased — the underlying DataFusion
+    /// error text is confined to logs, never the wire (Req 7.3).
+    #[error("{message}")]
+    Query {
+        /// PostgreSQL SQLSTATE for this query error.
+        sqlstate: &'static str,
+        /// GalaxDB-phrased, DataFusion-free message.
+        message: String,
+    },
 
     /// An internal error that doesn't fit other categories.
     #[error("internal error: {0}")]
@@ -191,6 +197,9 @@ impl GalaxError {
             | GalaxError::SemanticConsistencyRequired
             | GalaxError::FeatureNotSupported(_)
             | GalaxError::NotYetAvailable { .. } => "0A000", // feature_not_supported
+
+            // Query-engine errors carry their own SQLSTATE.
+            GalaxError::Query { sqlstate, .. } => sqlstate,
 
             // Class 42 — restricted/generated column update (the embedding
             // source column behaves like a GENERATED ALWAYS column).
