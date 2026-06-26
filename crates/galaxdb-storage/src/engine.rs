@@ -2114,11 +2114,11 @@ mod tests {
         fn column_types(&self) -> Vec<galaxdb_common::ColumnType> {
             vec![galaxdb_common::ColumnType::Int64, galaxdb_common::ColumnType::Text]
         }
-        fn split(&self, value: &[u8]) -> Option<Vec<Vec<u8>>> {
+        fn split(&self, value: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
             if value.len() < 8 {
                 return None;
             }
-            Some(vec![value[0..8].to_vec(), value[8..].to_vec()])
+            Some(vec![Some(value[0..8].to_vec()), Some(value[8..].to_vec())])
         }
     }
 
@@ -2161,18 +2161,23 @@ mod tests {
                 let end = start + be.block_len as usize;
                 let block = crate::pax::PaxBlock::deserialize(&data[start..end]).unwrap();
                 assert_eq!(
-                    block.header.column_count, 5,
-                    "columnar block = key,value,ts,id,name"
+                    block.header.column_count, 7,
+                    "columnar block = key,value,ts + (id,id_valid) + (name,name_valid)"
                 );
-                let ids = block.read_column(crate::columnar::FIRST_DATA_COLUMN).unwrap();
+                let ids = block.read_column(crate::columnar::data_column_index(0)).unwrap();
                 let names = block
-                    .read_column(crate::columnar::FIRST_DATA_COLUMN + 1)
+                    .read_column(crate::columnar::data_column_index(1))
                     .unwrap();
                 // Row order within the block is primary-key sorted: t:1,t:2,t:3.
                 assert_eq!(i64::from_le_bytes(ids[0].clone().try_into().unwrap()), 1);
                 assert_eq!(names[0], b"alice");
                 assert_eq!(i64::from_le_bytes(ids[2].clone().try_into().unwrap()), 3);
                 assert_eq!(names[2], b"carol");
+                // Validity companions: all present.
+                let id_valid = block
+                    .read_column(crate::columnar::validity_column_index(0))
+                    .unwrap();
+                assert_eq!(id_valid[0], vec![1u8]);
                 checked_columnar = true;
             }
         }
@@ -2246,8 +2251,8 @@ mod tests {
                 // that holds rows must be a 5-column columnar block.
                 if block.header.row_count > 0 {
                     assert_eq!(
-                        block.header.column_count, 5,
-                        "compacted columnar block must keep key,value,ts,id,name"
+                        block.header.column_count, 7,
+                        "compacted columnar block must keep base + (data,validity) pairs"
                     );
                     saw_columnar_block = true;
                 }
