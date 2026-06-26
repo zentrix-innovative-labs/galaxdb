@@ -150,6 +150,12 @@ pub enum GalaxError {
     #[error("feature not supported: {0}")]
     FeatureNotSupported(String),
 
+    /// A relational/analytical query failed in the query engine
+    /// (`galaxdb-query`). The message is GalaxDB-phrased; the underlying
+    /// DataFusion error text is confined to logs, never the wire (Req 7.3).
+    #[error("query error: {0}")]
+    Query(String),
+
     /// An internal error that doesn't fit other categories.
     #[error("internal error: {0}")]
     Internal(String),

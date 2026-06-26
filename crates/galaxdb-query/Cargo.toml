@@ -11,6 +11,7 @@ galaxdb-common.workspace = true
 galaxdb-sql.workspace = true
 galaxdb-storage = { path = "../galaxdb-storage" }
 arrow.workspace = true
+async-trait = "0.1"
 tracing.workspace = true
 
 # Apache DataFusion — the relational/analytical execution engine. This is
@@ -23,3 +24,4 @@ datafusion = "=52.5.0"
 
 [dev-dependencies]
 tokio = { workspace = true }
+tempfile = { workspace = true }

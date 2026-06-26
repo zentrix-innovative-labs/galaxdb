@@ -37,6 +37,8 @@ use galaxdb_sql::planner::Value;
 
 pub mod schema;
 pub mod arrow_batch;
+pub mod source;
+pub mod backend;
 
 /// MVCC read point for a scan. The same snapshot mechanism backs both
 /// `AT VERSION` time-travel and the read timestamp of an open transaction
@@ -197,10 +199,18 @@ pub struct GalaxLogicalPlan {
 /// implementation (HTAP task 11) is confined to this crate; this trait is
 /// the Req 7.5 escape hatch that lets an alternative backend be substituted
 /// without changing any other crate's public surface.
+///
+/// `execute` is async because the underlying engine (DataFusion) is async;
+/// the GalaxDB server is already async, so this composes naturally.
+#[async_trait::async_trait]
 pub trait QueryBackend: Send + Sync {
     /// Register a table's [`ArrowSource`] so the backend can scan it.
     fn register(&self, table: &str, source: Arc<dyn ArrowSource>) -> GalaxResult<()>;
 
     /// Execute a logical plan, returning a stream of Arrow result batches.
-    fn execute(&self, plan: GalaxLogicalPlan, ctx: &QueryContext) -> GalaxResult<ResultStream>;
+    async fn execute(
+        &self,
+        plan: GalaxLogicalPlan,
+        ctx: &QueryContext,
+    ) -> GalaxResult<ResultStream>;
 }

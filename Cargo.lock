@@ -2782,10 +2782,12 @@ name = "galaxdb-query"
 version = "0.2.0"
 dependencies = [
  "arrow",
+ "async-trait",
  "datafusion",
  "galaxdb-common",
  "galaxdb-sql",
  "galaxdb-storage",
+ "tempfile",
  "tokio",
  "tracing",
 ]

@@ -2576,6 +2576,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scan_columnar_bridges_legacy_blocks() {
+        // HTAP task 8: a block written BEFORE the table was registered
+        // columnar is a legacy 3-column block. scan_columnar must still read
+        // it by decoding the row blob via the splitter (the migration
+        // bridge), so existing data dirs keep working.
+        let engine = test_engine();
+        engine.put_sync(b"t:1".to_vec(), id_name_value(1, "alice")).unwrap();
+        engine.flush_memtable().await.unwrap(); // legacy 3-column block
+
+        // Register only now, then scan: the legacy block is bridged.
+        engine.register_columnar_table(b"t:".to_vec(), Arc::new(IdNameSplitter));
+        let batch = engine.scan_columnar(b"t:", &[], &[], u64::MAX).unwrap();
+        assert_eq!(batch.num_rows, 1);
+        assert_eq!(
+            i64::from_le_bytes(batch.columns[0].1[0].clone().unwrap().try_into().unwrap()),
+            1
+        );
+        assert_eq!(batch.columns[1].1[0].clone().unwrap(), b"alice");
+    }
+
+    #[tokio::test]
     async fn put_and_get_roundtrip() {
         let engine = test_engine();
         engine.put(b"key1".to_vec(), b"value1".to_vec()).await.unwrap();
