@@ -34,6 +34,16 @@ pub struct CatalogRowSplitter {
 }
 
 impl CatalogRowSplitter {
+    /// Build a splitter from a `(name, SqlType)` column list (declaration
+    /// order). Used by the analytical path, which already has the resolved
+    /// logical types. Returns `None` for an empty column list.
+    pub fn from_columns(columns: Vec<(String, SqlType)>) -> Option<Self> {
+        if columns.is_empty() {
+            return None;
+        }
+        Some(Self { columns })
+    }
+
     /// Build a splitter from a catalog [`TableEntry`].
     ///
     /// Returns `None` if the table has no columns or if **any** column's

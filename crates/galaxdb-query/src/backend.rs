@@ -159,6 +159,104 @@ impl QueryBackend for DataFusionBackend {
     }
 }
 
+/// One columnar table described for an analytical query:
+/// `(table name, key prefix, (column name, logical type) per column)`.
+pub type TableSpec = (String, Vec<u8>, Vec<(String, galaxdb_sql::SqlType)>);
+
+/// Analytical result rendered as text: `(column names, rows of cells)` where
+/// each cell is `Some(text)` or `None` for SQL NULL.
+pub type StringRows = (Vec<String>, Vec<Vec<Option<String>>>);
+
+/// Execute analytical SQL against columnar tables and return the result as
+/// string rows (HTAP task 15 — the bridge the embedded/server layer calls).
+///
+/// `tables` is `(name, key_prefix, fields)` for every table the query
+/// references. This registers each table's columnar splitter on the engine
+/// (idempotent), registers an Arrow source + DataFusion provider, runs the
+/// SQL at `snapshot`, and renders each result cell to its text form (`None`
+/// = SQL NULL). It is **blocking**: it owns a short-lived runtime and is
+/// meant to be called from a blocking context (the server runs the engine on
+/// `spawn_blocking`), never from a runtime worker thread.
+pub fn run_analytical_sql_blocking(
+    engine: Arc<galaxdb_storage::engine::Engine>,
+    tables: &[TableSpec],
+    sql: &str,
+    snapshot: ReadSnapshot,
+) -> GalaxResult<StringRows> {
+    use crate::source::EngineArrowSource;
+
+    // Ensure every referenced table has a columnar splitter registered so
+    // `scan_columnar` can read it (idempotent; a no-op if already present).
+    for (_name, prefix, fields) in tables {
+        if let Some(splitter) =
+            galaxdb_sql::columnar::CatalogRowSplitter::from_columns(fields.clone())
+        {
+            engine.register_columnar_table(prefix.clone(), Arc::new(splitter));
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| GalaxError::Internal(format!("query runtime: {e}")))?;
+
+    rt.block_on(async move {
+        let session = SessionContext::new();
+        for (name, prefix, fields) in tables {
+            let source: Arc<dyn ArrowSource> = Arc::new(EngineArrowSource::new(
+                engine.clone(),
+                prefix.clone(),
+                fields.clone(),
+            ));
+            let schema = source.schema(name)?;
+            let provider = GalaxTableProvider {
+                table: name.clone(),
+                source,
+                schema,
+                snapshot: snapshot.clone(),
+            };
+            session
+                .register_table(name.as_str(), Arc::new(provider))
+                .map_err(query_err)?;
+        }
+        let df = session.sql(sql).await.map_err(query_err)?;
+        let col_names: Vec<String> =
+            df.schema().fields().iter().map(|f| f.name().to_string()).collect();
+        let batches = df.collect().await.map_err(query_err)?;
+        let rows = format_rows(&batches)?;
+        Ok((col_names, rows))
+    })
+}
+
+/// Render result batches to row-major text cells (`None` = SQL NULL) using
+/// Arrow's display formatters, so every Arrow type renders correctly.
+fn format_rows(batches: &[RecordBatch]) -> GalaxResult<Vec<Vec<Option<String>>>> {
+    use arrow::util::display::{ArrayFormatter, FormatOptions};
+    let opts = FormatOptions::default();
+    let mut rows = Vec::new();
+    for batch in batches {
+        let fmts: Vec<ArrayFormatter> = batch
+            .columns()
+            .iter()
+            .map(|c| ArrayFormatter::try_new(c.as_ref(), &opts))
+            .collect::<Result<_, _>>()
+            .map_err(|e| GalaxError::Internal(format!("arrow formatter: {e}")))?;
+        for r in 0..batch.num_rows() {
+            let mut row = Vec::with_capacity(fmts.len());
+            for (ci, f) in fmts.iter().enumerate() {
+                if batch.column(ci).is_null(r) {
+                    row.push(None);
+                } else {
+                    row.push(Some(f.value(r).to_string()));
+                }
+            }
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

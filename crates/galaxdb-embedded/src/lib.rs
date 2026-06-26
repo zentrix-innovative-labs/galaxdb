@@ -1014,7 +1014,6 @@ impl Database {
         q: &sqlparser::ast::Query,
         session: Option<&galaxdb_auth::SessionContext>,
     ) -> GalaxResult<QueryResult> {
-        check_select_supported(q)?;
         // Detect SEMANTIC_MATCH in WHERE and route to vector search.
         if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
             let table = extract_table(q);
@@ -1040,6 +1039,16 @@ impl Database {
             }));
             let res = execute_with_context(&plan, &mut ctx)?;
             return Ok(query_result_from(res));
+        }
+
+        // Joins / aggregates / GROUP BY / subqueries / ORDER BY / LIMIT route
+        // to the DataFusion analytical engine (HTAP task 15). The native scan
+        // below handles only simple single-table queries.
+        if matches!(
+            galaxdb_sql::classify::classify_query(q),
+            galaxdb_sql::classify::StatementClass::Analytical
+        ) {
+            return self.analytical_query(q, session);
         }
 
         let (columns, filter) = extract_projection_and_filter(q);
@@ -1068,6 +1077,95 @@ impl Database {
         }));
         let res = execute_with_context(&plan, &mut ctx)?;
         Ok(query_result_from(res))
+    }
+
+    /// Execute an analytical SELECT (joins / aggregates / GROUP BY /
+    /// subqueries / ORDER BY / LIMIT) via the DataFusion query engine behind
+    /// `galaxdb-query` (HTAP task 15). Collects the referenced tables,
+    /// authorizes SELECT on each (when a session is attached), builds the
+    /// columnar Arrow sources, runs the SQL, and maps the Arrow result to
+    /// wire rows. `NULL` cells render as the literal `"NULL"`, matching the
+    /// native path's text rendering.
+    fn analytical_query(
+        &self,
+        q: &sqlparser::ast::Query,
+        session: Option<&galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        let tables = collect_table_names(q);
+        if tables.is_empty() {
+            return Err(GalaxError::FeatureNotSupported(
+                "analytical query references no base table".into(),
+            ));
+        }
+        self.authorize_select(&tables, session)?;
+
+        let mut metas: Vec<galaxdb_query::backend::TableSpec> =
+            Vec::with_capacity(tables.len());
+        for t in &tables {
+            let entry = self
+                .catalog
+                .get_table(t)
+                .ok_or_else(|| GalaxError::TableNotFound(t.clone()))?;
+            let fields = entry
+                .columns
+                .iter()
+                .map(|c| {
+                    let ty = galaxdb_sql::SqlType::from_sql_name(&c.data_type)
+                        .unwrap_or(galaxdb_sql::SqlType::Text);
+                    (c.name.clone(), ty)
+                })
+                .collect::<Vec<_>>();
+            metas.push((t.clone(), format!("{t}:").into_bytes(), fields));
+        }
+
+        let sql = q.to_string();
+        let (col_names, rows) = galaxdb_query::backend::run_analytical_sql_blocking(
+            self.engine.clone(),
+            &metas,
+            &sql,
+            galaxdb_query::ReadSnapshot::Latest,
+        )?;
+
+        let out_rows = rows
+            .into_iter()
+            .map(|cells| QueryRow {
+                values: col_names
+                    .iter()
+                    .cloned()
+                    .zip(cells.into_iter().map(|c| c.unwrap_or_else(|| "NULL".to_string())))
+                    .collect(),
+            })
+            .collect();
+        Ok(QueryResult::Rows(out_rows))
+    }
+
+    /// Authorize `SELECT` on every referenced table before an analytical
+    /// query runs, mirroring the executor's chokepoint so the analytical
+    /// path is not a privilege-escalation bypass. Trusted in-process mode
+    /// (no session) skips the check, exactly like the native executor.
+    fn authorize_select(
+        &self,
+        tables: &[String],
+        session: Option<&galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<()> {
+        use galaxdb_auth::{Action, Authorizer, ObjectRef, TableGrantAuthorizer};
+        let Some(session) = session else {
+            return Ok(());
+        };
+        let store = galaxdb_sql::auth_store::AuthStore::new(self.engine.clone());
+        let authz = TableGrantAuthorizer::new(Arc::new(move |r: &str, t: &str, a: Action| {
+            store.has_grant(r, t, a)
+        }));
+        for t in tables {
+            authz
+                .check(&session.role, Action::Select, &ObjectRef::Table(t.clone()))
+                .map_err(|e| GalaxError::InsufficientPrivilege {
+                    role: e.role.as_str().to_string(),
+                    action: e.action,
+                    object: e.object,
+                })?;
+        }
+        Ok(())
     }
 
     // -----------------------------------------------------------------
@@ -1372,7 +1470,6 @@ impl Database {
     }
 
     fn exec_select(&mut self, q: &sqlparser::ast::Query) -> GalaxResult<QueryResult> {
-        check_select_supported(q)?;
         let table = extract_table(q);
 
         // Detect SEMANTIC_MATCH(...) in the WHERE clause and route to
@@ -1389,6 +1486,16 @@ impl Database {
             let res = execute_with_context(&plan, &mut ctx)?;
             self.catalog = std::mem::take(&mut ctx.catalog);
             return Ok(query_result_from(res));
+        }
+
+        // Analytical (joins/aggregates/GROUP BY/subqueries/ORDER BY/LIMIT)
+        // → DataFusion engine (HTAP task 15).
+        if matches!(
+            galaxdb_sql::classify::classify_query(q),
+            galaxdb_sql::classify::StatementClass::Analytical
+        ) {
+            let session = self.session.clone();
+            return self.analytical_query(q, session.as_ref());
         }
 
         let (columns, filter) = extract_projection_and_filter(q);
@@ -2355,6 +2462,56 @@ fn count_placeholders(sql: &str) -> usize {
     max
 }
 
+/// Collect the base table names a query references (top-level FROM + JOINs,
+/// recursing into derived subqueries and set operations). Used by the
+/// analytical path to know which columnar sources to register. WHERE-clause
+/// subqueries are not yet walked; an unrecognized table simply surfaces as a
+/// typed "table not found" from the query engine, never a wrong result.
+fn collect_table_names(q: &sqlparser::ast::Query) -> Vec<String> {
+    let mut out = Vec::new();
+    collect_from_setexpr(q.body.as_ref(), &mut out);
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn collect_from_setexpr(se: &sqlparser::ast::SetExpr, out: &mut Vec<String>) {
+    use sqlparser::ast::SetExpr;
+    match se {
+        SetExpr::Select(s) => {
+            for twj in &s.from {
+                collect_from_table_factor(&twj.relation, out);
+                for j in &twj.joins {
+                    collect_from_table_factor(&j.relation, out);
+                }
+            }
+        }
+        SetExpr::Query(inner) => collect_from_setexpr(inner.body.as_ref(), out),
+        SetExpr::SetOperation { left, right, .. } => {
+            collect_from_setexpr(left, out);
+            collect_from_setexpr(right, out);
+        }
+        _ => {}
+    }
+}
+
+fn collect_from_table_factor(tf: &sqlparser::ast::TableFactor, out: &mut Vec<String>) {
+    use sqlparser::ast::TableFactor;
+    match tf {
+        TableFactor::Table { name, .. } => {
+            out.push(name.to_string().trim_matches('"').to_string());
+        }
+        TableFactor::Derived { subquery, .. } => collect_from_setexpr(subquery.body.as_ref(), out),
+        TableFactor::NestedJoin { table_with_joins, .. } => {
+            collect_from_table_factor(&table_with_joins.relation, out);
+            for j in &table_with_joins.joins {
+                collect_from_table_factor(&j.relation, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn extract_table(q: &sqlparser::ast::Query) -> String {
     if let sqlparser::ast::SetExpr::Select(s) = q.body.as_ref() {
         if let Some(f) = s.from.first() {
@@ -3260,31 +3417,55 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_select_constructs_are_rejected_not_silently_wrong() {
+    fn analytical_select_constructs_execute_via_datafusion() {
         let mut db = test_db();
         db.execute("CREATE TABLE a (id INT PRIMARY KEY, name TEXT)").unwrap();
         db.execute("CREATE TABLE b (id INT PRIMARY KEY, a_id INT)").unwrap();
         db.execute("INSERT INTO a (id, name) VALUES (1, 'x')").unwrap();
+        db.execute("INSERT INTO a (id, name) VALUES (2, 'y')").unwrap();
+        db.execute("INSERT INTO b (id, a_id) VALUES (10, 1)").unwrap();
 
-        // Each of these must error with a typed "not supported" — never
-        // silently scan one table and return wrong rows.
-        for sql in [
-            "SELECT a.name, b.id FROM a JOIN b ON a.id = b.a_id",
-            "SELECT a.id, b.id FROM a, b",
-            "SELECT COUNT(*) FROM a",
-            "SELECT name FROM a GROUP BY name",
-            "SELECT DISTINCT name FROM a",
-            "SELECT id FROM a UNION SELECT id FROM b",
-        ] {
-            let err = db.execute(sql).unwrap_err();
-            assert!(
-                matches!(err, GalaxError::FeatureNotSupported(_)),
-                "query {sql:?} should be FeatureNotSupported, got {err:?}"
-            );
-            assert_eq!(err.sqlstate(), "0A000");
+        // These all route to the DataFusion analytical engine (HTAP task 15)
+        // and now EXECUTE correctly instead of returning FeatureNotSupported.
+
+        // Aggregate over a single table.
+        match db.execute("SELECT COUNT(*) AS n FROM a").unwrap() {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values[0].1, "2");
+            }
+            other => panic!("expected Rows, got {other:?}"),
         }
 
-        // A plain single-table scan + WHERE still works.
+        // Inner JOIN: only a.id=1 matches b.a_id=1.
+        match db
+            .execute("SELECT a.name, b.id FROM a JOIN b ON a.id = b.a_id")
+            .unwrap()
+        {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 1),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+
+        // GROUP BY with ORDER BY.
+        match db
+            .execute("SELECT name, COUNT(*) AS n FROM a GROUP BY name ORDER BY name")
+            .unwrap()
+        {
+            QueryResult::Rows(rows) => assert_eq!(rows.len(), 2),
+            other => panic!("expected Rows, got {other:?}"),
+        }
+
+        // DISTINCT and UNION also execute.
+        assert!(matches!(
+            db.execute("SELECT DISTINCT name FROM a").unwrap(),
+            QueryResult::Rows(_)
+        ));
+        assert!(matches!(
+            db.execute("SELECT id FROM a UNION SELECT id FROM b").unwrap(),
+            QueryResult::Rows(_)
+        ));
+
+        // A plain single-table scan + WHERE still uses the native path.
         let ok = db.execute("SELECT id, name FROM a WHERE id = 1").unwrap();
         assert!(matches!(ok, QueryResult::Rows { .. }));
     }

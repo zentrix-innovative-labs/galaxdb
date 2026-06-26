@@ -2719,6 +2719,7 @@ dependencies = [
  "galaxdb-auth",
  "galaxdb-common",
  "galaxdb-io",
+ "galaxdb-query",
  "galaxdb-sidecar",
  "galaxdb-sql",
  "galaxdb-storage",
