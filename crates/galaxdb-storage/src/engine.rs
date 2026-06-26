@@ -1142,6 +1142,244 @@ impl Engine {
         results
     }
 
+    /// Column-major scan of a columnar table visible at `read_ts` (HTAP
+    /// task 7 — the reader of the columnar write path).
+    ///
+    /// Returns the projected SQL columns of every live row, reading typed
+    /// PAX columns **directly** from columnar SST blocks (no per-row string
+    /// parse — the OLAP fast path) and decoding the row blob via the
+    /// registered splitter only for memtable rows and legacy/non-columnar
+    /// blocks (the migration bridge, HTAP task 8). Rows come out sorted by
+    /// primary key.
+    ///
+    /// * `prefix` — the table's key prefix (`"table:"`); must have a
+    ///   columnar registration (else an error).
+    /// * `projection` — indices into the table's SQL columns; empty = all.
+    /// * `predicates` — conjuncts used only for **zone-map block pruning**
+    ///   (an I/O optimization). Pruning is MVCC-safe: a pruned block's rows
+    ///   still record their key+timestamp so an older matching version
+    ///   elsewhere cannot resurface. Row-level filtering is the caller's
+    ///   job (DataFusion re-checks), so predicates are treated as inexact.
+    pub fn scan_columnar(
+        &self,
+        prefix: &[u8],
+        projection: &[usize],
+        predicates: &[crate::columnar::ColumnPredicate],
+        read_ts: Timestamp,
+    ) -> GalaxResult<crate::columnar::ColumnarBatch> {
+        use crate::columnar::{data_column_index, is_valid_marker, validity_column_index, ColumnarBatch};
+        use galaxdb_common::ColumnType;
+
+        let reg = {
+            let regs = self
+                .columnar
+                .read()
+                .map_err(|_| GalaxError::Internal("columnar registry lock".into()))?;
+            regs.iter().find(|r| r.prefix == prefix).cloned()
+        }
+        .ok_or_else(|| {
+            GalaxError::Internal(format!(
+                "no columnar registration for prefix {}",
+                String::from_utf8_lossy(prefix)
+            ))
+        })?;
+
+        let splitter = reg.splitter.as_ref();
+        let col_types = splitter.column_types();
+        let n = col_types.len();
+        let proj: Vec<usize> = if projection.is_empty() {
+            (0..n).collect()
+        } else {
+            projection.to_vec()
+        };
+        for &p in &proj {
+            if p >= n {
+                return Err(GalaxError::Internal(format!(
+                    "projection index {p} out of range (table has {n} columns)"
+                )));
+            }
+        }
+        let columnar_col_count = crate::columnar::FIRST_DATA_COLUMN + 2 * n;
+
+        // A staged row outcome, merged per key by max timestamp.
+        enum Staged {
+            Tombstone,
+            /// In a zone-map-pruned block: definitely fails the predicate,
+            /// but its timestamp must still suppress older versions.
+            Excluded,
+            Cells(Vec<Option<Vec<u8>>>),
+        }
+        let mut winners: BTreeMap<Vec<u8>, (Timestamp, Staged)> = BTreeMap::new();
+        let consider = |winners: &mut BTreeMap<Vec<u8>, (Timestamp, Staged)>,
+                        key: Vec<u8>,
+                        ts: Timestamp,
+                        staged: Staged| {
+            match winners.get(&key) {
+                Some((cur, _)) if *cur > ts => {}
+                _ => {
+                    winners.insert(key, (ts, staged));
+                }
+            }
+        };
+        let project = |full: &[Option<Vec<u8>>]| -> Vec<Option<Vec<u8>>> {
+            proj.iter().map(|&c| full.get(c).cloned().flatten()).collect()
+        };
+
+        if let Ok(registry) = self.sst_registry.read() {
+            for (_sst_id, entry) in registry.entries.iter() {
+                let Ok(data) = std::fs::read(&entry.path) else {
+                    continue;
+                };
+                for be in &entry.block_index.entries {
+                    let start = be.file_offset as usize;
+                    let end = start + be.block_len as usize;
+                    if end > data.len() {
+                        continue;
+                    }
+                    let block = match crate::pax::PaxBlock::deserialize(&data[start..end]) {
+                        Ok(b) => b,
+                        Err(_) => continue,
+                    };
+                    let header_ts = block.header.commit_timestamp;
+                    let Ok(keys) = block.read_column(0) else { continue };
+                    let Ok(vals) = block.read_column(1) else { continue };
+                    let row_ts: Vec<Timestamp> = if block.header.column_count >= 3 {
+                        block
+                            .read_column(crate::flush::ROW_TS_COLUMN)
+                            .map(|col| {
+                                col.iter()
+                                    .map(|b| crate::flush::decode_row_ts(b).unwrap_or(header_ts))
+                                    .collect()
+                            })
+                            .unwrap_or_else(|_| vec![header_ts; keys.len()])
+                    } else {
+                        vec![header_ts; keys.len()]
+                    };
+
+                    let is_columnar = block.header.column_count as usize == columnar_col_count;
+
+                    // Zone-map block pruning (only meaningful for columnar
+                    // blocks, which carry per-SQL-column zone maps).
+                    let pruned = is_columnar
+                        && !predicates.is_empty()
+                        && predicates.iter().any(|p| {
+                            match block
+                                .header
+                                .column_descriptors
+                                .get(data_column_index(p.column))
+                            {
+                                Some(d) => !crate::pax::zone_map_can_match(
+                                    &col_types[p.column],
+                                    &d.zone_map_min,
+                                    &d.zone_map_max,
+                                    p.op,
+                                    &p.value,
+                                ),
+                                None => false,
+                            }
+                        });
+
+                    // Pre-read projected typed columns + validity (skip the
+                    // heavy data reads when the block is pruned).
+                    let mut proj_data: Vec<Vec<Vec<u8>>> = Vec::new();
+                    let mut proj_valid: Vec<Vec<Vec<u8>>> = Vec::new();
+                    let use_columnar = is_columnar && !pruned && {
+                        let mut ok = true;
+                        for &c in &proj {
+                            match (
+                                block.read_column(data_column_index(c)),
+                                block.read_column(validity_column_index(c)),
+                            ) {
+                                (Ok(d), Ok(v)) => {
+                                    proj_data.push(d);
+                                    proj_valid.push(v);
+                                }
+                                _ => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        ok && proj_data.len() == proj.len()
+                    };
+
+                    for (idx, key) in keys.iter().enumerate() {
+                        if !key.starts_with(prefix) {
+                            continue;
+                        }
+                        let ts = row_ts.get(idx).copied().unwrap_or(header_ts);
+                        if ts > read_ts {
+                            continue;
+                        }
+                        let is_tomb = vals.get(idx).map(|v| v.is_empty()).unwrap_or(true);
+                        if is_tomb {
+                            consider(&mut winners, key.clone(), ts, Staged::Tombstone);
+                            continue;
+                        }
+                        if pruned {
+                            consider(&mut winners, key.clone(), ts, Staged::Excluded);
+                            continue;
+                        }
+                        let cells = if use_columnar {
+                            (0..proj.len())
+                                .map(|j| {
+                                    let valid = proj_valid[j]
+                                        .get(idx)
+                                        .map(|b| is_valid_marker(b))
+                                        .unwrap_or(false);
+                                    if valid {
+                                        proj_data[j].get(idx).cloned()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect()
+                        } else {
+                            match splitter.split(&vals[idx]) {
+                                Some(full) => project(&full),
+                                None => continue,
+                            }
+                        };
+                        consider(&mut winners, key.clone(), ts, Staged::Cells(cells));
+                    }
+                }
+            }
+        }
+
+        // Memtable rows (sealed-but-unflushed are out of scope here,
+        // mirroring scan_all_at): decode the blob via the splitter (bridge).
+        let active = self.memtable_mgr.active();
+        for (key, versioned) in active.iter_all() {
+            if !key.starts_with(prefix) {
+                continue;
+            }
+            if let Some((maybe_val, ts)) = versioned.get_at_with_ts(read_ts) {
+                match maybe_val {
+                    Some(v) => {
+                        if let Some(full) = splitter.split(&v) {
+                            consider(&mut winners, key.clone(), ts, Staged::Cells(project(&full)));
+                        }
+                    }
+                    None => consider(&mut winners, key.clone(), ts, Staged::Tombstone),
+                }
+            }
+        }
+
+        // Assemble column-major output (BTreeMap → sorted by key).
+        let mut columns: Vec<(ColumnType, Vec<Option<Vec<u8>>>)> =
+            proj.iter().map(|&c| (col_types[c].clone(), Vec::new())).collect();
+        let mut num_rows = 0;
+        for (_key, (_ts, staged)) in winners {
+            if let Staged::Cells(cells) = staged {
+                for (j, cell) in cells.into_iter().enumerate() {
+                    columns[j].1.push(cell);
+                }
+                num_rows += 1;
+            }
+        }
+        Ok(ColumnarBatch { num_rows, columns })
+    }
+
     /// Get the total number of rows (approximate).
     pub fn row_count(&self) -> u64 {
         self.row_count.load(Ordering::Relaxed)
@@ -2259,6 +2497,82 @@ mod tests {
             }
         }
         assert!(saw_columnar_block, "expected a columnar block after compaction");
+    }
+
+    #[tokio::test]
+    async fn scan_columnar_reads_typed_columns_projection_and_memtable() {
+        let engine = test_engine();
+        engine.register_columnar_table(b"t:".to_vec(), Arc::new(IdNameSplitter));
+
+        for (id, name) in [(1i64, "alice"), (2, "bob"), (3, "carol")] {
+            engine
+                .put_sync(format!("t:{id}").into_bytes(), id_name_value(id, name))
+                .unwrap();
+        }
+        engine.flush_memtable().await.unwrap();
+        // A memtable-only row (exercises the splitter bridge for unflushed data).
+        engine.put_sync(b"t:4".to_vec(), id_name_value(4, "dave")).unwrap();
+        // An MVCC override of t:1 still in the memtable (newer version wins).
+        engine.put_sync(b"t:1".to_vec(), id_name_value(1, "alice2")).unwrap();
+
+        let batch = engine.scan_columnar(b"t:", &[], &[], u64::MAX).unwrap();
+        assert_eq!(batch.num_rows, 4);
+        assert_eq!(batch.columns.len(), 2);
+        let ids: Vec<i64> = batch.columns[0]
+            .1
+            .iter()
+            .map(|c| i64::from_le_bytes(c.clone().unwrap().try_into().unwrap()))
+            .collect();
+        assert_eq!(ids, vec![1, 2, 3, 4]); // sorted by key
+        let names: Vec<String> = batch.columns[1]
+            .1
+            .iter()
+            .map(|c| String::from_utf8(c.clone().unwrap()).unwrap())
+            .collect();
+        assert_eq!(names, vec!["alice2", "bob", "carol", "dave"]); // memtable override wins
+
+        // Projection: only the name column.
+        let only_name = engine.scan_columnar(b"t:", &[1], &[], u64::MAX).unwrap();
+        assert_eq!(only_name.columns.len(), 1);
+        assert_eq!(only_name.num_rows, 4);
+        assert_eq!(only_name.columns[0].0, galaxdb_common::ColumnType::Text);
+    }
+
+    #[tokio::test]
+    async fn scan_columnar_prunes_blocks_by_zone_map() {
+        use crate::columnar::ColumnPredicate;
+        use crate::pax::PruneOp;
+
+        let engine = test_engine();
+        engine.register_columnar_table(b"t:".to_vec(), Arc::new(IdNameSplitter));
+        for (id, name) in [(10i64, "a"), (20, "b"), (30, "c")] {
+            engine
+                .put_sync(format!("t:{id}").into_bytes(), id_name_value(id, name))
+                .unwrap();
+        }
+        engine.flush_memtable().await.unwrap();
+
+        // id > 100: the block's id range [10,30] cannot match → pruned → 0 rows.
+        let prune = ColumnPredicate {
+            column: 0,
+            op: PruneOp::Gt,
+            value: 100i64.to_le_bytes().to_vec(),
+        };
+        let pruned = engine
+            .scan_columnar(b"t:", &[], std::slice::from_ref(&prune), u64::MAX)
+            .unwrap();
+        assert_eq!(pruned.num_rows, 0);
+
+        // id > 5: range [10,30] can match → not pruned → all 3 rows returned.
+        let keep = ColumnPredicate {
+            column: 0,
+            op: PruneOp::Gt,
+            value: 5i64.to_le_bytes().to_vec(),
+        };
+        let kept = engine
+            .scan_columnar(b"t:", &[], std::slice::from_ref(&keep), u64::MAX)
+            .unwrap();
+        assert_eq!(kept.num_rows, 3);
     }
 
     #[tokio::test]

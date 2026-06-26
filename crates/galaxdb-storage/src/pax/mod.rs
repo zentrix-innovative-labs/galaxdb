@@ -679,6 +679,56 @@ fn to_comparable_bytes(col_type: &ColumnType, value: &[u8]) -> Vec<u8> {
     }
 }
 
+/// A comparison operator for zone-map block pruning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+/// Can a block whose column ranges over `[min, max]` (raw physical bytes, as
+/// stored in a [`ColumnDescriptor`]'s zone map) contain a row satisfying
+/// `column <op> value`? A `false` result means the block can be skipped; the
+/// check is **conservative** — it never returns `false` for a block that
+/// actually contains a matching row (HTAP Property 5).
+///
+/// Comparisons use the same order-preserving encoding as the zone map
+/// (`to_comparable_bytes`). An empty `min`/`max` (empty column) cannot match
+/// any comparison. NULLs never satisfy a comparison predicate, so the NULL
+/// placeholders folded into a nullable column's range only widen it (which
+/// is safe — it can prevent a skip, never cause a wrong one).
+pub fn zone_map_can_match(
+    col_type: &ColumnType,
+    min: &[u8],
+    max: &[u8],
+    op: PruneOp,
+    value: &[u8],
+) -> bool {
+    if min.is_empty() || max.is_empty() {
+        return false;
+    }
+    let cmin = to_comparable_bytes(col_type, min);
+    let cmax = to_comparable_bytes(col_type, max);
+    let cval = to_comparable_bytes(col_type, value);
+    match op {
+        // Some stored value equals `value` only if it lies within [min,max].
+        PruneOp::Eq => cmin <= cval && cval <= cmax,
+        // Some stored value > `value` exists iff max > value, etc.
+        PruneOp::Gt => cmax > cval,
+        PruneOp::Ge => cmax >= cval,
+        PruneOp::Lt => cmin < cval,
+        PruneOp::Le => cmin <= cval,
+        // `!=` can only fail to match when every value equals `value`,
+        // i.e. min == max == value. Otherwise some value differs.
+        PruneOp::Ne => !(cmin == cmax && cmin == cval),
+    }
+}
+
+
 /// Build the row offset table. Each entry is the cumulative byte size of
 /// all column values for rows up to (but not including) that row index.
 fn build_row_offsets(columns: &[ColumnData], row_count: usize) -> Vec<u32> {

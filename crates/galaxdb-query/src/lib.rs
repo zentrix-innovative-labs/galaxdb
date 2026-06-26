@@ -36,6 +36,7 @@ use galaxdb_common::{GalaxResult, Timestamp};
 use galaxdb_sql::planner::Value;
 
 pub mod schema;
+pub mod arrow_batch;
 
 /// MVCC read point for a scan. The same snapshot mechanism backs both
 /// `AT VERSION` time-travel and the read timestamp of an open transaction

@@ -9,6 +9,7 @@ description = "Anti-corruption boundary for the relational/analytical query laye
 [dependencies]
 galaxdb-common.workspace = true
 galaxdb-sql.workspace = true
+galaxdb-storage = { path = "../galaxdb-storage" }
 arrow.workspace = true
 tracing.workspace = true
 

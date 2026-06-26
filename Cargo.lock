@@ -2785,6 +2785,7 @@ dependencies = [
  "datafusion",
  "galaxdb-common",
  "galaxdb-sql",
+ "galaxdb-storage",
  "tokio",
  "tracing",
 ]

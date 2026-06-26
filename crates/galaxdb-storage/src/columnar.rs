@@ -121,6 +121,40 @@ pub fn validity_column_index(k: usize) -> usize {
     data_column_index(k) + 1
 }
 
+/// Interpret a validity companion cell: `1` (the first byte) means the
+/// value is present, anything else (incl. empty) means SQL NULL.
+pub fn is_valid_marker(cell: &[u8]) -> bool {
+    cell.first().copied() == Some(VALID)
+}
+
+/// A pushed-down predicate for a columnar scan: `column <op> value`, where
+/// `column` indexes the table's SQL columns (declaration order) and `value`
+/// is the physical byte encoding of the comparison constant (same encoding
+/// the column stores). Used for zone-map block pruning during the scan.
+#[derive(Debug, Clone)]
+pub struct ColumnPredicate {
+    /// Index into the table's SQL columns.
+    pub column: usize,
+    /// Comparison operator.
+    pub op: crate::pax::PruneOp,
+    /// Physical bytes of the comparison constant.
+    pub value: Vec<u8>,
+}
+
+/// A column-major batch produced by a columnar scan (HTAP task 7): one
+/// entry per projected SQL column, each a row-aligned vector of physical
+/// value bytes (`Some`) or SQL NULL (`None`). All columns have the same
+/// length, `num_rows`. The query layer turns this into an Arrow
+/// `RecordBatch` with no per-row string parse.
+#[derive(Debug, Clone)]
+pub struct ColumnarBatch {
+    /// Number of rows (length of every column vector).
+    pub num_rows: usize,
+    /// `(physical type, per-row cells)` per projected column, in projection
+    /// order.
+    pub columns: Vec<(ColumnType, Vec<Option<Vec<u8>>>)>,
+}
+
 use crate::pax::{CodecId, ColumnData};
 
 /// The single-byte validity markers stored per row in a validity companion
