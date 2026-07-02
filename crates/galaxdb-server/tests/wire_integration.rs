@@ -1353,3 +1353,65 @@ async fn row_description_reports_real_type_oids() {
     assert_eq!(cols[3].type_(), &Type::INT8, "big must be int8");
     assert_eq!(cols[4].type_(), &Type::BOOL, "flag must be bool");
 }
+
+/// pg_catalog introspection over the wire with a real driver (HTAP task 21
+/// / 23.1, tokio-postgres slice): the queries a client issues against the
+/// emulated catalog are answered (not errored), and pg_type carries the
+/// scalar OIDs GalaxDB reports. Full psql/psycopg/JDBC/SQLAlchemy coverage is
+/// the live driver matrix (task 23.1); this pins the tokio-postgres path.
+#[tokio::test]
+async fn pg_catalog_introspection_over_wire() {
+    let (conn_str, _td) = start_server().await;
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    // pg_type: the emulator answers with the scalar type set. tokio-postgres
+    // reads these as text (the emulated columns are text-typed).
+    let rows = client
+        .simple_query("SELECT oid, typname FROM pg_catalog.pg_type")
+        .await
+        .expect("pg_type query must be answered");
+    let type_names: Vec<String> = rows
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => {
+                r.get("typname").map(|s| s.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    for expected in ["int4", "text", "bool", "int8", "float8", "timestamp", "uuid"] {
+        assert!(
+            type_names.iter().any(|t| t == expected),
+            "pg_type must list {expected}, got {type_names:?}"
+        );
+    }
+
+    // pg_namespace exposes the public + pg_catalog schemas.
+    let ns = client
+        .simple_query("SELECT nspname FROM pg_catalog.pg_namespace")
+        .await
+        .expect("pg_namespace query must be answered");
+    let schemas: Vec<String> = ns
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => {
+                r.get("nspname").map(|s| s.to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert!(schemas.iter().any(|s| s == "public"), "schemas: {schemas:?}");
+
+    // pg_database and pg_class introspection are answered without error.
+    client
+        .simple_query("SELECT datname FROM pg_catalog.pg_database")
+        .await
+        .expect("pg_database query must be answered");
+    client
+        .simple_query("SELECT relname FROM pg_catalog.pg_class")
+        .await
+        .expect("pg_class query must be answered");
+}

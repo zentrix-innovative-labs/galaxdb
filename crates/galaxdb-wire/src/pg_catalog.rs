@@ -91,7 +91,9 @@ fn handle_pg_attribute() -> PgCatalogResult {
 }
 
 fn handle_pg_type() -> PgCatalogResult {
-    // Return basic PostgreSQL types that psycopg2/SQLAlchemy expect
+    // The scalar OIDs GalaxDB reports on the wire (task 22), matching
+    // `galaxdb_sql::types::oid`. Drivers (psycopg/SQLAlchemy/tokio-postgres)
+    // look types up here by oid or typname during connection setup.
     PgCatalogResult {
         columns: vec![
             ColumnDesc::int4("oid"),
@@ -100,16 +102,22 @@ fn handle_pg_type() -> PgCatalogResult {
             ColumnDesc::text("typtype"),
         ],
         rows: vec![
-            vec![s("23"), s("int4"), s("4"), s("b")],
-            vec![s("25"), s("text"), s("-1"), s("b")],
             vec![s("16"), s("bool"), s("1"), s("b")],
+            vec![s("17"), s("bytea"), s("-1"), s("b")],
             vec![s("20"), s("int8"), s("8"), s("b")],
             vec![s("21"), s("int2"), s("2"), s("b")],
+            vec![s("23"), s("int4"), s("4"), s("b")],
+            vec![s("25"), s("text"), s("-1"), s("b")],
+            vec![s("114"), s("json"), s("-1"), s("b")],
             vec![s("700"), s("float4"), s("4"), s("b")],
             vec![s("701"), s("float8"), s("8"), s("b")],
             vec![s("1043"), s("varchar"), s("-1"), s("b")],
-            vec![s("17"), s("bytea"), s("-1"), s("b")],
-            vec![s("114"), s("json"), s("-1"), s("b")],
+            vec![s("1082"), s("date"), s("4"), s("b")],
+            vec![s("1114"), s("timestamp"), s("8"), s("b")],
+            vec![s("1184"), s("timestamptz"), s("8"), s("b")],
+            vec![s("1700"), s("numeric"), s("-1"), s("b")],
+            vec![s("2950"), s("uuid"), s("16"), s("b")],
+            vec![s("3802"), s("jsonb"), s("-1"), s("b")],
         ],
     }
 }
