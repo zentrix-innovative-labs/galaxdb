@@ -1,0 +1,69 @@
+name: DataFusion bump
+
+# HTAP task 25 — a dedicated, opt-in job that replays the SQL conformance
+# corpus (task 24) against a *candidate* DataFusion version. Its result
+# gates the bump (a failing corpus blocks merging the new pin) but it is a
+# separate workflow, so it never gates a normal push, PR, or release.
+#
+# Trigger it manually from the Actions tab with the candidate version, e.g.
+# `53.0.0`. It rewrites the exact pin in crates/galaxdb-query/Cargo.toml,
+# rebuilds, and runs the conformance corpus + the galaxdb-query tests. Any
+# failure means the candidate is not safe to adopt; the normal CI keeps the
+# current pin untouched.
+
+on:
+  workflow_dispatch:
+    inputs:
+      datafusion_version:
+        description: "Candidate DataFusion version to test (e.g. 53.0.0)"
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  conformance-on-candidate:
+    name: "Conformance corpus vs DataFusion ${{ inputs.datafusion_version }}"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install native build deps (protoc, cmake)
+        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-dfbump-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Repin DataFusion to the candidate version
+        run: |
+          set -euo pipefail
+          MANIFEST=crates/galaxdb-query/Cargo.toml
+          echo "Before:"; grep -E '^datafusion = ' "$MANIFEST"
+          # Rewrite the exact pin `datafusion = "=X.Y.Z"` to the candidate.
+          sed -i -E 's/^datafusion = "=[0-9.]+"/datafusion = "=${{ inputs.datafusion_version }}"/' "$MANIFEST"
+          echo "After:"; grep -E '^datafusion = ' "$MANIFEST"
+          cargo update -p datafusion --precise "${{ inputs.datafusion_version }}"
+
+      - name: Run the SQL conformance corpus (task 24)
+        run: cargo test -p galaxdb-embedded --test conformance
+
+      - name: Run galaxdb-query analytical tests
+        run: cargo test -p galaxdb-query
+
+      - name: Containment guard still holds
+        run: cargo test -p galaxdb-query --test containment
+
+      - name: Result
+        run: echo "Candidate DataFusion ${{ inputs.datafusion_version }} passed the conformance corpus. Safe to adopt the pin."

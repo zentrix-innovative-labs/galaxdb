@@ -43,6 +43,9 @@ jobs:
       - name: Run tests
         run: cargo test --workspace --exclude galaxdb-python --lib
 
+      - name: Run SQL conformance corpus (task 24)
+        run: cargo test -p galaxdb-embedded --test conformance
+
       - name: Clippy lint
         run: cargo clippy --workspace --exclude galaxdb-python -- -D warnings
 
