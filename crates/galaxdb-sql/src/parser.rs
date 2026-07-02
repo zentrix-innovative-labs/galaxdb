@@ -55,6 +55,9 @@ pub fn parse(sql: &str) -> GalaxResult<Vec<AuroraStatement>> {
     if upper.starts_with("DROP ROLE") {
         return Ok(vec![parse_drop_role(trimmed)?]);
     }
+    if upper.starts_with("ALTER TABLE") {
+        return Ok(vec![parse_alter_table_set_storage(trimmed)?]);
+    }
     if upper.starts_with("ALTER ROLE") {
         return Ok(vec![parse_alter_role(trimmed)?]);
     }
@@ -247,6 +250,42 @@ fn parse_alter_role(sql: &str) -> GalaxResult<AuroraStatement> {
         message: "ALTER ROLE ... PASSWORD requires a quoted string".to_string(),
     })?;
     Ok(AuroraStatement::AlterRolePassword { name, password })
+}
+
+/// Parse `ALTER TABLE <name> SET STORAGE {COLUMNAR|LEGACY|ROW}` (a GalaxDB
+/// extension — `SET STORAGE` at table scope, distinct from PostgreSQL's
+/// per-column `ALTER COLUMN ... SET STORAGE`). `ROW` is an alias for
+/// `LEGACY`. HTAP task 9.
+fn parse_alter_table_set_storage(sql: &str) -> GalaxResult<AuroraStatement> {
+    let rest = trim_stmt(&sql["ALTER TABLE".len()..]);
+    let (table, after_name) = take_ident(rest).ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "ALTER TABLE requires a table name".to_string(),
+    })?;
+    let tail = after_name.trim();
+    let upper = tail.to_uppercase();
+    let kw = upper
+        .strip_prefix("SET STORAGE")
+        .map(|s| s.trim())
+        .ok_or_else(|| GalaxError::SqlParse {
+            position: 0,
+            message: "ALTER TABLE currently supports only SET STORAGE \
+                      {COLUMNAR|LEGACY|ROW}"
+                .to_string(),
+        })?;
+    let mode = match kw {
+        "COLUMNAR" => galaxdb_common::StorageMode::Columnar,
+        "LEGACY" | "ROW" => galaxdb_common::StorageMode::Legacy,
+        other => {
+            return Err(GalaxError::SqlParse {
+                position: 0,
+                message: format!(
+                    "unknown storage mode {other:?}; expected COLUMNAR, LEGACY, or ROW"
+                ),
+            })
+        }
+    };
+    Ok(AuroraStatement::AlterTableSetStorage { table, mode })
 }
 
 /// Parse `GRANT priv ON table TO role` / `REVOKE priv ON table FROM role`.

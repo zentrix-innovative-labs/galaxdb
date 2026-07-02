@@ -37,6 +37,12 @@ pub enum AuroraStatement {
     CreateIndex(CreateIndexStmt),
     /// DROP INDEX name.
     DropIndex { name: String, if_exists: bool },
+    /// ALTER TABLE name SET STORAGE {COLUMNAR|LEGACY|ROW} — switch a table's
+    /// physical storage layout and rewrite its on-disk blocks (HTAP task 9).
+    AlterTableSetStorage {
+        table: String,
+        mode: galaxdb_common::StorageMode,
+    },
 }
 
 /// A privilege that can be granted on a table.

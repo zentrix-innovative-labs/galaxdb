@@ -284,6 +284,14 @@ pub struct Engine {
     /// prefix; flush consults this to append one typed PAX column per SQL
     /// column. Empty by default, so legacy tables are unaffected.
     columnar: RwLock<Vec<ColumnarRegistration>>,
+    /// Test-observable counter of row-blob decodes on the columnar scan path
+    /// (HTAP task 9.1): incremented every time `scan_columnar` falls back to
+    /// `RowColumnSplitter::split` for a memtable row or a legacy/non-columnar
+    /// block (the migration bridge). Reading fully-columnar on-disk blocks
+    /// touches only the projected typed columns and never bumps this, so a
+    /// test can assert a zero-string-parse OLAP hot path. Not a production
+    /// metric; cheap relaxed atomic.
+    columnar_bridge_decodes: AtomicU64,
     /// Optional AEGIS-256 TDE module for encrypting/decrypting PAX blocks.
     #[cfg(feature = "aegis-tde")]
     tde: Option<Arc<galaxdb_crypto::AegisTdeModule>>,
@@ -462,6 +470,7 @@ impl Engine {
             compaction_wake: Arc::new((Mutex::new((false, false)), Condvar::new())),
             bg_worker_active: AtomicBool::new(false),
             columnar: RwLock::new(Vec::new()),
+            columnar_bridge_decodes: AtomicU64::new(0),
             #[cfg(feature = "aegis-tde")]
             tde: None,
         })
@@ -1344,6 +1353,7 @@ impl Engine {
                                 })
                                 .collect()
                         } else {
+                            self.columnar_bridge_decodes.fetch_add(1, Ordering::Relaxed);
                             match splitter.split(&vals[idx]) {
                                 Some(full) => project(&full),
                                 None => continue,
@@ -1365,6 +1375,7 @@ impl Engine {
             if let Some((maybe_val, ts)) = versioned.get_at_with_ts(read_ts) {
                 match maybe_val {
                     Some(v) => {
+                        self.columnar_bridge_decodes.fetch_add(1, Ordering::Relaxed);
                         if let Some(full) = splitter.split(&v) {
                             consider(&mut winners, key.clone(), ts, Staged::Cells(project(&full)));
                         }
@@ -1417,6 +1428,15 @@ impl Engine {
     /// Get the total number of rows (approximate).
     pub fn row_count(&self) -> u64 {
         self.row_count.load(Ordering::Relaxed)
+    }
+
+    /// Test-only: number of row-blob decodes taken on the columnar scan
+    /// bridge (memtable rows + legacy/non-columnar blocks). Zero after a
+    /// scan that read only fully-columnar on-disk blocks — the assertion
+    /// behind the OLAP zero-string-parse guarantee (HTAP task 9.1).
+    #[doc(hidden)]
+    pub fn columnar_bridge_decode_count(&self) -> u64 {
+        self.columnar_bridge_decodes.load(Ordering::Relaxed)
     }
 
     /// Per-row content checksums for the committed snapshot visible at
@@ -2063,7 +2083,7 @@ impl Engine {
         }
         match self.compaction_lock.try_lock() {
             Ok(_guard) => {
-                self.compact_inner()?;
+                self.compact_inner(false)?;
                 Ok(true)
             }
             Err(_) => Ok(false), // another compaction is already running
@@ -2078,7 +2098,24 @@ impl Engine {
             .compaction_lock
             .lock()
             .map_err(|_| GalaxError::Internal("compaction lock poisoned".into()))?;
-        self.compact_inner()
+        self.compact_inner(false)
+    }
+
+    /// Force a full rewrite of every registered SST into a minimal set,
+    /// running even when fewer than two SSTs exist (unlike [`Self::compact`],
+    /// which no-ops below the merge threshold). Used by
+    /// `ALTER TABLE ... SET STORAGE` (HTAP task 9) to eagerly rewrite a
+    /// table's on-disk blocks into the newly selected layout: after the SQL
+    /// layer (un)registers the table's columnar splitter, this pass re-emits
+    /// every block through the compaction output builder, which lays rows out
+    /// as typed PAX columns for registered tables and as legacy three-column
+    /// blocks for unregistered ones. A no-op only when there are zero SSTs.
+    pub fn force_compact(&self) -> GalaxResult<CompactionStats> {
+        let _guard = self
+            .compaction_lock
+            .lock()
+            .map_err(|_| GalaxError::Internal("compaction lock poisoned".into()))?;
+        self.compact_inner(true)
     }
 
     /// Decrypt an SST block read during compaction when it was written
@@ -2092,8 +2129,10 @@ impl Engine {
         }
     }
 
-    /// Core compaction, run while holding the compaction lock.
-    fn compact_inner(&self) -> GalaxResult<CompactionStats> {
+    /// Core compaction, run while holding the compaction lock. When `force`
+    /// is true, a single SST is still rewritten (used by the storage-mode
+    /// rewrite in task 9); otherwise the merge no-ops below two SSTs.
+    fn compact_inner(&self, force: bool) -> GalaxResult<CompactionStats> {
         // 1. Snapshot the input set (ids + paths + per-file encrypted flag).
         let inputs: Vec<(u64, PathBuf, bool)> = {
             let reg = self
@@ -2114,7 +2153,11 @@ impl Engine {
                 })
                 .collect()
         };
-        if inputs.len() < 2 {
+        // Normal compaction merges two or more SSTs. A forced rewrite
+        // (task 9 storage-mode change) also rewrites a lone SST so its blocks
+        // are re-emitted in the table's new layout; only zero SSTs is a no-op.
+        let threshold = if force { 1 } else { 2 };
+        if inputs.len() < threshold {
             return Ok(CompactionStats {
                 input_ssts: inputs.len(),
                 output_ssts: inputs.len(),
@@ -2531,6 +2574,133 @@ mod tests {
             }
         }
         assert!(saw_columnar_block, "expected a columnar block after compaction");
+    }
+
+    /// Helper: how many rows-bearing blocks in the engine's SSTs have exactly
+    /// `want_cols` columns (3 = legacy, 7 = columnar for the 2-col splitter).
+    fn count_blocks_with_columns(engine: &Engine, want_cols: usize) -> usize {
+        let mut n = 0;
+        for entry in std::fs::read_dir(engine.data_dir()).unwrap() {
+            let path = entry.unwrap().path();
+            let fname = path.file_name().unwrap().to_str().unwrap().to_string();
+            if !(fname.starts_with("sst_") && fname.ends_with(".pax")) {
+                continue;
+            }
+            let data = std::fs::read(&path).unwrap();
+            let Ok(index) = crate::sst::SstBlockIndex::from_file_data(&data) else {
+                continue;
+            };
+            for be in &index.entries {
+                let start = be.file_offset as usize;
+                let end = start + be.block_len as usize;
+                let block = crate::pax::PaxBlock::deserialize(&data[start..end]).unwrap();
+                if block.header.row_count > 0
+                    && block.header.column_count as usize == want_cols
+                {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// `ALTER TABLE ... SET STORAGE COLUMNAR` over a table that already has
+    /// legacy on-disk data (HTAP task 9): a single legacy SST is rewritten
+    /// into a columnar block by `force_compact` after the splitter is
+    /// registered, with identical query results before and after (Property 3).
+    #[tokio::test]
+    async fn force_compact_rewrites_lone_legacy_sst_to_columnar() {
+        let engine = test_engine();
+
+        // Legacy write path (no splitter registered): one 3-column SST.
+        engine.put_sync(b"t:1".to_vec(), id_name_value(1, "alice")).unwrap();
+        engine.put_sync(b"t:2".to_vec(), id_name_value(2, "bob")).unwrap();
+        engine.flush_memtable().await.unwrap();
+        assert_eq!(count_blocks_with_columns(&engine, 3), 1, "starts legacy");
+        assert_eq!(count_blocks_with_columns(&engine, 7), 0);
+
+        let before = engine.scan_all();
+
+        // ALTER SET STORAGE COLUMNAR: register the splitter, then force a
+        // rewrite even though there is a single SST.
+        engine.register_columnar_table(b"t:".to_vec(), Arc::new(IdNameSplitter));
+        engine.force_compact().unwrap();
+
+        // The legacy block(s) were rewritten: no 3-column blocks remain and
+        // the data is now stored columnar (block count is a compaction detail).
+        assert_eq!(
+            count_blocks_with_columns(&engine, 3),
+            0,
+            "no legacy blocks may remain after SET STORAGE COLUMNAR"
+        );
+        assert!(
+            count_blocks_with_columns(&engine, 7) >= 1,
+            "data must be stored in columnar blocks after the rewrite"
+        );
+
+        // Identical query results before/after (Property 3).
+        assert_eq!(engine.scan_all(), before);
+        assert_eq!(engine.get(b"t:1"), Some(id_name_value(1, "alice")));
+        assert_eq!(engine.get(b"t:2"), Some(id_name_value(2, "bob")));
+    }
+
+    /// `ALTER TABLE ... SET STORAGE LEGACY` reverses the rewrite: a columnar
+    /// SST is re-emitted as a legacy three-column block once the splitter is
+    /// unregistered, again with identical results (HTAP task 9).
+    #[tokio::test]
+    async fn force_compact_rewrites_columnar_sst_back_to_legacy() {
+        let engine = test_engine();
+        engine.register_columnar_table(b"t:".to_vec(), Arc::new(IdNameSplitter));
+        engine.put_sync(b"t:1".to_vec(), id_name_value(1, "alice")).unwrap();
+        engine.put_sync(b"t:2".to_vec(), id_name_value(2, "bob")).unwrap();
+        engine.flush_memtable().await.unwrap();
+        assert_eq!(count_blocks_with_columns(&engine, 7), 1, "starts columnar");
+
+        let before = engine.scan_all();
+
+        // ALTER SET STORAGE LEGACY: unregister, then force the rewrite.
+        engine.unregister_columnar_table(b"t:");
+        engine.force_compact().unwrap();
+
+        assert!(
+            count_blocks_with_columns(&engine, 3) >= 1,
+            "columnar SST must be rewritten to legacy blocks"
+        );
+        assert_eq!(
+            count_blocks_with_columns(&engine, 7),
+            0,
+            "no columnar blocks may remain after SET STORAGE LEGACY"
+        );
+        assert_eq!(engine.scan_all(), before);
+        assert_eq!(engine.get(b"t:2"), Some(id_name_value(2, "bob")));
+    }
+
+    /// The OLAP hot path is zero-string-parse (HTAP task 9.1): scanning a
+    /// table whose rows are all in on-disk columnar blocks reads only the
+    /// projected typed columns and never decodes a row blob via the splitter.
+    #[tokio::test]
+    async fn scan_columnar_fully_on_disk_does_zero_string_parse() {
+        let engine = test_engine();
+        engine.register_columnar_table(b"t:".to_vec(), Arc::new(IdNameSplitter));
+        for (id, name) in [(1i64, "alice"), (2, "bob"), (3, "carol")] {
+            engine
+                .put_sync(format!("t:{id}").into_bytes(), id_name_value(id, name))
+                .unwrap();
+        }
+        // Flush so every row lives in a columnar SST block; the active
+        // memtable is then empty (its rows would otherwise take the bridge).
+        engine.flush_memtable().await.unwrap();
+
+        let before = engine.columnar_bridge_decode_count();
+        let batch = engine
+            .scan_columnar(b"t:", &[0, 1], &[], engine.latest_commit_ts())
+            .unwrap();
+        assert_eq!(batch.num_rows, 3);
+        assert_eq!(
+            engine.columnar_bridge_decode_count(),
+            before,
+            "scanning fully-columnar on-disk blocks must not string-parse any row blob"
+        );
     }
 
     #[tokio::test]

@@ -204,6 +204,17 @@ impl Catalog {
         self.tables.get(name)
     }
 
+    /// Update a table's physical storage mode in place (HTAP task 9).
+    /// Errors if the table is unknown.
+    pub fn set_storage_mode(&mut self, name: &str, mode: StorageMode) -> GalaxResult<()> {
+        let entry = self
+            .tables
+            .get_mut(name)
+            .ok_or_else(|| GalaxError::TableNotFound(name.to_string()))?;
+        entry.storage_mode = mode;
+        Ok(())
+    }
+
     pub fn table_exists(&self, name: &str) -> bool {
         self.tables.contains_key(name)
     }
@@ -603,6 +614,7 @@ fn plan_kind_str(plan: &QueryPlan) -> &'static str {
         QueryPlan::Revoke(_) => "revoke",
         QueryPlan::CreateIndex(_) => "create_index",
         QueryPlan::DropIndex { .. } => "drop_index",
+        QueryPlan::AlterTableSetStorage { .. } => "alter_table_set_storage",
     }
 }
 
@@ -644,6 +656,9 @@ fn plan_authz_target(plan: &QueryPlan) -> (galaxdb_auth::Action, galaxdb_auth::O
             (Action::Ddl, ObjectRef::Table(stmt.table_name.clone()))
         }
         QueryPlan::DropTable { name, .. } => (Action::Ddl, ObjectRef::Table(name.clone())),
+        QueryPlan::AlterTableSetStorage { table, .. } => {
+            (Action::Ddl, ObjectRef::Table(table.clone()))
+        }
         QueryPlan::Analyze { table } => (Action::Ddl, ObjectRef::Table(table.clone())),
         QueryPlan::CreateVersionTag(_) => (Action::Ddl, ObjectRef::Cluster),
         // CREATE/DROP INDEX are schema changes scoped to their table.
@@ -881,6 +896,9 @@ pub fn execute_with_context(
 
         QueryPlan::CreateIndex(stmt) => exec_create_index(stmt, ctx),
         QueryPlan::DropIndex { name, if_exists } => exec_drop_index(name, *if_exists, ctx),
+        QueryPlan::AlterTableSetStorage { table, mode } => {
+            exec_alter_table_set_storage(table, *mode, ctx)
+        }
     }
 }
 
@@ -964,6 +982,74 @@ fn exec_drop_table(name: &str, if_exists: bool, ctx: &mut ExecutorContext) -> Ga
         }
         Err(e) => Err(e),
     }
+}
+
+/// `ALTER TABLE <table> SET STORAGE {COLUMNAR|LEGACY}` (HTAP task 9).
+///
+/// Switches the table's physical layout and rewrites its on-disk blocks so
+/// existing data is stored in the new layout, not just future writes:
+///
+/// * `COLUMNAR` — build the table's [`CatalogRowSplitter`] (error out if the
+///   schema has a type the columnar path does not recognize, rather than
+///   silently staying legacy — engineering-principles §2), register it so
+///   flush/compaction emit typed PAX columns, flip the catalog mode, then
+///   `force_compact` to rewrite existing legacy SST blocks into columnar.
+/// * `LEGACY` — unregister the splitter, flip the mode, then `force_compact`
+///   to re-emit any columnar blocks as legacy three-column blocks.
+///
+/// Query results are identical before and after (Property 3): reads bridge
+/// legacy and columnar blocks to the same logical rows; the rewrite only
+/// changes the physical layout. Rows still in the active memtable convert on
+/// their next flush under the new mode; the on-disk rewrite is immediate.
+fn exec_alter_table_set_storage(
+    table: &str,
+    mode: StorageMode,
+    ctx: &mut ExecutorContext,
+) -> GalaxResult<ExecuteResult> {
+    let entry = ctx
+        .catalog
+        .get_table(table)
+        .cloned()
+        .ok_or_else(|| GalaxError::TableNotFound(table.to_string()))?;
+
+    let prefix = format!("{table}:").into_bytes();
+    match mode {
+        StorageMode::Columnar => {
+            // The splitter must exist for the mode to be honest: if the schema
+            // is not fully columnar-encodable, refuse rather than claim a
+            // layout we cannot produce.
+            let splitter = crate::columnar::CatalogRowSplitter::from_table_entry(&entry)
+                .ok_or_else(|| {
+                    GalaxError::FeatureNotSupported(format!(
+                        "table {table:?} has a column type the columnar storage \
+                         path does not support yet; cannot SET STORAGE COLUMNAR"
+                    ))
+                })?;
+            ctx.engine
+                .register_columnar_table(prefix, std::sync::Arc::new(splitter));
+        }
+        StorageMode::Legacy => {
+            ctx.engine.unregister_columnar_table(&prefix);
+        }
+    }
+
+    Arc::make_mut(&mut ctx.catalog).set_storage_mode(table, mode)?;
+
+    // Rewrite on-disk blocks into the new layout now (compaction-driven
+    // rewrite). `force_compact` runs even with a single SST; a no-op only
+    // when the table's data is entirely in the memtable (which converts on
+    // its next flush under the new mode).
+    ctx.engine
+        .force_compact()
+        .map_err(|e| GalaxError::Internal(format!("storage-mode rewrite failed: {e}")))?;
+
+    let mode_str = match mode {
+        StorageMode::Columnar => "COLUMNAR",
+        StorageMode::Legacy => "LEGACY",
+    };
+    Ok(ExecuteResult::Ok(format!(
+        "ALTER TABLE {table} SET STORAGE {mode_str}"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -2723,5 +2809,16 @@ pub fn execute_legacy(plan: &QueryPlan, catalog: &mut Catalog) -> ExecuteResult 
             "CREATE/DROP INDEX requires a storage-backed index store; use execute_with_context"
                 .to_string(),
         ),
+        QueryPlan::AlterTableSetStorage { table, .. } => {
+            if !catalog.table_exists(table) {
+                ExecuteResult::Error(format!("table not found: {}", table))
+            } else {
+                ExecuteResult::Error(
+                    "ALTER TABLE SET STORAGE requires a storage engine; \
+                     use execute_with_context"
+                        .to_string(),
+                )
+            }
+        }
     }
 }

@@ -1529,6 +1529,12 @@ impl Database {
                     if_exists: *if_exists,
                 })
             }
+            AuroraStatement::AlterTableSetStorage { table, mode } => {
+                self.dispatch(QueryPlan::AlterTableSetStorage {
+                    table: table.clone(),
+                    mode: *mode,
+                })
+            }
         }
     }
 
@@ -3599,6 +3605,77 @@ mod tests {
         assert!(db.table_exists("t"));
         db.execute("DROP TABLE t").unwrap();
         assert!(!db.table_exists("t"));
+    }
+
+    #[test]
+    fn alter_table_set_storage_switches_mode_and_preserves_results() {
+        use galaxdb_common::StorageMode;
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        for i in 1..=3 {
+            db.execute(&format!("INSERT INTO t (id, name) VALUES ({i}, 'n{i}')"))
+                .unwrap();
+        }
+        // New tables default to Columnar (HTAP task 5).
+        assert_eq!(
+            db.catalog.get_table("t").unwrap().storage_mode,
+            StorageMode::Columnar
+        );
+        let before = rows_of(db.execute("SELECT id, name FROM t").unwrap());
+        assert_eq!(before.len(), 3);
+
+        // → LEGACY: the catalog mode flips and query results are identical
+        // (the on-disk rewrite is verified deterministically in the storage
+        // crate; here we assert the SQL-level contract — Property 3).
+        assert!(matches!(
+            db.execute("ALTER TABLE t SET STORAGE LEGACY").unwrap(),
+            QueryResult::Ok(_)
+        ));
+        assert_eq!(
+            db.catalog.get_table("t").unwrap().storage_mode,
+            StorageMode::Legacy
+        );
+        assert_eq!(rows_of(db.execute("SELECT id, name FROM t").unwrap()).len(), 3);
+
+        // → COLUMNAR again: mode flips back, new writes still work, and
+        // point-lookup + filter remain correct after the round trip.
+        assert!(matches!(
+            db.execute("ALTER TABLE t SET STORAGE COLUMNAR").unwrap(),
+            QueryResult::Ok(_)
+        ));
+        assert_eq!(
+            db.catalog.get_table("t").unwrap().storage_mode,
+            StorageMode::Columnar
+        );
+        db.execute("INSERT INTO t (id, name) VALUES (4, 'n4')").unwrap();
+        assert_eq!(rows_of(db.execute("SELECT id FROM t").unwrap()).len(), 4);
+        let one = rows_of(db.execute("SELECT name FROM t WHERE id = 2").unwrap());
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].values[0].1, "n2");
+
+        // `ROW` is an accepted alias for LEGACY.
+        assert!(matches!(
+            db.execute("ALTER TABLE t SET STORAGE ROW").unwrap(),
+            QueryResult::Ok(_)
+        ));
+        assert_eq!(
+            db.catalog.get_table("t").unwrap().storage_mode,
+            StorageMode::Legacy
+        );
+    }
+
+    #[test]
+    fn alter_table_set_storage_unknown_table_errors() {
+        let mut db = test_db();
+        assert!(db.execute("ALTER TABLE nope SET STORAGE COLUMNAR").is_err());
+    }
+
+    #[test]
+    fn alter_table_set_storage_rejects_unknown_mode() {
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY)").unwrap();
+        assert!(db.execute("ALTER TABLE t SET STORAGE SIDEWAYS").is_err());
     }
 
     #[test]

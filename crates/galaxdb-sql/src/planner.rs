@@ -119,6 +119,11 @@ pub enum QueryPlan {
     CreateIndex(crate::ast::CreateIndexStmt),
     /// DROP INDEX.
     DropIndex { name: String, if_exists: bool },
+    /// ALTER TABLE ... SET STORAGE {COLUMNAR|LEGACY} (HTAP task 9).
+    AlterTableSetStorage {
+        table: String,
+        mode: galaxdb_common::StorageMode,
+    },
 }
 
 /// Search strategy chosen by the adaptive planner (Req 22).

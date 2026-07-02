@@ -519,6 +519,35 @@ fn parse_alter_role_password() {
 }
 
 #[test]
+fn parse_alter_table_set_storage_columnar() {
+    match &parse("ALTER TABLE t SET STORAGE COLUMNAR").unwrap()[0] {
+        AuroraStatement::AlterTableSetStorage { table, mode } => {
+            assert_eq!(table, "t");
+            assert_eq!(*mode, galaxdb_common::StorageMode::Columnar);
+        }
+        other => panic!("expected AlterTableSetStorage, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_alter_table_set_storage_legacy_and_row_alias() {
+    for kw in ["LEGACY", "ROW"] {
+        match &parse(&format!("ALTER TABLE docs SET STORAGE {kw}")).unwrap()[0] {
+            AuroraStatement::AlterTableSetStorage { table, mode } => {
+                assert_eq!(table, "docs");
+                assert_eq!(*mode, galaxdb_common::StorageMode::Legacy);
+            }
+            other => panic!("expected AlterTableSetStorage, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn parse_alter_table_set_storage_rejects_unknown_mode() {
+    assert!(parse("ALTER TABLE t SET STORAGE SIDEWAYS").is_err());
+}
+
+#[test]
 fn parse_grant_and_revoke() {
     match &parse("GRANT SELECT ON docs TO alice").unwrap()[0] {
         AuroraStatement::Grant(g) => {
