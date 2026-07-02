@@ -94,3 +94,53 @@ performance cliff), the response does not touch any other crate:
 
 Either path is a `galaxdb-query`-local change, which is the entire point of
 the anti-corruption layer.
+
+### Implementing an alternative backend
+
+A substitute engine implements the `QueryBackend` trait
+(`crates/galaxdb-query/src/lib.rs`) — the entire surface it must satisfy:
+
+```rust
+#[async_trait::async_trait]
+pub trait QueryBackend: Send + Sync {
+    /// Register a table's `ArrowSource` so the backend can scan it.
+    fn register(&self, table: &str, source: Arc<dyn ArrowSource>) -> GalaxResult<()>;
+
+    /// Execute a logical plan, returning a stream of Arrow result batches.
+    async fn execute(
+        &self,
+        plan: GalaxLogicalPlan,
+        ctx: &QueryContext,
+    ) -> GalaxResult<ResultStream>;
+}
+```
+
+Everything the backend consumes and produces is a GalaxDB-owned or Arrow
+type: it reads rows through `ArrowSource` (which the storage engine
+implements via `EngineArrowSource`, yielding Arrow `RecordBatch`es at a
+`ReadSnapshot`), receives a `GalaxLogicalPlan` (the validated analytical SQL
+plus its referenced tables), and returns a `ResultStream` of Arrow batches.
+Errors must map to `GalaxError` (the DataFusion impl does this in
+`error.rs`); no engine-specific error text is allowed to escape.
+
+**Selection point.** The concrete backend is chosen in exactly one place:
+`galaxdb_query::backend::run_analytical_sql_blocking`
+(`crates/galaxdb-query/src/backend.rs`), which the embedded engine calls from
+its analytical path (`Database::analytical_query`). It constructs a
+`DataFusionBackend`, registers an `EngineArrowSource` per referenced table at
+the query snapshot, and runs the plan. Swapping backends is editing that one
+constructor; the embedded engine, wire protocol, and storage layer are
+untouched because they only ever see `QueryBackend`, `ArrowSource`, and Arrow.
+
+**Checklist for a substitute:**
+
+1. `impl QueryBackend for MyBackend` with the two methods above.
+2. Map the engine's errors to `GalaxError::Query { sqlstate, message }` with
+   no foreign brand text (mirror `galaxdb-query/src/error.rs`).
+3. Point `run_analytical_sql_blocking` (or a sibling constructor) at
+   `MyBackend`.
+4. Run the SQL conformance corpus (HTAP task 24) — a substitute is only
+   complete when the corpus is green, exactly as for a DataFusion bump.
+
+The containment guard guarantees step 3 is the only wiring change: nothing
+outside `galaxdb-query` can have named the old backend's types.
