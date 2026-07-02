@@ -131,7 +131,7 @@ async fn test_kill_mid_flush() -> TestResult {
     };
 
     // Simulate partial flush (don't checkpoint WAL — simulates kill)
-    let _ = flush_memtable(&memtable_clone, &flush_config, 1, &galaxdb_io::TokioScheduler::new()).await;
+    let _ = flush_memtable(&memtable_clone, &flush_config, 1, &galaxdb_io::TokioScheduler::new(), &[]).await;
     println!("  Simulated kill mid-flush (no WAL checkpoint)");
 
     // Step 3: Drop the WAL writer without shutdown (simulates kill)
@@ -972,6 +972,157 @@ async fn test_sidecar_kill_mid_request() -> TestResult {
 // Main
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// C8: Columnar write-soak + crash recovery (HTAP task 28)
+// ---------------------------------------------------------------------------
+
+/// A columnar splitter for the chaos scenario: value = `id_le(8) ++ name`
+/// → an Int64 `id` column and a Text `name` column. Stands in for the SQL
+/// layer's `CatalogRowSplitter` so the engine's columnar write path is
+/// exercised under crash/compaction (mirrors the storage unit tests).
+struct IdNameSplitter;
+impl galaxdb_storage::columnar::RowColumnSplitter for IdNameSplitter {
+    fn column_types(&self) -> Vec<galaxdb_common::ColumnType> {
+        vec![
+            galaxdb_common::ColumnType::Int64,
+            galaxdb_common::ColumnType::Text,
+        ]
+    }
+    fn split(&self, v: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
+        if v.len() < 8 {
+            return None;
+        }
+        Some(vec![Some(v[0..8].to_vec()), Some(v[8..].to_vec())])
+    }
+}
+
+fn id_name_value(id: i64, name: &str) -> Vec<u8> {
+    let mut v = id.to_le_bytes().to_vec();
+    v.extend_from_slice(name.as_bytes());
+    v
+}
+
+/// Write-soak a **columnar** table across many flush + compaction cycles,
+/// overwriting keys (MVCC), then simulate a crash by dropping and reopening
+/// the engine. Verifies: (1) the SST count stays bounded (compaction keeps
+/// the columnar layout compact), (2) every key's latest value survives the
+/// crash (no data loss through WAL replay + flushed columnar SSTs), and
+/// (3) the columnar scan path works after recovery once the splitter is
+/// re-registered.
+async fn test_columnar_write_soak_and_crash_recovery() -> TestResult {
+    use galaxdb_storage::engine::{Engine, EngineConfig};
+
+    let name = "C8: Columnar write-soak + crash recovery";
+    println!("\n--- {} ---", name);
+
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(e) => return TestResult::fail(name, &format!("temp dir: {e}")),
+    };
+    let data_dir = dir.path().join("data");
+
+    const KEYS: i64 = 400;
+    const ROUNDS: i64 = 4; // each round overwrites every key once
+
+    // Expected latest name per key after all writes.
+    let latest_name = |k: i64| format!("k{k}-r{}", ROUNDS - 1);
+
+    let sst_count_after_compaction;
+    {
+        let engine = match Engine::new(EngineConfig {
+            data_dir: data_dir.clone(),
+            wal_group_commit_ms: 1,
+            ..Default::default()
+        }) {
+            Ok(e) => Arc::new(e),
+            Err(e) => return TestResult::fail(name, &format!("open engine: {e}")),
+        };
+        engine.register_columnar_table(b"t:".to_vec(), Arc::new(IdNameSplitter));
+
+        for round in 0..ROUNDS {
+            for k in 0..KEYS {
+                let key = format!("t:{k}").into_bytes();
+                let val = id_name_value(k, &format!("k{k}-r{round}"));
+                if let Err(e) = engine.put_sync(key, val) {
+                    return TestResult::fail(name, &format!("put_sync: {e}"));
+                }
+            }
+            // Flush each round → a new columnar SST; auto-compaction may fire.
+            if let Err(e) = engine.flush_memtable().await {
+                return TestResult::fail(name, &format!("flush: {e}"));
+            }
+        }
+        // Force a full merge; the columnar layout must survive it.
+        if let Err(e) = engine.compact() {
+            return TestResult::fail(name, &format!("compact: {e}"));
+        }
+        sst_count_after_compaction = engine.sst_count();
+
+        // Pre-crash sanity: latest values are correct.
+        for k in [0i64, KEYS / 2, KEYS - 1] {
+            let got = engine.get(format!("t:{k}").as_bytes());
+            let expect = id_name_value(k, &latest_name(k));
+            if got.as_deref() != Some(expect.as_slice()) {
+                return TestResult::fail(
+                    name,
+                    &format!("pre-crash value mismatch for key {k}"),
+                );
+            }
+        }
+        // Drop the engine WITHOUT any graceful shutdown → simulated crash.
+    }
+
+    // Bounded steady state: KEYS distinct keys overwritten ROUNDS times must
+    // compact to a small number of SSTs, not one-per-round-per-key.
+    if sst_count_after_compaction > 4 {
+        return TestResult::fail(
+            name,
+            &format!(
+                "SST count not bounded after compaction: {sst_count_after_compaction} (expected <= 4)"
+            ),
+        );
+    }
+
+    // Reopen → WAL replay + SST recovery.
+    let engine = match Engine::new(EngineConfig {
+        data_dir: data_dir.clone(),
+        wal_group_commit_ms: 1,
+        ..Default::default()
+    }) {
+        Ok(e) => Arc::new(e),
+        Err(e) => return TestResult::fail(name, &format!("reopen engine: {e}")),
+    };
+
+    // No data loss: every key's latest value survives the crash.
+    for k in 0..KEYS {
+        let got = engine.get(format!("t:{k}").as_bytes());
+        let expect = id_name_value(k, &latest_name(k));
+        if got.as_deref() != Some(expect.as_slice()) {
+            return TestResult::fail(
+                name,
+                &format!("post-crash data loss / mismatch for key {k}"),
+            );
+        }
+    }
+
+    // Columnar scan path works after recovery (re-register the splitter as
+    // the SQL layer would on catalog reload) and reads every row.
+    engine.register_columnar_table(b"t:".to_vec(), Arc::new(IdNameSplitter));
+    match engine.scan_columnar(b"t:", &[0, 1], &[], engine.latest_commit_ts()) {
+        Ok(batch) if batch.num_rows == KEYS as usize => TestResult::pass(
+            name,
+            &format!(
+                "{KEYS} keys × {ROUNDS} rounds survived crash; {sst_count_after_compaction} SST(s) after compaction; columnar scan OK"
+            ),
+        ),
+        Ok(batch) => TestResult::fail(
+            name,
+            &format!("columnar scan row count {} != {KEYS}", batch.num_rows),
+        ),
+        Err(e) => TestResult::fail(name, &format!("post-recovery columnar scan: {e}")),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     #[cfg(debug_assertions)]
@@ -1002,6 +1153,7 @@ async fn main() {
     results.push(timed!(test_sidecar_kill_mid_request()));
     results.push(timed!(test_concurrent_writers()));
     results.push(timed!(test_olap_scan_during_oltp()));
+    results.push(timed!(test_columnar_write_soak_and_crash_recovery()));
 
     let total_elapsed = suite_start.elapsed();
 
