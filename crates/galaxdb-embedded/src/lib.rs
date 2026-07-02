@@ -1410,13 +1410,15 @@ impl Database {
             return Ok(query_result_from(res));
         }
 
-        // Joins / aggregates / GROUP BY / subqueries / ORDER BY / LIMIT route
-        // to the DataFusion analytical engine (HTAP task 15). The native scan
-        // below handles only simple single-table queries.
-        if matches!(
-            galaxdb_sql::classify::classify_query(q),
-            galaxdb_sql::classify::StatementClass::Analytical
-        ) {
+        // Analytical (joins/aggregates/GROUP BY/subqueries/ORDER BY/LIMIT)
+        // → DataFusion analytical engine (HTAP task 15). `NOT DUPLICATE`
+        // queries stay native so the dedup pass is preserved (task 17.1).
+        if !query_has_not_duplicate(q)
+            && matches!(
+                galaxdb_sql::classify::classify_query(q),
+                galaxdb_sql::classify::StatementClass::Analytical
+            )
+        {
             return self.analytical_query(q, session);
         }
 
@@ -1460,6 +1462,20 @@ impl Database {
         q: &sqlparser::ast::Query,
         session: Option<&galaxdb_auth::SessionContext>,
     ) -> GalaxResult<QueryResult> {
+        self.analytical_query_at(q, session, galaxdb_query::ReadSnapshot::Latest)
+    }
+
+    /// [`analytical_query`](Self::analytical_query) at a specific MVCC read
+    /// snapshot. `AT VERSION <tag|ts>` on an analytical query (JOIN / GROUP BY
+    /// / aggregate) resolves to `ReadSnapshot::AsOfTimestamp`, so DataFusion's
+    /// scans read the historical columnar data through the same per-row ts
+    /// filter the native time-travel path uses (HTAP task 17, design §3.5).
+    fn analytical_query_at(
+        &self,
+        q: &sqlparser::ast::Query,
+        session: Option<&galaxdb_auth::SessionContext>,
+        snapshot: galaxdb_query::ReadSnapshot,
+    ) -> GalaxResult<QueryResult> {
         let tables = collect_table_names(q);
         if tables.is_empty() {
             return Err(GalaxError::FeatureNotSupported(
@@ -1492,7 +1508,7 @@ impl Database {
             self.engine.clone(),
             &metas,
             &sql,
-            galaxdb_query::ReadSnapshot::Latest,
+            snapshot,
         )?;
 
         let out_rows = rows
@@ -2034,11 +2050,14 @@ impl Database {
         }
 
         // Analytical (joins/aggregates/GROUP BY/subqueries/ORDER BY/LIMIT)
-        // → DataFusion engine (HTAP task 15).
-        if matches!(
-            galaxdb_sql::classify::classify_query(q),
-            galaxdb_sql::classify::StatementClass::Analytical
-        ) {
+        // → DataFusion engine (HTAP task 15). `NOT DUPLICATE` queries stay
+        // native so the dedup pass is preserved (task 17.1).
+        if !query_has_not_duplicate(q)
+            && matches!(
+                galaxdb_sql::classify::classify_query(q),
+                galaxdb_sql::classify::StatementClass::Analytical
+            )
+        {
             let session = self.session.clone();
             return self.analytical_query(q, session.as_ref());
         }
@@ -2053,6 +2072,29 @@ impl Database {
         let res = execute_with_context(&plan, &mut ctx)?;
         self.catalog = std::mem::take(&mut ctx.catalog);
         Ok(query_result_from(res))
+    }
+
+    /// Resolve an `AtVersionExpr` to an MVCC read timestamp: a literal
+    /// timestamp is used directly; a version tag is looked up in the tag
+    /// catalog (HTAP task 17, mirroring the native `FullScanAtVersion`
+    /// resolver so native and analytical time-travel agree).
+    fn resolve_at_version_ts(
+        &self,
+        at: &galaxdb_sql::ast::AtVersionExpr,
+    ) -> GalaxResult<galaxdb_common::Timestamp> {
+        use galaxdb_sql::ast::VersionRef;
+        match &at.version {
+            VersionRef::Timestamp(ts) => Ok(*ts),
+            VersionRef::Tag(name) => {
+                let tc = self
+                    .tag_catalog
+                    .lock()
+                    .map_err(|_| GalaxError::Internal("tag catalog mutex poisoned".into()))?;
+                tc.get_tag(name)
+                    .map(|t| t.version_timestamp)
+                    .ok_or_else(|| GalaxError::Internal(format!("unknown version tag: {name}")))
+            }
+        }
     }
 
     /// Dispatch a `SELECT ... AT VERSION <ref> [CONSISTENCY <mode>]`
@@ -2082,6 +2124,24 @@ impl Database {
                 "AT VERSION is only supported on SELECT statements".into(),
             ));
         };
+
+        // Analytical AT VERSION (JOIN / GROUP BY / aggregate, without a
+        // SEMANTIC_MATCH) → resolve the snapshot ts and run the analytical
+        // engine at that snapshot (HTAP task 17).
+        if extract_semantic_match_from_query(q).is_none()
+            && matches!(
+                galaxdb_sql::classify::classify_query(q),
+                galaxdb_sql::classify::StatementClass::Analytical
+            )
+        {
+            let ts = self.resolve_at_version_ts(&at)?;
+            let session = self.session.clone();
+            return self.analytical_query_at(
+                q,
+                session.as_ref(),
+                galaxdb_query::ReadSnapshot::AsOfTimestamp(ts),
+            );
+        }
 
         check_select_supported(q)?;
         let table = extract_table(q);
@@ -2122,6 +2182,21 @@ impl Database {
                 "AT VERSION is only supported on SELECT statements".into(),
             ));
         };
+
+        // Analytical AT VERSION → historical analytical scan (HTAP task 17).
+        if extract_semantic_match_from_query(q).is_none()
+            && matches!(
+                galaxdb_sql::classify::classify_query(q),
+                galaxdb_sql::classify::StatementClass::Analytical
+            )
+        {
+            let ts = self.resolve_at_version_ts(&at)?;
+            return self.analytical_query_at(
+                q,
+                session,
+                galaxdb_query::ReadSnapshot::AsOfTimestamp(ts),
+            );
+        }
 
         check_select_supported(q)?;
         let table = extract_table(q);
@@ -3292,6 +3367,36 @@ fn is_semantic_match_call(expr: &sqlparser::ast::Expr) -> bool {
         if f.name.to_string().eq_ignore_ascii_case("SEMANTIC_MATCH"))
 }
 
+/// Does the query's WHERE clause contain the AuroraSQL `NOT DUPLICATE`
+/// group-level dedup predicate (parsed as `NOT DUPLICATE` → `UnaryOp{Not,
+/// Identifier("DUPLICATE")}`)? Used to keep such queries on the native
+/// executor, which applies the dedup pass — the DataFusion analytical engine
+/// has no `NOT DUPLICATE` operator, so routing one there would drop the
+/// semantics (HTAP task 17.1).
+fn query_has_not_duplicate(q: &sqlparser::ast::Query) -> bool {
+    fn expr_has(expr: &sqlparser::ast::Expr) -> bool {
+        use sqlparser::ast::{Expr, UnaryOperator};
+        match expr {
+            Expr::UnaryOp {
+                op: UnaryOperator::Not,
+                expr,
+            } => match expr.as_ref() {
+                Expr::Identifier(id) => id.value.eq_ignore_ascii_case("DUPLICATE"),
+                inner => expr_has(inner),
+            },
+            Expr::BinaryOp { left, right, .. } => expr_has(left) || expr_has(right),
+            Expr::Nested(e) => expr_has(e),
+            _ => false,
+        }
+    }
+    if let sqlparser::ast::SetExpr::Select(s) = q.body.as_ref() {
+        if let Some(sel) = &s.selection {
+            return expr_has(sel);
+        }
+    }
+    false
+}
+
 /// Remove every `SEMANTIC_MATCH(...)` conjunct from a WHERE expression,
 /// returning the residual relational predicate (`None` if nothing remains).
 /// Only `AND` chains are unwound — `SEMANTIC_MATCH` combined with `OR` is not
@@ -4283,6 +4388,60 @@ mod tests {
         assert!(s3.contains("PRICE > 5"));
     }
 
+    #[test]
+    fn analytical_at_version_reads_historical_snapshot() {
+        // HTAP task 17 / 17.1: an analytical (GROUP BY) query with AT VERSION
+        // reads the historical columnar snapshot through the DataFusion path.
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, cat TEXT, v INT)")
+            .unwrap();
+        for (id, cat, v) in [(1, "a", 10), (2, "a", 20), (3, "b", 30)] {
+            db.execute(&format!(
+                "INSERT INTO t (id, cat, v) VALUES ({id}, '{cat}', {v})"
+            ))
+            .unwrap();
+        }
+        // Snapshot after the first three inserts.
+        let ts0 = db.engine.next_ts_for_tests() - 1;
+        // Two more rows land at a higher ts (invisible at ts0).
+        db.execute("INSERT INTO t (id, cat, v) VALUES (4, 'a', 40)").unwrap();
+        db.execute("INSERT INTO t (id, cat, v) VALUES (5, 'b', 50)").unwrap();
+
+        let counts = |r: QueryResult| -> Vec<(String, String)> {
+            rows_of(r)
+                .into_iter()
+                .map(|row| {
+                    let cat = row.values.iter().find(|(k, _)| k == "cat").unwrap().1.clone();
+                    let n = row.values.iter().find(|(k, _)| k == "n").unwrap().1.clone();
+                    (cat, n)
+                })
+                .collect()
+        };
+
+        // Latest: a=3 (1,2,4), b=2 (3,5).
+        let latest = counts(
+            db.execute("SELECT cat, COUNT(*) AS n FROM t GROUP BY cat ORDER BY cat")
+                .unwrap(),
+        );
+        assert_eq!(
+            latest,
+            vec![("a".into(), "3".into()), ("b".into(), "2".into())]
+        );
+
+        // AT VERSION ts0: a=2 (1,2), b=1 (3) — the later inserts are invisible.
+        let hist = counts(
+            db.execute(&format!(
+                "SELECT cat, COUNT(*) AS n FROM t GROUP BY cat ORDER BY cat AT VERSION {ts0}"
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            hist,
+            vec![("a".into(), "2".into()), ("b".into(), "1".into())],
+            "analytical AT VERSION must aggregate over the historical snapshot"
+        );
+    }
+
     /// End-to-end SEMANTIC_MATCH test using the real model. Gated behind
     /// the `online-tests` feature — requires network access to HuggingFace
     /// Hub on first run (downloads ~90 MB for all-MiniLM-L6-v2).
@@ -5066,6 +5225,40 @@ mod tests {
     // -----------------------------------------------------------------
     // WHERE NOT DUPLICATE (task 35.5) — embedded end-to-end
     // -----------------------------------------------------------------
+
+    /// `NOT DUPLICATE` combined with an analytical clause (ORDER BY) must
+    /// still dedup: the query stays on the native executor rather than being
+    /// routed to DataFusion, which has no `NOT DUPLICATE` operator (HTAP
+    /// task 17.1 — WHERE NOT DUPLICATE preserved).
+    #[test]
+    fn where_not_duplicate_with_order_by_stays_native_and_dedups() {
+        let mut db = test_db();
+        db.execute(
+            "CREATE TABLE docs (id INT PRIMARY KEY, body TEXT, _near_duplicate_group BIGINT)",
+        )
+        .unwrap();
+        // Group 100: ids 1,2,3 → representative id=1. Group 200: 4,5 → id=4.
+        for (id, g) in [(1, "100"), (2, "100"), (3, "100"), (4, "200"), (5, "200")] {
+            db.execute(&format!(
+                "INSERT INTO docs (id, body, _near_duplicate_group) VALUES ({id}, 'b{id}', {g})"
+            ))
+            .unwrap();
+        }
+        // With ORDER BY present, classify() would say Analytical; the guard
+        // keeps it native so dedup runs. Two representatives survive.
+        let r = db
+            .execute("SELECT id FROM docs WHERE NOT DUPLICATE ORDER BY id")
+            .unwrap();
+        let QueryResult::Rows(rows) = r else {
+            panic!("expected Rows");
+        };
+        let ids: std::collections::HashSet<String> = rows
+            .iter()
+            .map(|row| row.values.iter().find(|(k, _)| k == "id").unwrap().1.clone())
+            .collect();
+        assert_eq!(ids.len(), 2, "one representative per group, got {ids:?}");
+        assert!(ids.contains("1") && ids.contains("4"), "reps 1 and 4: {ids:?}");
+    }
 
     /// End-to-end: create a table with the near-duplicate group column,
     /// seed rows that share group ids, run `SELECT … WHERE NOT
