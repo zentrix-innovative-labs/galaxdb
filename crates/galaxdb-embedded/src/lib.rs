@@ -664,6 +664,20 @@ impl Database {
     // Explicit transactions (HTAP Phase 5, design §3.6.1)
     // -----------------------------------------------------------------
 
+    /// Flush the active memtable to an on-disk SST (maintenance / test
+    /// helper). Blocks on the engine's async flush using a short-lived
+    /// current-thread runtime, so it is safe to call from a synchronous
+    /// context (e.g. the conformance corpus, which runs queries over real
+    /// SST-backed data rather than only the memtable).
+    pub fn flush(&self) -> GalaxResult<()> {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| GalaxError::Internal(format!("flush runtime: {e}")))?
+            .block_on(self.engine.flush_memtable())?;
+        Ok(())
+    }
+
     /// Begin an explicit transaction (`BEGIN`/`START TRANSACTION`).
     ///
     /// Captures the engine's current MVCC timestamp as the transaction's
