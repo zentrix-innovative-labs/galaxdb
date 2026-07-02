@@ -499,6 +499,12 @@ where
         std::collections::HashMap::new();
     let mut portals: std::collections::HashMap<String, Portal> =
         std::collections::HashMap::new();
+    // Per-connection explicit-transaction state (HTAP Phase 5). `None` is
+    // autocommit; `Some` holds the active transaction's buffer/snapshot.
+    // `txn_failed` records that a statement errored inside the block, so
+    // only COMMIT/ROLLBACK are accepted until it ends (Postgres 25P02).
+    let mut current_txn: Option<galaxdb_sql::executor::TxnHandle> = None;
+    let mut txn_failed = false;
 
     loop {
         let msg = match read_message(&mut reader).await {
@@ -513,11 +519,38 @@ where
                 // COPY ... FROM STDIN / TO STDOUT is a wire sub-protocol,
                 // not a normal statement — intercept it before execution.
                 if let Some(cmd) = galaxdb_wire::copy::parse_copy(&sql) {
-                    run_copy(&mut reader, &mut writer, &db, &session, cmd).await?;
+                    if current_txn.is_some() {
+                        // COPY does not participate in the transaction write
+                        // buffer; rather than silently bypass it, reject it
+                        // inside an explicit transaction (v1).
+                        write_error_response(
+                            &mut writer,
+                            "0A000",
+                            "COPY inside an explicit transaction is not supported (v1)",
+                        )
+                        .await?;
+                    } else {
+                        run_copy(&mut reader, &mut writer, &db, &session, cmd).await?;
+                    }
                 } else {
-                    run_simple_query(&mut writer, &db, &session, &sql).await?;
+                    run_simple_query_txn(
+                        &mut writer,
+                        &db,
+                        &session,
+                        &sql,
+                        &mut current_txn,
+                        &mut txn_failed,
+                    )
+                    .await?;
                 }
-                write_ready_for_query(&mut writer, b'I').await?;
+                let status = if txn_failed {
+                    b'E'
+                } else if current_txn.is_some() {
+                    b'T'
+                } else {
+                    b'I'
+                };
+                write_ready_for_query(&mut writer, status).await?;
                 writer.flush().await?;
             }
 
@@ -680,9 +713,36 @@ where
                         // (Req 7). The client already received the
                         // RowDescription from Describe, so emit DataRows +
                         // CommandComplete only.
-                        let result =
-                            run_bound_execute(&db, &session, template, p.values.clone()).await?;
-                        write_query_result(&mut writer, result, false).await?;
+                        if txn_failed {
+                            // Inside a failed transaction every command is
+                            // rejected until the block ends (Postgres 25P02).
+                            write_error_response(
+                                &mut writer,
+                                "25P02",
+                                "current transaction is aborted, commands ignored until end of transaction block",
+                            )
+                            .await?;
+                        } else if let Some(txn) = current_txn.as_ref() {
+                            // Route the bound statement through the open
+                            // transaction's write buffer / read snapshot.
+                            let result = run_bound_execute_txn(
+                                &db,
+                                &session,
+                                template,
+                                p.values.clone(),
+                                txn,
+                            )
+                            .await?;
+                            if result.is_err() {
+                                txn_failed = true;
+                            }
+                            write_query_result(&mut writer, result, false).await?;
+                        } else {
+                            let result =
+                                run_bound_execute(&db, &session, template, p.values.clone())
+                                    .await?;
+                            write_query_result(&mut writer, result, false).await?;
+                        }
                     }
                 }
                 // No ReadyForQuery here — that waits for Sync.
@@ -700,7 +760,14 @@ where
             }
 
             FrontendMessage::Sync => {
-                write_ready_for_query(&mut writer, b'I').await?;
+                let status = if txn_failed {
+                    b'E'
+                } else if current_txn.is_some() {
+                    b'T'
+                } else {
+                    b'I'
+                };
+                write_ready_for_query(&mut writer, status).await?;
                 writer.flush().await?;
             }
 
@@ -831,6 +898,252 @@ async fn run_simple_query<W: AsyncWriteExt + Unpin>(
 
     let result = run_engine(db, session, sql).await?;
     write_query_result(writer, result, true).await
+}
+
+/// A transaction-control statement recognized by the wire layer
+/// (HTAP Phase 5). These are intercepted before the SQL engine because
+/// they manage per-connection transaction state, not table data.
+enum TxnControl {
+    Begin,
+    Commit,
+    Rollback,
+    Savepoint(String),
+    Release(String),
+    RollbackTo(String),
+}
+
+/// Recognize a transaction-control statement from raw SQL. Returns `None`
+/// for anything that is not transaction control (it then runs as normal
+/// DML/DQL). Case-insensitive on keywords; savepoint identifiers keep their
+/// original case (double quotes are stripped).
+fn parse_txn_control(sql: &str) -> Option<TxnControl> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let toks: Vec<&str> = s.split_whitespace().collect();
+    if toks.is_empty() {
+        return None;
+    }
+    let unquote = |t: &str| t.trim_matches('"').to_string();
+    let eq = |t: Option<&&str>, kw: &str| t.map(|x| x.eq_ignore_ascii_case(kw)).unwrap_or(false);
+    match toks[0].to_uppercase().as_str() {
+        // BEGIN [TRANSACTION|WORK] ...  /  START TRANSACTION ...
+        "BEGIN" => Some(TxnControl::Begin),
+        "START" if eq(toks.get(1), "TRANSACTION") => Some(TxnControl::Begin),
+        // COMMIT [TRANSACTION|WORK]  /  END [TRANSACTION]
+        "COMMIT" | "END" => Some(TxnControl::Commit),
+        // ROLLBACK [TO [SAVEPOINT] name]  /  ABORT
+        "ROLLBACK" | "ABORT" => {
+            if eq(toks.get(1), "TO") {
+                let name = if eq(toks.get(2), "SAVEPOINT") {
+                    toks.get(3)
+                } else {
+                    toks.get(2)
+                };
+                return name.map(|n| TxnControl::RollbackTo(unquote(n)));
+            }
+            Some(TxnControl::Rollback)
+        }
+        // SAVEPOINT name
+        "SAVEPOINT" => toks.get(1).map(|n| TxnControl::Savepoint(unquote(n))),
+        // RELEASE [SAVEPOINT] name
+        "RELEASE" => {
+            let name = if eq(toks.get(1), "SAVEPOINT") {
+                toks.get(2)
+            } else {
+                toks.get(1)
+            };
+            name.map(|n| TxnControl::Release(unquote(n)))
+        }
+        _ => None,
+    }
+}
+
+/// Simple-query entry point that is aware of explicit transactions
+/// (HTAP Phase 5). Routes transaction-control statements to the
+/// transaction-state machine, statements inside an open transaction to
+/// `Database::execute_in_txn`, and everything else to the autocommit
+/// [`run_simple_query`] path. Does NOT write `ReadyForQuery` — the caller
+/// computes the transaction-status byte and sends it.
+#[allow(clippy::too_many_arguments)]
+async fn run_simple_query_txn<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    db: &Arc<RwLock<Database>>,
+    session: &SessionContext,
+    sql: &str,
+    current_txn: &mut Option<galaxdb_sql::executor::TxnHandle>,
+    txn_failed: &mut bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(ctrl) = parse_txn_control(sql) {
+        return handle_txn_control(writer, db, ctrl, current_txn, txn_failed).await;
+    }
+
+    // Inside a failed transaction Postgres rejects everything until the
+    // block ends (25P02). Transaction-control above is the only exception.
+    if *txn_failed {
+        write_error_response(
+            writer,
+            "25P02",
+            "current transaction is aborted, commands ignored until end of transaction block",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Inside an open transaction: read-only catalog introspection still
+    // works (the emulated pg_catalog is static), DML/DQL routes through the
+    // transaction buffer.
+    if let Some(txn) = current_txn.as_ref() {
+        if let Some(pg_result) = pg_catalog::try_handle_pg_catalog(sql) {
+            write_row_description(writer, &pg_result.columns).await?;
+            for row in &pg_result.rows {
+                let values: Vec<Option<&str>> = row.iter().map(|v| v.as_deref()).collect();
+                write_data_row(writer, &values).await?;
+            }
+            write_command_complete(writer, &format!("SELECT {}", pg_result.rows.len())).await?;
+            return Ok(());
+        }
+        let db_clone = db.clone();
+        let txn_clone = txn.clone();
+        let sql_owned = sql.to_string();
+        let sess = session.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            db_clone
+                .blocking_read()
+                .execute_in_txn(&sql_owned, &txn_clone, Some(sess))
+        })
+        .await
+        .map_err(|e| std::io::Error::other(format!("txn worker panic: {e}")))?;
+        // Any statement error inside a transaction poisons it: subsequent
+        // commands are rejected until COMMIT/ROLLBACK (Postgres semantics).
+        if result.is_err() {
+            *txn_failed = true;
+        }
+        return write_query_result(writer, result, true).await;
+    }
+
+    // Autocommit (no open transaction): unchanged behavior.
+    run_simple_query(writer, db, session, sql).await
+}
+
+/// Drive the per-connection transaction-state machine for a control
+/// statement, writing the appropriate `CommandComplete`/`ErrorResponse`.
+async fn handle_txn_control<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    db: &Arc<RwLock<Database>>,
+    ctrl: TxnControl,
+    current_txn: &mut Option<galaxdb_sql::executor::TxnHandle>,
+    txn_failed: &mut bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match ctrl {
+        TxnControl::Begin => {
+            // A nested BEGIN is a no-op in Postgres (warns, stays in txn).
+            if current_txn.is_none() {
+                let db_clone = db.clone();
+                let txn = tokio::task::spawn_blocking(move || {
+                    db_clone.blocking_read().begin_transaction()
+                })
+                .await
+                .map_err(|e| std::io::Error::other(format!("begin worker panic: {e}")))??;
+                *current_txn = Some(txn);
+                *txn_failed = false;
+            }
+            write_command_complete(writer, "BEGIN").await?;
+        }
+        TxnControl::Commit => match current_txn.take() {
+            None => write_command_complete(writer, "COMMIT").await?,
+            Some(txn) => {
+                if *txn_failed {
+                    // A failed transaction commits as a rollback (Postgres).
+                    let db_clone = db.clone();
+                    tokio::task::spawn_blocking(move || {
+                        db_clone.blocking_read().rollback_transaction(&txn)
+                    })
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("rollback worker panic: {e}")))?;
+                    *txn_failed = false;
+                    write_command_complete(writer, "ROLLBACK").await?;
+                } else {
+                    let db_clone = db.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        db_clone.blocking_read().commit_transaction(&txn)
+                    })
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("commit worker panic: {e}")))?;
+                    match res {
+                        Ok(()) => write_command_complete(writer, "COMMIT").await?,
+                        Err(e) => {
+                            write_error_response(writer, e.sqlstate(), &format!("{e}")).await?
+                        }
+                    }
+                }
+            }
+        },
+        TxnControl::Rollback => match current_txn.take() {
+            None => write_command_complete(writer, "ROLLBACK").await?,
+            Some(txn) => {
+                let db_clone = db.clone();
+                tokio::task::spawn_blocking(move || {
+                    db_clone.blocking_read().rollback_transaction(&txn)
+                })
+                .await
+                .map_err(|e| std::io::Error::other(format!("rollback worker panic: {e}")))?;
+                *txn_failed = false;
+                write_command_complete(writer, "ROLLBACK").await?;
+            }
+        },
+        TxnControl::Savepoint(name) => match current_txn.as_ref() {
+            None => {
+                write_error_response(
+                    writer,
+                    "25P01",
+                    "SAVEPOINT can only be used in transaction blocks",
+                )
+                .await?
+            }
+            Some(txn) => {
+                txn.savepoint(&name);
+                write_command_complete(writer, "SAVEPOINT").await?;
+            }
+        },
+        TxnControl::RollbackTo(name) => match current_txn.as_ref() {
+            None => {
+                write_error_response(
+                    writer,
+                    "25P01",
+                    "ROLLBACK TO SAVEPOINT can only be used in transaction blocks",
+                )
+                .await?
+            }
+            Some(txn) => match txn.rollback_to(&name) {
+                Ok(()) => {
+                    // Rolling back to a live savepoint clears the failed state.
+                    *txn_failed = false;
+                    write_command_complete(writer, "ROLLBACK").await?;
+                }
+                Err(_) => {
+                    write_error_response(writer, "3B001", &format!("no such savepoint: {name}"))
+                        .await?
+                }
+            },
+        },
+        TxnControl::Release(name) => match current_txn.as_ref() {
+            None => {
+                write_error_response(
+                    writer,
+                    "25P01",
+                    "RELEASE SAVEPOINT can only be used in transaction blocks",
+                )
+                .await?
+            }
+            Some(txn) => match txn.release(&name) {
+                Ok(()) => write_command_complete(writer, "RELEASE").await?,
+                Err(_) => {
+                    write_error_response(writer, "3B001", &format!("no such savepoint: {name}"))
+                        .await?
+                }
+            },
+        },
+    }
+    Ok(())
 }
 
 /// Drive the COPY sub-protocol (Req 8): `COPY t FROM STDIN` ingests text
@@ -989,7 +1302,30 @@ async fn run_bound_execute(
     .map_err(|e| std::io::Error::other(format!("worker panic: {e}")))
 }
 
-/// Execute one statement against the engine on the blocking pool, choosing
+/// Bind + execute a prepared template inside an open explicit transaction
+/// (extended query protocol, HTAP Phase 5). Mirrors [`run_bound_execute`]
+/// but routes through the transaction's write buffer / read snapshot via
+/// [`Database::execute_bound_in_txn`].
+async fn run_bound_execute_txn(
+    db: &Arc<RwLock<Database>>,
+    session: &SessionContext,
+    template: &galaxdb_embedded::PreparedTemplate,
+    values: Vec<galaxdb_embedded::BoundValue>,
+    txn: &galaxdb_sql::executor::TxnHandle,
+) -> Result<galaxdb_common::GalaxResult<galaxdb_embedded::QueryResult>, std::io::Error> {
+    galaxdb_observe::metrics().queries_total.inc();
+    let db_clone = db.clone();
+    let session_clone = session.clone();
+    let template = template.clone();
+    let txn = txn.clone();
+    tokio::task::spawn_blocking(move || {
+        db_clone
+            .blocking_read()
+            .execute_bound_in_txn(&template, &values, &txn, Some(session_clone))
+    })
+    .await
+    .map_err(|e| std::io::Error::other(format!("txn worker panic: {e}")))
+}
 /// a read or write lock by statement kind (same rule as the v1 loop).
 /// DML (INSERT/UPDATE/DELETE) uses the concurrent path with `blocking_read()`
 /// so multiple clients can issue writes simultaneously and share WAL fsyncs

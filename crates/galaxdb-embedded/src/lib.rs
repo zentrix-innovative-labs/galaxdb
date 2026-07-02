@@ -177,6 +177,11 @@ pub struct Database {
     /// a `Mutex` for interior mutability so both `&mut self` (`execute`)
     /// and `&self` (`execute_readonly`) callers can use it.
     stmt_cache: Mutex<galaxdb_sql::StatementCache>,
+    /// Snapshot-isolation transaction manager (HTAP Phase 5). Shared across
+    /// connections for write-write conflict detection (acquire/release write
+    /// locks); each `BEGIN` gets a snapshot id from it. Read snapshots use
+    /// the engine's MVCC clock; this manager owns the lock table + txn ids.
+    txn_manager: Arc<galaxdb_sql::transaction::TransactionManager>,
 }
 
 /// Adapter exposing the version-tag catalog's pinned timestamps to the
@@ -267,6 +272,7 @@ impl Database {
             session: None,
             audit: None,
             stmt_cache: Mutex::new(galaxdb_sql::StatementCache::new(256)),
+            txn_manager: Arc::new(galaxdb_sql::transaction::TransactionManager::new()),
         }
     }
 
@@ -647,6 +653,276 @@ impl Database {
         Ok(last)
     }
 
+    // -----------------------------------------------------------------
+    // Explicit transactions (HTAP Phase 5, design §3.6.1)
+    // -----------------------------------------------------------------
+
+    /// Begin an explicit transaction (`BEGIN`/`START TRANSACTION`).
+    ///
+    /// Captures the engine's current MVCC timestamp as the transaction's
+    /// read snapshot (every version committed at or before this ts is
+    /// visible for the life of the transaction — snapshot isolation) and a
+    /// [`TransactionManager`](galaxdb_sql::transaction::TransactionManager)
+    /// snapshot id that owns this transaction's write locks. The returned
+    /// [`TxnHandle`] is threaded through
+    /// [`execute_in_txn`](Self::execute_in_txn) and finalized with
+    /// [`commit_transaction`](Self::commit_transaction) or
+    /// [`rollback_transaction`](Self::rollback_transaction).
+    pub fn begin_transaction(&self) -> GalaxResult<galaxdb_sql::executor::TxnHandle> {
+        // `latest_commit_ts()` is the ts of the most recent committed write.
+        // `scan_all_at`/`get_at` use `ts <= read_ts`, so reading at this value
+        // makes exactly "everything committed so far" visible and anything
+        // committed after BEGIN (which is assigned a strictly larger ts)
+        // invisible — the snapshot-isolation boundary (design §3.6.1). Using
+        // the *next* (unassigned) ts here would leak the first write that
+        // commits after BEGIN into the snapshot (off-by-one dirty read).
+        let read_ts = self.engine.latest_commit_ts();
+        let snapshot = self.txn_manager.begin();
+        Ok(galaxdb_sql::executor::TxnHandle::new(
+            read_ts,
+            snapshot.read_timestamp,
+            self.txn_manager.clone(),
+        ))
+    }
+
+    /// Commit a transaction: atomically* apply every buffered write to the
+    /// engine (durable through the WAL), then release the transaction's
+    /// write locks and snapshot.
+    ///
+    /// Write-write conflicts were already rejected at buffer time
+    /// (`buffer_write` → `acquire_write_lock` → `40001`), so the apply step
+    /// cannot conflict. Buffered upserts become `put_sync`; buffered
+    /// tombstones become `delete_sync`.
+    ///
+    /// \*Per design §3.6.1 each buffered entry is applied with its own
+    /// `put_sync`/`delete_sync` (each individually WAL-durable). Cross-key
+    /// crash atomicity of the apply step is a documented v1 limitation — the
+    /// engine exposes no mixed put/delete batch primitive yet — not a silent
+    /// fallback: the writes that land are correct and durable.
+    ///
+    /// Secondary-index and embedding-sidecar hooks are NOT re-applied for
+    /// buffered rows at commit (documented limitation): committed data is
+    /// correct and durable, but indexes/embeddings derived from rows written
+    /// inside a transaction are eventually-consistent until the next
+    /// rebuild/insert. Autocommit DML keeps applying those hooks inline.
+    pub fn commit_transaction(
+        &self,
+        txn: &galaxdb_sql::executor::TxnHandle,
+    ) -> GalaxResult<()> {
+        let writes = txn.writes.lock().expect("txn writes lock").clone();
+        for (key, value) in writes {
+            match value {
+                Some(v) => {
+                    self.engine.put_sync(key, v)?;
+                }
+                None => {
+                    self.engine.delete_sync(&key)?;
+                }
+            }
+        }
+        // Release write locks + drop the active snapshot. We reconstruct the
+        // manager Snapshot from the handle's owner id (the only field commit
+        // consults) since the handle stores the id, not the Snapshot itself.
+        let snapshot = galaxdb_sql::transaction::Snapshot {
+            read_timestamp: txn.txn_id,
+            write_set: Vec::new(),
+        };
+        self.txn_manager.commit(&snapshot)?;
+        Ok(())
+    }
+
+    /// Roll back a transaction (`ROLLBACK`): discard the buffered write set
+    /// and release the transaction's write locks + snapshot. Nothing was
+    /// applied to the engine, so there is nothing to undo.
+    pub fn rollback_transaction(&self, txn: &galaxdb_sql::executor::TxnHandle) {
+        txn.writes.lock().expect("txn writes lock").clear();
+        txn.savepoints.lock().expect("txn savepoints lock").clear();
+        let snapshot = galaxdb_sql::transaction::Snapshot {
+            read_timestamp: txn.txn_id,
+            write_set: Vec::new(),
+        };
+        self.txn_manager.abort(&snapshot);
+    }
+
+    /// Execute one statement inside an open transaction (`txn`).
+    ///
+    /// DML (`INSERT`/`UPDATE`/`DELETE`) buffers its writes into the handle's
+    /// write set with read-your-writes overlay rather than committing to the
+    /// engine; row-returning `SELECT`s read at the transaction's snapshot ts
+    /// with the buffer overlaid. The following are rejected with a typed
+    /// error for v1 (they are not yet transaction-aware): DDL, multi-table
+    /// /analytical queries (the DataFusion path cannot see the write
+    /// buffer), `SEMANTIC_MATCH`, and `AT VERSION`.
+    pub fn execute_in_txn(
+        &self,
+        sql: &str,
+        txn: &galaxdb_sql::executor::TxnHandle,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        if split_at_version(sql)?.is_some() {
+            return Err(GalaxError::FeatureNotSupported(
+                "AT VERSION time-travel is not supported inside an explicit \
+                 transaction (v1)"
+                    .into(),
+            ));
+        }
+        let stmts = self.cached_parse(sql)?;
+        let mut last = QueryResult::Ok("OK".to_string());
+        for stmt in stmts.iter() {
+            last = self.exec_stmt_in_txn(stmt, txn, session.clone())?;
+        }
+        Ok(last)
+    }
+
+    /// Translate + execute a single parsed statement against the transaction
+    /// buffer. Shared by [`execute_in_txn`](Self::execute_in_txn).
+    fn exec_stmt_in_txn(
+        &self,
+        stmt: &AuroraStatement,
+        txn: &galaxdb_sql::executor::TxnHandle,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        use sqlparser::ast::Statement;
+        let s = match stmt {
+            AuroraStatement::Standard(s) => s,
+            other => {
+                return Err(GalaxError::FeatureNotSupported(format!(
+                    "statement not supported inside a transaction (v1): {other:?}"
+                )));
+            }
+        };
+        match s.as_ref() {
+            Statement::Insert(ins) => {
+                let table = ins.table_name.to_string();
+                let column_names: Vec<String> =
+                    ins.columns.iter().map(|c| c.to_string()).collect();
+                let Some(source) = &ins.source else {
+                    return Ok(QueryResult::RowCount(0));
+                };
+                let sqlparser::ast::SetExpr::Values(values) = source.body.as_ref() else {
+                    return Err(GalaxError::FeatureNotSupported(
+                        "INSERT ... SELECT is not supported inside a transaction (v1)"
+                            .into(),
+                    ));
+                };
+                let mut inserted = 0u64;
+                for row in &values.rows {
+                    let row_values: Vec<Value> = row.iter().map(value_from_expr).collect();
+                    let plan = QueryPlan::Insert {
+                        table: table.clone(),
+                        columns: column_names.clone(),
+                        values: row_values,
+                    };
+                    let mut ctx = self.txn_context(txn, session.clone());
+                    let res = execute_with_context(&plan, &mut ctx)?;
+                    inserted += match res {
+                        ExecuteResult::RowCount(n) => n,
+                        _ => 1,
+                    };
+                }
+                Ok(QueryResult::RowCount(inserted))
+            }
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+                ..
+            } => {
+                let tname = table.relation.to_string();
+                let asns: Vec<(String, Value)> = assignments
+                    .iter()
+                    .map(|a| (a.target.to_string(), value_from_expr(&a.value)))
+                    .collect();
+                let filter = selection.as_ref().and_then(filter_from_expr);
+                let plan = QueryPlan::Update {
+                    table: tname,
+                    assignments: asns,
+                    filter,
+                };
+                let mut ctx = self.txn_context(txn, session);
+                let res = execute_with_context(&plan, &mut ctx)?;
+                Ok(query_result_from(res))
+            }
+            Statement::Delete(del) => {
+                let tname = match &del.from {
+                    sqlparser::ast::FromTable::WithFromKeyword(tables)
+                    | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables
+                        .first()
+                        .map(|t| t.relation.to_string())
+                        .unwrap_or_default(),
+                };
+                let filter = del.selection.as_ref().and_then(filter_from_expr);
+                let plan = QueryPlan::Delete {
+                    table: tname,
+                    filter,
+                };
+                let mut ctx = self.txn_context(txn, session);
+                let res = execute_with_context(&plan, &mut ctx)?;
+                Ok(query_result_from(res))
+            }
+            Statement::Query(q) => {
+                if extract_semantic_match_from_query(q).is_some() {
+                    return Err(GalaxError::FeatureNotSupported(
+                        "SEMANTIC_MATCH is not supported inside a transaction (v1)".into(),
+                    ));
+                }
+                if matches!(
+                    galaxdb_sql::classify::classify_query(q),
+                    galaxdb_sql::classify::StatementClass::Analytical
+                ) {
+                    return Err(GalaxError::FeatureNotSupported(
+                        "analytical queries (joins/aggregates/subqueries/ORDER BY/\
+                         LIMIT) are not supported inside an explicit transaction \
+                         (v1); the columnar analytical engine cannot see a \
+                         transaction's uncommitted write buffer"
+                            .into(),
+                    ));
+                }
+                let (columns, filter) = extract_projection_and_filter(q);
+                let plan = QueryPlan::FullScan {
+                    table: extract_table(q),
+                    filter,
+                    columns,
+                };
+                let mut ctx = self.txn_context(txn, session);
+                let res = execute_with_context(&plan, &mut ctx)?;
+                Ok(query_result_from(res))
+            }
+            other => Err(GalaxError::FeatureNotSupported(format!(
+                "statement not supported inside a transaction (v1): {other}"
+            ))),
+        }
+    }
+
+    /// Build an [`ExecutorContext`] wired with every engine subsystem and
+    /// the active transaction handle, so DML buffers + reads overlay the
+    /// transaction's write set (design §3.6.1). Mirrors the per-statement
+    /// context built on the autocommit concurrent path, plus `ctx.txn`.
+    fn txn_context(
+        &self,
+        txn: &galaxdb_sql::executor::TxnHandle,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> ExecutorContext {
+        let mut ctx = ExecutorContext::new(self.engine.clone());
+        ctx.catalog = self.catalog.clone();
+        ctx.sidecar = self.sidecar.clone();
+        ctx.merkle_dag = Some(self.merkle_dag.clone());
+        ctx.tag_catalog = Some(self.tag_catalog.clone());
+        ctx.vector_backend = Some(Arc::new(EmbeddedVectorBackend {
+            sidecar: self.sidecar.clone(),
+            indexes: self.vector_indexes.clone(),
+            engine: self.engine.clone(),
+        }));
+        ctx.auth_store = Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+        ctx.secondary_index = Some(galaxdb_sql::secondary_index::SecondaryIndexStore::new(
+            self.engine.clone(),
+        ));
+        ctx.session = session;
+        ctx.audit = self.audit.clone();
+        ctx.txn = Some(txn.clone());
+        ctx
+    }
+
     /// Resolve the static shape of a statement for the extended query
     /// protocol's `Describe` (Req 6 AC4) — parameter count and, for a
     /// row-returning SELECT, the result column names — without executing
@@ -775,6 +1051,28 @@ impl Database {
     /// an exclusive write lock. Safe because DML (INSERT/UPDATE/DELETE) never
     /// mutates the catalog, and the engine is internally thread-safe. Allows
     /// concurrent prepared INSERTs to share WAL group-commit fsyncs.
+    /// Bind + execute a prepared template inside an open explicit
+    /// transaction (HTAP Phase 5, extended query protocol). Each bound
+    /// statement runs through the same transaction-buffer path as the
+    /// simple-query [`execute_in_txn`](Self::execute_in_txn): DML buffers
+    /// writes (read-your-writes), SELECT reads at the transaction snapshot
+    /// with the buffer overlaid, and unsupported-in-txn constructs surface a
+    /// typed error. The parser is not re-invoked (Req 7).
+    pub fn execute_bound_in_txn(
+        &self,
+        template: &PreparedTemplate,
+        values: &[galaxdb_sql::BoundValue],
+        txn: &galaxdb_sql::executor::TxnHandle,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        let bound = galaxdb_sql::bind_placeholders(&template.stmts, values)?;
+        let mut last = QueryResult::Ok("OK".to_string());
+        for stmt in bound.iter() {
+            last = self.exec_stmt_in_txn(stmt, txn, session.clone())?;
+        }
+        Ok(last)
+    }
+
     pub fn execute_bound_dml_concurrent(
         &self,
         template: &PreparedTemplate,

@@ -34,7 +34,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use galaxdb_common::{GalaxError, GalaxResult, StorageMode};
+use galaxdb_common::{GalaxError, GalaxResult, StorageMode, Timestamp};
 use galaxdb_sidecar::manager::SidecarManager;
 use galaxdb_sidecar::protocol::EmbedRequest;
 use galaxdb_storage::engine::Engine;
@@ -311,6 +311,115 @@ pub struct ExecutorContext {
     /// embedded/server layer always supplies a real store backed by the
     /// engine.
     pub secondary_index: Option<crate::secondary_index::SecondaryIndexStore>,
+
+    /// Active explicit transaction (HTAP Phase 5). When `Some`, DML buffers
+    /// its writes into [`TxnHandle::writes`] instead of committing to the
+    /// engine, and reads execute at [`TxnHandle::read_ts`] with the buffer
+    /// overlaid (read-your-writes, snapshot isolation). `None` is the
+    /// autocommit path: every statement commits on its own (unchanged).
+    pub txn: Option<TxnHandle>,
+}
+
+/// The buffered write set of an explicit transaction: storage key →
+/// `Some(row bytes)` for an upsert or `None` for a tombstone (delete),
+/// ordered by key. Applied atomically at `COMMIT`; snapshotted per savepoint.
+pub type WriteBuffer = std::collections::BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
+/// A per-connection explicit-transaction handle threaded through the
+/// executor (HTAP Phase 5, design §3.6.1). Cheaply clonable (the write
+/// buffer + manager are shared) so it can ride in an `ExecutorContext` built
+/// per statement while accumulating across the transaction's statements.
+#[derive(Clone)]
+pub struct TxnHandle {
+    /// MVCC snapshot the transaction reads at (engine clock, fixed at BEGIN).
+    pub read_ts: Timestamp,
+    /// Lock-owner id for write-write conflict detection (the manager's
+    /// snapshot timestamp assigned at BEGIN).
+    pub txn_id: u64,
+    /// Buffered writes: storage key → `Some(row bytes)` for an upsert or
+    /// `None` for a tombstone (delete). Applied atomically at `COMMIT`.
+    pub writes: Arc<std::sync::Mutex<WriteBuffer>>,
+    /// Shared manager used to acquire/release write locks (conflict → 40001).
+    pub txn_manager: Arc<crate::transaction::TransactionManager>,
+    /// Savepoint stack (HTAP task 19). Each entry is `(name, snapshot of the
+    /// write buffer at SAVEPOINT time)`. `ROLLBACK TO <name>` restores the
+    /// buffer to the recorded snapshot and pops every savepoint above it;
+    /// `RELEASE <name>` drops the marker (and the ones above it) without
+    /// touching the buffer. Held in declaration (stack) order.
+    pub savepoints: Arc<std::sync::Mutex<Vec<(String, WriteBuffer)>>>,
+}
+
+impl TxnHandle {
+    /// Start a fresh transaction handle reading at `read_ts`, owning locks
+    /// under `txn_id`, against the shared `txn_manager`.
+    pub fn new(
+        read_ts: Timestamp,
+        txn_id: u64,
+        txn_manager: Arc<crate::transaction::TransactionManager>,
+    ) -> Self {
+        Self {
+            read_ts,
+            txn_id,
+            writes: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
+            txn_manager,
+            savepoints: Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Buffer an upsert (`Some`) or tombstone (`None`) for `key`, first
+    /// acquiring the write lock so a concurrent transaction writing the same
+    /// key is rejected with [`GalaxError::WriteConflict`] (SQLSTATE 40001).
+    pub fn buffer_write(&self, key: Vec<u8>, value: Option<Vec<u8>>) -> GalaxResult<()> {
+        self.txn_manager.acquire_write_lock(&key, self.txn_id)?;
+        self.writes.lock().expect("txn writes lock").insert(key, value);
+        Ok(())
+    }
+
+    /// Establish a savepoint: snapshot the current write buffer under `name`
+    /// (HTAP task 19). A repeated name shadows the older marker (Postgres
+    /// semantics keep both; restoring resolves to the most recent), so we
+    /// push a new entry. `ROLLBACK TO`/`RELEASE` resolve to the topmost
+    /// matching name.
+    pub fn savepoint(&self, name: &str) {
+        let snapshot = self.writes.lock().expect("txn writes lock").clone();
+        self.savepoints
+            .lock()
+            .expect("txn savepoints lock")
+            .push((name.to_string(), snapshot));
+    }
+
+    /// Roll the write buffer back to the named savepoint, discarding every
+    /// buffered write made after it and popping savepoints above it. Returns
+    /// [`GalaxError::Internal`] if no such savepoint exists (mirrors
+    /// Postgres `42704`/`3B001` "no such savepoint"). Write locks acquired
+    /// since the savepoint are intentionally retained until the transaction
+    /// ends (conservative: never drops a lock another statement may still
+    /// rely on; released wholesale at COMMIT/ROLLBACK).
+    pub fn rollback_to(&self, name: &str) -> GalaxResult<()> {
+        let mut sps = self.savepoints.lock().expect("txn savepoints lock");
+        let Some(idx) = sps.iter().rposition(|(n, _)| n == name) else {
+            return Err(GalaxError::Internal(format!(
+                "no such savepoint: {name}"
+            )));
+        };
+        let snapshot = sps[idx].1.clone();
+        sps.truncate(idx + 1); // keep the savepoint itself, drop those above
+        *self.writes.lock().expect("txn writes lock") = snapshot;
+        Ok(())
+    }
+
+    /// Release (forget) the named savepoint and every savepoint above it,
+    /// leaving the write buffer untouched. Errors if the name is unknown.
+    pub fn release(&self, name: &str) -> GalaxResult<()> {
+        let mut sps = self.savepoints.lock().expect("txn savepoints lock");
+        let Some(idx) = sps.iter().rposition(|(n, _)| n == name) else {
+            return Err(GalaxError::Internal(format!(
+                "no such savepoint: {name}"
+            )));
+        };
+        sps.truncate(idx);
+        Ok(())
+    }
 }
 
 impl ExecutorContext {
@@ -331,6 +440,7 @@ impl ExecutorContext {
             authorizer: None,
             audit: None,
             secondary_index: None,
+            txn: None,
         }
     }
 }
@@ -894,6 +1004,15 @@ fn exec_insert(
     let key = row_codec::build_primary_key(table, &table_entry, &ordered)?;
     let value_bytes = row_codec::encode_row(&ordered);
 
+    // Inside an explicit transaction: buffer the write (read-your-writes via
+    // the overlay) and apply atomically at COMMIT — do not touch the engine
+    // (HTAP Phase 5, design §3.6.1). Secondary-index/sidecar hooks for
+    // buffered rows fire at commit/eventually; data correctness is preserved.
+    if let Some(txn) = ctx.txn.as_ref() {
+        txn.buffer_write(key, Some(value_bytes))?;
+        return Ok(ExecuteResult::RowCount(1));
+    }
+
     // Real write: WAL + memtable + ART, one fsync.
     ctx.engine
         .put_sync(key.clone(), value_bytes)
@@ -938,6 +1057,44 @@ fn exec_insert(
     Ok(ExecuteResult::RowCount(1))
 }
 
+/// The live `(key, value)` rows of `table` as this context sees them: at
+/// the transaction's snapshot with buffered writes overlaid when inside an
+/// explicit transaction (read-your-writes, snapshot isolation), or the
+/// latest committed state on the autocommit path. Rows are pre-filtered to
+/// the table's `"{table}:"` key prefix.
+fn ctx_table_rows(ctx: &ExecutorContext, table: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let prefix = format!("{}:", table);
+    let prefix_bytes = prefix.as_bytes();
+    if let Some(txn) = ctx.txn.as_ref() {
+        let mut map: std::collections::BTreeMap<Vec<u8>, Vec<u8>> = ctx
+            .engine
+            .scan_all_at_with_prefix(txn.read_ts, prefix_bytes)
+            .into_iter()
+            .map(|(k, v, _)| (k, v))
+            .collect();
+        for (k, v) in txn.writes.lock().expect("txn writes lock").iter() {
+            if !k.starts_with(prefix_bytes) {
+                continue;
+            }
+            match v {
+                Some(val) => {
+                    map.insert(k.clone(), val.clone());
+                }
+                None => {
+                    map.remove(k);
+                }
+            }
+        }
+        map.into_iter().collect()
+    } else {
+        ctx.engine
+            .scan_all_with_prefix(Some(prefix_bytes))
+            .into_iter()
+            .filter(|(k, _)| k.starts_with(prefix_bytes))
+            .collect()
+    }
+}
+
 fn exec_update(
     table: &str,
     assignments: &[(String, Value)],
@@ -973,15 +1130,12 @@ fn exec_update(
     }
 
     // Scan, filter, update each matching row. Updates go through
-    // `put_sync` which writes a new MVCC version at a new timestamp.
+    // `put_sync` which writes a new MVCC version at a new timestamp; inside
+    // an explicit transaction they buffer instead (applied at COMMIT).
     let mut updated = 0u64;
-    let prefix = format!("{}:", table);
-    let all = ctx.engine.scan_all();
+    let rows = ctx_table_rows(ctx, table);
 
-    for (key, value_bytes) in all {
-        if !String::from_utf8_lossy(&key).starts_with(&prefix) {
-            continue;
-        }
+    for (key, value_bytes) in rows {
         let mut cols = row_codec::decode_row(&value_bytes);
 
         // Evaluate the filter (None = match all).
@@ -1005,6 +1159,13 @@ fn exec_update(
         }
 
         let new_bytes = row_codec::encode_row(&cols);
+
+        if let Some(txn) = ctx.txn.as_ref() {
+            txn.buffer_write(key, Some(new_bytes))?;
+            updated += 1;
+            continue;
+        }
+
         ctx.engine
             .put_sync(key.clone(), new_bytes)
             .map_err(|e| GalaxError::Internal(format!("engine put failed: {}", e)))?;
@@ -1042,14 +1203,10 @@ fn exec_delete(
 
     // Collect the keys first so we don't mutate storage while scanning.
     // Buffer the decoded columns too so secondary-index entries can be
-    // removed (Req 5 AC3).
+    // removed (Req 5 AC3). Reads honor the transaction snapshot + overlay.
     let mut doomed: Vec<Vec<u8>> = Vec::new();
     let mut doomed_rows: Vec<BufferedRow> = Vec::new();
-    let prefix = format!("{}:", table);
-    for (key, value_bytes) in ctx.engine.scan_all() {
-        if !String::from_utf8_lossy(&key).starts_with(&prefix) {
-            continue;
-        }
+    for (key, value_bytes) in ctx_table_rows(ctx, table) {
         let cols = row_codec::decode_row(&value_bytes);
         if let Some(f) = filter {
             if !row_codec::filter_matches(&cols, f) {
@@ -1058,6 +1215,14 @@ fn exec_delete(
         }
         doomed.push(key.clone());
         doomed_rows.push((key, cols));
+    }
+
+    // Inside an explicit transaction: buffer tombstones, apply at COMMIT.
+    if let Some(txn) = ctx.txn.as_ref() {
+        for key in &doomed {
+            txn.buffer_write(key.clone(), None)?;
+        }
+        return Ok(ExecuteResult::RowCount(doomed.len() as u64));
     }
 
     let mut deleted = 0u64;
@@ -1137,15 +1302,10 @@ fn exec_full_scan(
         columns.to_vec()
     };
 
-    // Zone-map pruning on the key column (task 18.4). Every row for a
-    // table lives under the `"{table}:"` prefix in the engine's key
-    // space; SST blocks whose key zone maps cannot overlap this
-    // prefix are skipped without being loaded. `scan_all_with_prefix`
-    // does the filter at the block layer; the executor just feeds it
-    // the table's prefix and applies the WHERE filter per row on what
-    // comes back.
-    let prefix = format!("{}:", table);
-    let prefix_bytes = prefix.as_bytes();
+    // Zone-map pruning on the key column (task 18.4) is applied inside the
+    // read helpers (`ctx_table_rows` / `scan_all_with_prefix`), which feed
+    // the table's `"{table}:"` prefix to the block layer; the executor then
+    // applies the WHERE filter per row on what comes back.
 
     // `WHERE NOT DUPLICATE` is a group-level predicate: we have to see
     // every row that passes the per-row filter before we can pick the
@@ -1164,7 +1324,7 @@ fn exec_full_scan(
     // the full row set, so it always takes the scan path. When no index
     // covers the predicate we fall back to the zone-map-pruned scan — a
     // correctness-preserving path, not an error (AC6).
-    let index_pks = if dedup {
+    let index_pks = if dedup || ctx.txn.is_some() {
         None
     } else {
         filter.and_then(|f| {
@@ -1201,10 +1361,7 @@ fn exec_full_scan(
             access_path = "full_scan",
             "planner chose zone-map-pruned full scan",
         );
-        for (key, value_bytes) in ctx.engine.scan_all_with_prefix(Some(prefix_bytes)) {
-            if !key.starts_with(prefix_bytes) {
-                continue;
-            }
+        for (key, value_bytes) in ctx_table_rows(ctx, table) {
             let cols = row_codec::decode_row(&value_bytes);
             if let Some(f) = filter {
                 if !row_codec::filter_matches(&cols, f) {
@@ -1444,7 +1601,18 @@ fn exec_point_lookup(
         .cloned()
         .ok_or_else(|| GalaxError::TableNotFound(table.to_string()))?;
 
-    match ctx.engine.get(key) {
+    // Read-your-writes under a transaction: check the buffer first
+    // (`Some` = upsert, `None` = tombstone), else read at the snapshot.
+    let looked_up = if let Some(txn) = ctx.txn.as_ref() {
+        match txn.writes.lock().expect("txn writes lock").get(key) {
+            Some(buffered) => buffered.clone(),
+            None => ctx.engine.get_at(key, txn.read_ts),
+        }
+    } else {
+        ctx.engine.get(key)
+    };
+
+    match looked_up {
         Some(value_bytes) => {
             let cols = row_codec::decode_row(&value_bytes);
             let column_names: Vec<String> =

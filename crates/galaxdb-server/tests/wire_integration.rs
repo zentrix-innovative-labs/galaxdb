@@ -1068,3 +1068,244 @@ async fn audit_log_records_auth_authz_and_admin_events() {
         "expected a denied SELECT event for alice"
     );
 }
+
+// ---------------------------------------------------------------------
+// Explicit transactions over the wire (HTAP Phase 5, tasks 18/19/20).
+// ---------------------------------------------------------------------
+
+/// Collect the `Row` messages from a `simple_query` result.
+fn simple_rows(
+    msgs: Vec<tokio_postgres::SimpleQueryMessage>,
+) -> Vec<tokio_postgres::SimpleQueryRow> {
+    msgs.into_iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some(r),
+            _ => None,
+        })
+        .collect()
+}
+
+/// BEGIN buffers writes with read-your-writes; COMMIT makes them durable
+/// and visible to later statements; ROLLBACK discards them entirely
+/// (tasks 18/20 — the core transaction lifecycle).
+#[tokio::test]
+async fn transaction_commit_persists_and_rollback_discards() {
+    let (conn_str, _td) = start_server().await;
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .simple_query("CREATE TABLE acct (id INTEGER PRIMARY KEY, bal INTEGER)")
+        .await
+        .unwrap();
+    client
+        .simple_query("INSERT INTO acct (id, bal) VALUES (1, 100)")
+        .await
+        .unwrap();
+
+    // COMMIT path: buffered UPDATE is visible read-your-writes inside the
+    // txn, then durable after COMMIT.
+    client.simple_query("BEGIN").await.unwrap();
+    client
+        .simple_query("UPDATE acct SET bal = 250 WHERE id = 1")
+        .await
+        .unwrap();
+    let rows = simple_rows(
+        client
+            .simple_query("SELECT bal FROM acct WHERE id = 1")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        rows[0].get("bal"),
+        Some("250"),
+        "read-your-writes: the buffered UPDATE must be visible inside its txn"
+    );
+    client.simple_query("COMMIT").await.unwrap();
+
+    let rows = simple_rows(
+        client
+            .simple_query("SELECT bal FROM acct WHERE id = 1")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rows[0].get("bal"), Some("250"), "COMMIT must persist the write");
+
+    // ROLLBACK path: a buffered UPDATE disappears after ROLLBACK.
+    client.simple_query("BEGIN").await.unwrap();
+    client
+        .simple_query("UPDATE acct SET bal = 999 WHERE id = 1")
+        .await
+        .unwrap();
+    client.simple_query("ROLLBACK").await.unwrap();
+
+    let rows = simple_rows(
+        client
+            .simple_query("SELECT bal FROM acct WHERE id = 1")
+            .await
+            .unwrap(),
+    );
+    assert_eq!(
+        rows[0].get("bal"),
+        Some("250"),
+        "ROLLBACK must discard the buffered write (value stays 250)"
+    );
+}
+
+/// Snapshot isolation across two connections: an open transaction never
+/// sees another connection's writes committed after it began (no dirty
+/// reads, no non-repeatable reads), and sees them only after starting a
+/// fresh transaction (task 20 — snapshot → scan).
+#[tokio::test]
+async fn transaction_snapshot_isolation_across_connections() {
+    let (conn_str, _td) = start_server().await;
+
+    let (a, a_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = a_conn.await;
+    });
+    let (b, b_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = b_conn.await;
+    });
+
+    a.simple_query("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .await
+        .unwrap();
+    a.simple_query("INSERT INTO t (id, v) VALUES (1, 10)")
+        .await
+        .unwrap();
+
+    // A begins a transaction and takes a snapshot (sees v=10).
+    a.simple_query("BEGIN").await.unwrap();
+    let rows = simple_rows(a.simple_query("SELECT v FROM t WHERE id = 1").await.unwrap());
+    assert_eq!(rows[0].get("v"), Some("10"));
+
+    // B (autocommit) updates the row and inserts a new one AFTER A's snapshot.
+    b.simple_query("UPDATE t SET v = 20 WHERE id = 1")
+        .await
+        .unwrap();
+    b.simple_query("INSERT INTO t (id, v) VALUES (2, 99)")
+        .await
+        .unwrap();
+
+    // A must still see its snapshot: v=10 and only one row (no dirty read,
+    // no non-repeatable read, no phantom).
+    let rows = simple_rows(a.simple_query("SELECT v FROM t WHERE id = 1").await.unwrap());
+    assert_eq!(
+        rows[0].get("v"),
+        Some("10"),
+        "A's snapshot must not see B's committed UPDATE (non-repeatable read)"
+    );
+    let all = simple_rows(a.simple_query("SELECT id FROM t").await.unwrap());
+    assert_eq!(
+        all.len(),
+        1,
+        "A's snapshot must not see B's inserted row (phantom read)"
+    );
+
+    a.simple_query("COMMIT").await.unwrap();
+
+    // After committing, a fresh statement on A sees B's changes.
+    let rows = simple_rows(a.simple_query("SELECT v FROM t WHERE id = 1").await.unwrap());
+    assert_eq!(rows[0].get("v"), Some("20"));
+    let all = simple_rows(a.simple_query("SELECT id FROM t").await.unwrap());
+    assert_eq!(all.len(), 2, "after the txn ends, A sees the current state");
+}
+
+/// Two transactions writing the same key: the second writer is rejected
+/// with SQLSTATE 40001 (serialization_failure) at write-buffer time
+/// (task 18 — write-write conflict detection).
+#[tokio::test]
+async fn transaction_write_write_conflict_40001() {
+    let (conn_str, _td) = start_server().await;
+
+    let (a, a_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = a_conn.await;
+    });
+    let (b, b_conn) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = b_conn.await;
+    });
+
+    a.simple_query("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .await
+        .unwrap();
+    a.simple_query("INSERT INTO t (id, v) VALUES (1, 0)")
+        .await
+        .unwrap();
+
+    a.simple_query("BEGIN").await.unwrap();
+    b.simple_query("BEGIN").await.unwrap();
+
+    // A acquires the write lock on row 1 by buffering an UPDATE.
+    a.simple_query("UPDATE t SET v = 1 WHERE id = 1")
+        .await
+        .unwrap();
+
+    // B tries to write the same row → write-write conflict → 40001.
+    let err = b
+        .simple_query("UPDATE t SET v = 2 WHERE id = 1")
+        .await
+        .expect_err("second writer must conflict");
+    let code = err
+        .as_db_error()
+        .map(|e| e.code().code().to_string())
+        .unwrap_or_default();
+    assert_eq!(code, "40001", "write-write conflict must map to 40001, got {code:?} ({err})");
+
+    // B's transaction is now aborted; ROLLBACK ends it, then A commits.
+    b.simple_query("ROLLBACK").await.unwrap();
+    a.simple_query("COMMIT").await.unwrap();
+
+    let rows = simple_rows(a.simple_query("SELECT v FROM t WHERE id = 1").await.unwrap());
+    assert_eq!(rows[0].get("v"), Some("1"), "A's committed write must win");
+}
+
+/// SAVEPOINT / ROLLBACK TO SAVEPOINT: rolling back to a savepoint discards
+/// writes made after it while keeping earlier ones; the transaction then
+/// commits the surviving writes (task 19 — nested write-set markers).
+#[tokio::test]
+async fn transaction_savepoint_rollback_to() {
+    let (conn_str, _td) = start_server().await;
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .simple_query("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)")
+        .await
+        .unwrap();
+
+    client.simple_query("BEGIN").await.unwrap();
+    client
+        .simple_query("INSERT INTO t (id, v) VALUES (1, 1)")
+        .await
+        .unwrap();
+    client.simple_query("SAVEPOINT sp1").await.unwrap();
+    client
+        .simple_query("INSERT INTO t (id, v) VALUES (2, 2)")
+        .await
+        .unwrap();
+
+    // Inside the txn, both rows are visible (read-your-writes).
+    let all = simple_rows(client.simple_query("SELECT id FROM t").await.unwrap());
+    assert_eq!(all.len(), 2, "both buffered inserts visible before rollback-to");
+
+    // Roll back to sp1: row 2 is discarded, row 1 survives.
+    client.simple_query("ROLLBACK TO SAVEPOINT sp1").await.unwrap();
+    let all = simple_rows(client.simple_query("SELECT id FROM t").await.unwrap());
+    assert_eq!(all.len(), 1, "ROLLBACK TO must discard writes after the savepoint");
+
+    client.simple_query("COMMIT").await.unwrap();
+
+    // After commit only row 1 is durable.
+    let all = simple_rows(client.simple_query("SELECT id FROM t").await.unwrap());
+    assert_eq!(all.len(), 1);
+    let rows = simple_rows(client.simple_query("SELECT v FROM t WHERE id = 1").await.unwrap());
+    assert_eq!(rows[0].get("v"), Some("1"));
+}

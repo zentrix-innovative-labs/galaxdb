@@ -482,6 +482,15 @@ impl Engine {
         self.next_timestamp.load(Ordering::SeqCst)
     }
 
+    /// The current MVCC timestamp boundary: every committed write has a
+    /// timestamp strictly less than this value. NOTE: this is the *next,
+    /// unassigned* ts, not a read snapshot — reads use `ts <= read_ts`, so a
+    /// transaction must snapshot at [`Self::latest_commit_ts`] (this value
+    /// minus one) to exclude writes that commit after it begins.
+    pub fn current_timestamp(&self) -> Timestamp {
+        self.next_timestamp.load(Ordering::SeqCst)
+    }
+
     /// Return the timestamp most recently allocated by `next_ts`, i.e.
     /// the commit ts of the most recent write that has landed in the
     /// engine.
@@ -1378,6 +1387,31 @@ impl Engine {
             }
         }
         Ok(ColumnarBatch { num_rows, columns })
+    }
+
+    /// Like [`scan_all_at`](Self::scan_all_at) but restricted to keys under
+    /// `key_prefix`. Used by the transaction read path to read a single
+    /// table at a transaction's snapshot timestamp (HTAP Phase 5). Visibility
+    /// and tombstone handling are identical to `scan_all_at`.
+    pub fn scan_all_at_with_prefix(
+        &self,
+        read_ts: Timestamp,
+        key_prefix: &[u8],
+    ) -> Vec<(Vec<u8>, Vec<u8>, Timestamp)> {
+        self.scan_all_at(read_ts)
+            .into_iter()
+            .filter(|(k, _, _)| k.starts_with(key_prefix))
+            .collect()
+    }
+
+    /// Read the value of `key` visible at `read_ts` (MVCC point read at a
+    /// snapshot), or `None` if no version is visible or it is a tombstone.
+    /// Used by the transaction point-read path.
+    pub fn get_at(&self, key: &[u8], read_ts: Timestamp) -> Option<Vec<u8>> {
+        self.scan_all_at_with_prefix(read_ts, key)
+            .into_iter()
+            .find(|(k, _, _)| k == key)
+            .map(|(_, v, _)| v)
     }
 
     /// Get the total number of rows (approximate).
