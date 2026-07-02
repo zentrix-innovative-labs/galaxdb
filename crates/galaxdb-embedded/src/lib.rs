@@ -1375,6 +1375,16 @@ impl Database {
     ) -> GalaxResult<QueryResult> {
         // Detect SEMANTIC_MATCH in WHERE and route to vector search.
         if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
+            // SEMANTIC_MATCH combined with analytical clauses (JOIN / GROUP BY
+            // / aggregate / ORDER BY / …) → feed the matched candidate set to
+            // the DataFusion analytical engine (HTAP task 16). A plain
+            // single-table SEMANTIC_MATCH stays on the native vector path.
+            if matches!(
+                galaxdb_sql::classify::classify_query(q),
+                galaxdb_sql::classify::StatementClass::Analytical
+            ) {
+                return self.analytical_semantic_query(q, &semantic_expr, session);
+            }
             let table = extract_table(q);
             let (_columns, extra_filter) = extract_projection_and_filter_no_semantic(q);
             let plan = planner::plan_semantic_search(
@@ -1481,6 +1491,167 @@ impl Database {
         let (col_names, rows) = galaxdb_query::backend::run_analytical_sql_blocking(
             self.engine.clone(),
             &metas,
+            &sql,
+            galaxdb_query::ReadSnapshot::Latest,
+        )?;
+
+        let out_rows = rows
+            .into_iter()
+            .map(|cells| QueryRow {
+                values: col_names
+                    .iter()
+                    .cloned()
+                    .zip(cells.into_iter().map(|c| c.unwrap_or_else(|| "NULL".to_string())))
+                    .collect(),
+            })
+            .collect();
+        Ok(QueryResult::Rows(out_rows))
+    }
+
+    /// `SEMANTIC_MATCH` feeding an analytical query (HTAP task 16, ADR-0004).
+    ///
+    /// When a `SELECT` combines `SEMANTIC_MATCH(...)` with analytical clauses
+    /// (JOIN / GROUP BY / aggregate / ORDER BY / …), the native single-table
+    /// vector path cannot serve it. Here the native HNSW backend computes the
+    /// top-k matched rows **once** (the paper's adaptive strategy: a residual
+    /// relational predicate → brute-force over the filtered set; otherwise
+    /// HNSW-first), those rows become a candidate Arrow table (the base
+    /// columns plus a `similarity` column), and DataFusion runs the query —
+    /// with the `SEMANTIC_MATCH(...)` predicate stripped — over exactly the
+    /// matched rows, joining/aggregating them against the relational columns.
+    fn analytical_semantic_query(
+        &self,
+        q: &sqlparser::ast::Query,
+        semantic: &galaxdb_sql::ast::SemanticMatchExpr,
+        session: Option<&galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        use galaxdb_sql::executor::VectorSearchBackend;
+        use galaxdb_sql::planner::{SearchStrategy, Value};
+        use std::collections::HashMap;
+
+        // The semantically-matched table is the query's base (FROM) table.
+        let sem_table = extract_table(q);
+        let tables = collect_table_names(q);
+        if tables.is_empty() {
+            return Err(GalaxError::FeatureNotSupported(
+                "SEMANTIC_MATCH analytical query references no base table".into(),
+            ));
+        }
+        self.authorize_select(&tables, session)?;
+
+        let sem_entry = self
+            .catalog
+            .get_table(&sem_table)
+            .ok_or_else(|| GalaxError::TableNotFound(sem_table.clone()))?
+            .clone();
+
+        // Residual (non-semantic) relational predicate → adaptive strategy.
+        let (_proj, residual) = extract_projection_and_filter_no_semantic(q);
+
+        // Cap on the candidate set the analytical query aggregates over. Larger
+        // than the native default (10) because aggregates/joins want the full
+        // matched population, not just a display page.
+        const CANDIDATE_K: usize = 100;
+
+        let backend = EmbeddedVectorBackend {
+            sidecar: self.sidecar.clone(),
+            indexes: self.vector_indexes.clone(),
+            engine: self.engine.clone(),
+        };
+        let results = match &residual {
+            Some(f) => backend.brute_force_filtered(
+                &sem_table,
+                &semantic.query,
+                semantic.threshold,
+                CANDIDATE_K,
+                f,
+            )?,
+            None => backend.semantic_search(
+                &sem_table,
+                &semantic.query,
+                semantic.threshold,
+                CANDIDATE_K,
+                SearchStrategy::HnswWithPostFilter,
+            )?,
+        };
+
+        // Resolve each matched row_id (xxh3_64 of the primary key) to its
+        // decoded row, mirroring the native SEMANTIC_MATCH row join.
+        let col_order: Vec<String> =
+            sem_entry.columns.iter().map(|c| c.name.clone()).collect();
+        let base_cols: Vec<(String, galaxdb_sql::SqlType)> = sem_entry
+            .columns
+            .iter()
+            .map(|c| {
+                let ty = galaxdb_sql::SqlType::from_sql_name(&c.data_type)
+                    .unwrap_or(galaxdb_sql::SqlType::Text);
+                (c.name.clone(), ty)
+            })
+            .collect();
+        let prefix = format!("{sem_table}:");
+        let row_map: HashMap<u64, Vec<(String, Value)>> = self
+            .engine
+            .scan_all()
+            .into_iter()
+            .filter(|(k, _)| String::from_utf8_lossy(k).starts_with(&prefix))
+            .map(|(k, v)| {
+                (
+                    xxhash_rust::xxh3::xxh3_64(&k),
+                    galaxdb_sql::row_codec::decode_row(&v),
+                )
+            })
+            .collect();
+
+        let mut cand_rows: Vec<Vec<Option<Value>>> = Vec::new();
+        let mut sims: Vec<f64> = Vec::new();
+        for r in &results {
+            if let Some(cells) = row_map.get(&r.row_id) {
+                let by_name: HashMap<&str, &Value> =
+                    cells.iter().map(|(n, v)| (n.as_str(), v)).collect();
+                let row: Vec<Option<Value>> = col_order
+                    .iter()
+                    .map(|n| by_name.get(n.as_str()).map(|v| (*v).clone()))
+                    .collect();
+                cand_rows.push(row);
+                sims.push(r.similarity as f64);
+            }
+        }
+
+        let provider = Arc::new(EmbeddedSemanticCandidateProvider {
+            schema: galaxdb_query::semantic::candidate_schema(&base_cols),
+            base_cols,
+            rows: cand_rows,
+            sims,
+        });
+        let source: Arc<dyn galaxdb_query::ArrowSource> =
+            Arc::new(galaxdb_query::semantic::SemanticCandidateSource::new(provider));
+
+        // TableSpecs for every referenced table (the semantic one is served
+        // by the override, the rest by the engine).
+        let mut metas: Vec<galaxdb_query::backend::TableSpec> = Vec::with_capacity(tables.len());
+        for t in &tables {
+            let entry = self
+                .catalog
+                .get_table(t)
+                .ok_or_else(|| GalaxError::TableNotFound(t.clone()))?;
+            let fields = entry
+                .columns
+                .iter()
+                .map(|c| {
+                    let ty = galaxdb_sql::SqlType::from_sql_name(&c.data_type)
+                        .unwrap_or(galaxdb_sql::SqlType::Text);
+                    (c.name.clone(), ty)
+                })
+                .collect::<Vec<_>>();
+            metas.push((t.clone(), format!("{t}:").into_bytes(), fields));
+        }
+
+        let stripped = strip_semantic_match_query(q);
+        let sql = stripped.to_string();
+        let (col_names, rows) = galaxdb_query::backend::run_analytical_sql_blocking_with_semantic(
+            self.engine.clone(),
+            &metas,
+            std::slice::from_ref(&(sem_table, source)),
             &sql,
             galaxdb_query::ReadSnapshot::Latest,
         )?;
@@ -1840,6 +2011,15 @@ impl Database {
         // Detect SEMANTIC_MATCH(...) in the WHERE clause and route to
         // the vector search path instead of a full scan.
         if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
+            // SEMANTIC_MATCH + analytical clauses → analytical candidate path
+            // (HTAP task 16); a plain single-table match stays native.
+            if matches!(
+                galaxdb_sql::classify::classify_query(q),
+                galaxdb_sql::classify::StatementClass::Analytical
+            ) {
+                let session = self.session.clone();
+                return self.analytical_semantic_query(q, &semantic_expr, session.as_ref());
+            }
             let (_columns, extra_filter) = extract_projection_and_filter_no_semantic(q);
             let plan = planner::plan_semantic_search(
                 table.clone(),
@@ -2501,6 +2681,31 @@ impl Drop for Database {
 // the database's local HNSW + delta buffer + sidecar.
 // ---------------------------------------------------------------------------
 
+/// Candidate provider for the analytical `SEMANTIC_MATCH` path (HTAP task 16).
+/// Holds the already-resolved matched rows (base-column `Value`s) plus their
+/// similarity scores; [`candidates`](galaxdb_query::semantic::VectorCandidateProvider::candidates)
+/// materializes them into the Arrow batch DataFusion joins/aggregates over.
+/// The HNSW search that produced these rows already ran in
+/// `analytical_semantic_query`, so this is a pure builder — no vector work
+/// happens inside the query runtime.
+struct EmbeddedSemanticCandidateProvider {
+    schema: arrow::datatypes::SchemaRef,
+    base_cols: Vec<(String, galaxdb_sql::SqlType)>,
+    rows: Vec<Vec<Option<galaxdb_sql::planner::Value>>>,
+    sims: Vec<f64>,
+}
+
+impl galaxdb_query::semantic::VectorCandidateProvider for EmbeddedSemanticCandidateProvider {
+    fn schema(&self) -> arrow::datatypes::SchemaRef {
+        self.schema.clone()
+    }
+    fn candidates(&self) -> GalaxResult<Vec<arrow::record_batch::RecordBatch>> {
+        let batch =
+            galaxdb_query::semantic::build_candidate_batch(&self.base_cols, &self.rows, &self.sims)?;
+        Ok(vec![batch])
+    }
+}
+
 struct EmbeddedVectorBackend {
     sidecar: Option<Arc<SidecarManager>>,
     indexes: Arc<RwLock<HashMap<String, TableVectorIndex>>>,
@@ -3081,9 +3286,64 @@ fn extract_semantic_match_from_expr(
     }
 }
 
-/// Like `extract_projection_and_filter` but strips any SEMANTIC_MATCH
-/// call from the WHERE clause, returning only the non-semantic filter
-/// (for hybrid search).
+/// Is `expr` itself a top-level `SEMANTIC_MATCH(...)` function call?
+fn is_semantic_match_call(expr: &sqlparser::ast::Expr) -> bool {
+    matches!(expr, sqlparser::ast::Expr::Function(f)
+        if f.name.to_string().eq_ignore_ascii_case("SEMANTIC_MATCH"))
+}
+
+/// Remove every `SEMANTIC_MATCH(...)` conjunct from a WHERE expression,
+/// returning the residual relational predicate (`None` if nothing remains).
+/// Only `AND` chains are unwound — `SEMANTIC_MATCH` combined with `OR` is not
+/// a supported analytical shape (the candidate set defines the row universe),
+/// so an `OR` containing it is left intact and will surface as an error when
+/// DataFusion cannot resolve the `SEMANTIC_MATCH` name (never silently wrong).
+fn strip_semantic_match_expr(expr: &sqlparser::ast::Expr) -> Option<sqlparser::ast::Expr> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+    if is_semantic_match_call(expr) {
+        return None;
+    }
+    if let Expr::BinaryOp {
+        left,
+        op: BinaryOperator::And,
+        right,
+    } = expr
+    {
+        let l = strip_semantic_match_expr(left);
+        let r = strip_semantic_match_expr(right);
+        return match (l, r) {
+            (Some(l), Some(r)) => Some(Expr::BinaryOp {
+                left: Box::new(l),
+                op: BinaryOperator::And,
+                right: Box::new(r),
+            }),
+            (Some(e), None) | (None, Some(e)) => Some(e),
+            (None, None) => None,
+        };
+    }
+    if let Expr::Nested(inner) = expr {
+        return strip_semantic_match_expr(inner).map(|e| Expr::Nested(Box::new(e)));
+    }
+    Some(expr.clone())
+}
+
+/// Return a copy of `q` with the `SEMANTIC_MATCH(...)` predicate removed from
+/// its WHERE clause (HTAP task 16). The candidate set produced by the vector
+/// search becomes the row source for the base table, so the residual query
+/// carries only the relational predicate + the analytical clauses.
+fn strip_semantic_match_query(q: &sqlparser::ast::Query) -> sqlparser::ast::Query {
+    let mut out = q.clone();
+    if let sqlparser::ast::SetExpr::Select(s) = out.body.as_mut() {
+        let mut select = s.as_ref().clone();
+        select.selection = select
+            .selection
+            .as_ref()
+            .and_then(strip_semantic_match_expr);
+        **s = select;
+    }
+    out
+}
+
 fn extract_projection_and_filter_no_semantic(
     q: &sqlparser::ast::Query,
 ) -> (Vec<String>, Option<FilterExpr>) {
@@ -3981,6 +4241,48 @@ mod tests {
         .is_empty());
     }
 
+    #[test]
+    fn strip_semantic_match_query_removes_predicate() {
+        let parse_q = |sql: &str| {
+            let stmts = parser::parse(sql).unwrap();
+            match &stmts[0] {
+                AuroraStatement::Standard(s) => match s.as_ref() {
+                    sqlparser::ast::Statement::Query(q) => (**q).clone(),
+                    other => panic!("not a query: {other:?}"),
+                },
+                other => panic!("not standard: {other:?}"),
+            }
+        };
+
+        // Only SEMANTIC_MATCH in WHERE → the whole WHERE is removed, the
+        // analytical clauses survive.
+        let q = parse_q(
+            "SELECT category, COUNT(*) FROM docs \
+             WHERE SEMANTIC_MATCH(body, 'ai', 0.5) GROUP BY category",
+        );
+        let s = strip_semantic_match_query(&q).to_string().to_uppercase();
+        assert!(!s.contains("SEMANTIC_MATCH"), "predicate must be gone: {s}");
+        assert!(s.contains("GROUP BY"), "analytical clause kept: {s}");
+
+        // SEMANTIC_MATCH AND <relational> → the relational conjunct survives.
+        let q2 = parse_q(
+            "SELECT id FROM docs \
+             WHERE SEMANTIC_MATCH(body, 'ai', 0.5) AND price > 5 ORDER BY id",
+        );
+        let s2 = strip_semantic_match_query(&q2).to_string().to_uppercase();
+        assert!(!s2.contains("SEMANTIC_MATCH"), "predicate gone: {s2}");
+        assert!(s2.contains("PRICE > 5"), "relational conjunct kept: {s2}");
+        assert!(s2.contains("ORDER BY"), "order clause kept: {s2}");
+
+        // <relational> AND SEMANTIC_MATCH (other order) → relational survives.
+        let q3 = parse_q(
+            "SELECT id FROM docs WHERE price > 5 AND SEMANTIC_MATCH(body, 'ai', 0.5)",
+        );
+        let s3 = strip_semantic_match_query(&q3).to_string().to_uppercase();
+        assert!(!s3.contains("SEMANTIC_MATCH"));
+        assert!(s3.contains("PRICE > 5"));
+    }
+
     /// End-to-end SEMANTIC_MATCH test using the real model. Gated behind
     /// the `online-tests` feature — requires network access to HuggingFace
     /// Hub on first run (downloads ~90 MB for all-MiniLM-L6-v2).
@@ -4069,9 +4371,82 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------
-    // Phase I regressions — WHERE / projection plumbing
-    //
+    /// End-to-end SEMANTIC_MATCH feeding an analytical query (HTAP task 16):
+    /// the matched rows are grouped/aggregated by DataFusion. Gated behind
+    /// `online-tests` (needs the sidecar + model), like the sibling test.
+    ///
+    /// ```text
+    /// cargo test -p galaxdb-embedded --features online-tests --release
+    /// ```
+    #[cfg(feature = "online-tests")]
+    #[test]
+    fn semantic_match_group_by_end_to_end() {
+        const MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+        const MODEL_DIM: usize = 384;
+
+        let sidecar_binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("galaxdb-sidecar");
+        if !sidecar_binary.exists() {
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "galaxdb-sidecar"])
+                .status()
+                .expect("cargo build");
+            assert!(status.success(), "failed to build sidecar binary");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("semantic_agg_db");
+        std::mem::forget(dir);
+        let mut db = Database::open_with_sidecar(
+            db_path.to_str().unwrap(),
+            sidecar_binary.to_str().unwrap(),
+            MODEL_ID,
+        )
+        .unwrap();
+
+        db.execute(&format!(
+            "CREATE TABLE docs (id INT PRIMARY KEY, category TEXT, \
+             content TEXT EMBEDDING MODEL '{MODEL_ID}' DIM {MODEL_DIM})"
+        ))
+        .unwrap();
+        db.execute("INSERT INTO docs (id, category, content) VALUES (1, 'ml', 'machine learning is great')").unwrap();
+        db.execute("INSERT INTO docs (id, category, content) VALUES (2, 'rust', 'rust programming language')").unwrap();
+        db.execute("INSERT INTO docs (id, category, content) VALUES (3, 'ml', 'machine learning algorithms')").unwrap();
+
+        // SEMANTIC_MATCH + GROUP BY: aggregate over the matched rows. With a
+        // permissive threshold all three match; grouped by category that is
+        // 2 'ml' + 1 'rust'. The point is that GROUP BY executes over the
+        // semantic candidate set (task 16), not that ranking is exact.
+        let result = db
+            .execute(
+                "SELECT category, COUNT(*) AS n FROM docs \
+                 WHERE SEMANTIC_MATCH(content, 'machine learning', 0.0) \
+                 GROUP BY category ORDER BY category",
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows(rows) => {
+                assert!(!rows.is_empty(), "GROUP BY over semantic matches returns rows");
+                let total: i64 = rows
+                    .iter()
+                    .map(|r| {
+                        r.values
+                            .iter()
+                            .find(|(k, _)| k == "n")
+                            .and_then(|(_, v)| v.parse::<i64>().ok())
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                assert!(total >= 1, "at least one matched row is aggregated");
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+    }
     // Before Phase I, `exec_select`, `exec_update`, and `exec_delete`
     // hard-coded `filter: None`, silently ignoring the WHERE clause.
     // These tests drive real SQL through `Database::execute` and assert

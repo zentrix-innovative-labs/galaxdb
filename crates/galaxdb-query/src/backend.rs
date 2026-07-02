@@ -229,7 +229,74 @@ pub fn run_analytical_sql_blocking(
     })
 }
 
-/// Render result batches to row-major text cells (`None` = SQL NULL) using
+/// Like [`run_analytical_sql_blocking`], but a subset of the referenced
+/// tables are backed by a **`SEMANTIC_MATCH` candidate source** instead of
+/// the engine (HTAP task 16, ADR-0004). For each `(table, source)` in
+/// `semantic_overrides`, that table is registered from the override
+/// [`ArrowSource`] — the materialized top-k matched rows plus a `similarity`
+/// column — so the analytical SQL (with the `SEMANTIC_MATCH(...)` predicate
+/// already stripped) joins / aggregates / groups over exactly the matched
+/// rows. Tables not in the override list are scanned from the engine as
+/// usual. The vector search that produced each override ran once, in the
+/// embedded layer; no vector type crosses into DataFusion.
+pub fn run_analytical_sql_blocking_with_semantic(
+    engine: Arc<galaxdb_storage::engine::Engine>,
+    tables: &[TableSpec],
+    semantic_overrides: &[(String, Arc<dyn ArrowSource>)],
+    sql: &str,
+    snapshot: ReadSnapshot,
+) -> GalaxResult<StringRows> {
+    use crate::source::EngineArrowSource;
+
+    for (_name, prefix, fields) in tables {
+        if let Some(splitter) =
+            galaxdb_sql::columnar::CatalogRowSplitter::from_columns(fields.clone())
+        {
+            engine.register_columnar_table(prefix.clone(), Arc::new(splitter));
+        }
+    }
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .map_err(|e| GalaxError::Internal(format!("query runtime: {e}")))?;
+
+    rt.block_on(async move {
+        let session = SessionContext::new();
+        for (name, prefix, fields) in tables {
+            // A semantic override for this table wins: register the matched
+            // candidate rows instead of the full engine scan.
+            let source: Arc<dyn ArrowSource> = match semantic_overrides
+                .iter()
+                .find(|(t, _)| t == name)
+            {
+                Some((_, override_source)) => override_source.clone(),
+                None => Arc::new(EngineArrowSource::new(
+                    engine.clone(),
+                    prefix.clone(),
+                    fields.clone(),
+                )),
+            };
+            let schema = source.schema(name)?;
+            let provider = GalaxTableProvider {
+                table: name.clone(),
+                source,
+                schema,
+                snapshot: snapshot.clone(),
+            };
+            session
+                .register_table(name.as_str(), Arc::new(provider))
+                .map_err(query_err)?;
+        }
+        let df = session.sql(sql).await.map_err(query_err)?;
+        let col_names: Vec<String> =
+            df.schema().fields().iter().map(|f| f.name().to_string()).collect();
+        let batches = df.collect().await.map_err(query_err)?;
+        let rows = format_rows(&batches)?;
+        Ok((col_names, rows))
+    })
+}
 /// Arrow's display formatters, so every Arrow type renders correctly.
 fn format_rows(batches: &[RecordBatch]) -> GalaxResult<Vec<Vec<Option<String>>>> {
     use arrow::util::display::{ArrayFormatter, FormatOptions};
@@ -450,5 +517,148 @@ mod tests {
         assert_eq!(ages.value(1), 40);
         assert_eq!(counts.value(1), 1);
         assert_eq!(totals.value(1), 9);
+    }
+
+    // ---- Task 16: SEMANTIC_MATCH candidates feeding the analytical path ----
+
+    use crate::semantic::{SemanticCandidateSource, VectorCandidateProvider};
+    use arrow::array::{Float64Array, StringArray};
+    use arrow::datatypes::SchemaRef;
+
+    /// A stub candidate provider standing in for the native HNSW backend
+    /// (engineering-principles §1: mocks only under `#[cfg(test)]`). It
+    /// returns a fixed matched subset of a `docs(id, category)` table plus a
+    /// `similarity` column — exactly what the embedded provider produces from
+    /// a real top-k search, so this test exercises the real analytical path
+    /// over vector candidates without the embedding model.
+    struct StubCandidates;
+    impl VectorCandidateProvider for StubCandidates {
+        fn schema(&self) -> SchemaRef {
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("category", DataType::Utf8, false),
+                Field::new("similarity", DataType::Float64, false),
+            ]))
+        }
+        fn candidates(&self) -> GalaxResult<Vec<RecordBatch>> {
+            // Three matched rows: two in category "ai", one in "db".
+            let ids = Int64Array::from(vec![1i64, 3, 7]);
+            let cats = StringArray::from(vec!["ai", "ai", "db"]);
+            let sims = Float64Array::from(vec![0.91, 0.88, 0.72]);
+            Ok(vec![RecordBatch::try_new(
+                self.schema(),
+                vec![Arc::new(ids), Arc::new(cats), Arc::new(sims)],
+            )
+            .unwrap()])
+        }
+    }
+
+    #[test]
+    fn semantic_candidates_group_by_over_analytical_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            Engine::new(EngineConfig {
+                data_dir: dir.path().to_path_buf(),
+                wal_group_commit_ms: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        // `docs` is served entirely by the semantic candidate override; its
+        // TableSpec is only used to satisfy the signature (engine scan of it
+        // never runs).
+        let docs_spec: TableSpec = (
+            "docs".into(),
+            b"docs:".to_vec(),
+            vec![("id".into(), SqlType::Int8), ("category".into(), SqlType::Text)],
+        );
+        let source: Arc<dyn ArrowSource> =
+            Arc::new(SemanticCandidateSource::new(Arc::new(StubCandidates)));
+
+        // GROUP BY over the matched rows: 2 "ai" + 1 "db".
+        let (cols, rows) = run_analytical_sql_blocking_with_semantic(
+            engine.clone(),
+            std::slice::from_ref(&docs_spec),
+            std::slice::from_ref(&("docs".to_string(), source.clone())),
+            "SELECT category, COUNT(*) AS n FROM docs GROUP BY category ORDER BY category",
+            ReadSnapshot::Latest,
+        )
+        .unwrap();
+        assert_eq!(cols, vec!["category", "n"]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![Some("ai".into()), Some("2".into())]);
+        assert_eq!(rows[1], vec![Some("db".into()), Some("1".into())]);
+
+        // ORDER BY similarity DESC over the candidates surfaces the score.
+        let (_cols, rows) = run_analytical_sql_blocking_with_semantic(
+            engine,
+            std::slice::from_ref(&docs_spec),
+            std::slice::from_ref(&("docs".to_string(), source)),
+            "SELECT id FROM docs ORDER BY similarity DESC LIMIT 2",
+            ReadSnapshot::Latest,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![Some("1".into())]); // sim 0.91
+        assert_eq!(rows[1], vec![Some("3".into())]); // sim 0.88
+    }
+
+    #[test]
+    fn semantic_candidates_join_relational_table() {
+        // "joins over vector candidates" (Req 2.1): the matched docs (from
+        // the candidate override) join a real engine table `authors` on id.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            Engine::new(EngineConfig {
+                data_dir: dir.path().to_path_buf(),
+                wal_group_commit_ms: 1,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        // authors(id, popularity): 1→100, 3→300, 7→700. Written in the
+        // row-codec format the backend's CatalogRowSplitter decodes (exactly
+        // what a real INSERT produces), left in the memtable — `scan_columnar`
+        // reads memtable rows via the splitter bridge, so no async flush is
+        // needed (keeping this test off the tokio runtime the blocking backend
+        // entry point requires).
+        use galaxdb_sql::planner::Value;
+        use galaxdb_sql::row_codec::encode_row;
+        for (id, pop) in [(1i64, 100i64), (3, 300), (7, 700)] {
+            let val = encode_row(&[
+                ("id".to_string(), Value::Integer(id)),
+                ("popularity".to_string(), Value::Integer(pop)),
+            ]);
+            engine.put_sync(format!("authors:{id}").into_bytes(), val).unwrap();
+        }
+
+        let docs_spec: TableSpec = (
+            "docs".into(),
+            b"docs:".to_vec(),
+            vec![("id".into(), SqlType::Int8), ("category".into(), SqlType::Text)],
+        );
+        let authors_spec: TableSpec = (
+            "authors".into(),
+            b"authors:".to_vec(),
+            vec![("id".into(), SqlType::Int8), ("popularity".into(), SqlType::Int8)],
+        );
+        let source: Arc<dyn ArrowSource> =
+            Arc::new(SemanticCandidateSource::new(Arc::new(StubCandidates)));
+
+        let (cols, rows) = run_analytical_sql_blocking_with_semantic(
+            engine,
+            &[docs_spec, authors_spec],
+            &[("docs".into(), source)],
+            "SELECT d.id, a.popularity FROM docs d \
+             JOIN authors a ON d.id = a.id ORDER BY d.id",
+            ReadSnapshot::Latest,
+        )
+        .unwrap();
+        assert_eq!(cols, vec!["id", "popularity"]);
+        // Only the three matched docs (1,3,7) join; all have an author.
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec![Some("1".into()), Some("100".into())]);
+        assert_eq!(rows[1], vec![Some("3".into()), Some("300".into())]);
+        assert_eq!(rows[2], vec![Some("7".into()), Some("700".into())]);
     }
 }

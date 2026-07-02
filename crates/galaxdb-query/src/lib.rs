@@ -40,6 +40,7 @@ pub mod arrow_batch;
 pub mod error;
 pub mod source;
 pub mod backend;
+pub mod semantic;
 
 /// MVCC read point for a scan. The same snapshot mechanism backs both
 /// `AT VERSION` time-travel and the read timestamp of an open transaction
