@@ -257,7 +257,8 @@ async fn extended_protocol_prepared_statements() {
 
     // 2. Prepared SELECT with a bound int4 parameter — exercises Bind
     //    parameter substitution into the WHERE clause and the Describe
-    //    RowDescription (2 columns). Results come back text-typed.
+    //    RowDescription (2 columns). Columns are typed from the catalog
+    //    (HTAP task 22): `id` is int4, `name` is text.
     let by_id = client
         .prepare_typed(
             "SELECT id, name FROM items WHERE id = $1",
@@ -268,7 +269,7 @@ async fn extended_protocol_prepared_statements() {
 
     let rows = client.query(&by_id, &[&2i32]).await.expect("query failed");
     assert_eq!(rows.len(), 1, "WHERE id = $1 must return exactly one row");
-    assert_eq!(rows[0].get::<_, &str>("id"), "2");
+    assert_eq!(rows[0].get::<_, i32>("id"), 2);
     assert_eq!(rows[0].get::<_, &str>("name"), "latte");
 
     // A different bound value selects a different row — proves the param
@@ -1308,4 +1309,47 @@ async fn transaction_savepoint_rollback_to() {
     assert_eq!(all.len(), 1);
     let rows = simple_rows(client.simple_query("SELECT v FROM t WHERE id = 1").await.unwrap());
     assert_eq!(rows[0].get("v"), Some("1"));
+}
+
+/// RowDescription reports each column's real PostgreSQL type OID resolved
+/// from the catalog (HTAP task 22), not the old always-TEXT default. Driven
+/// through the extended protocol so tokio-postgres exposes the column types.
+#[tokio::test]
+async fn row_description_reports_real_type_oids() {
+    use tokio_postgres::types::Type;
+
+    let (conn_str, _td) = start_server().await;
+    let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+
+    client
+        .simple_query(
+            "CREATE TABLE typed (id INTEGER PRIMARY KEY, name TEXT, \
+             score DOUBLE PRECISION, big BIGINT, flag BOOLEAN)",
+        )
+        .await
+        .unwrap();
+    client
+        .simple_query(
+            "INSERT INTO typed (id, name, score, big, flag) \
+             VALUES (1, 'a', 1.5, 100, true)",
+        )
+        .await
+        .unwrap();
+
+    // `query` uses Parse/Describe/Bind/Execute; the Describe RowDescription
+    // carries the type OIDs tokio-postgres surfaces as `Column::type_`.
+    let rows = client
+        .query("SELECT id, name, score, big, flag FROM typed", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let cols = rows[0].columns();
+    assert_eq!(cols[0].type_(), &Type::INT4, "id must be int4");
+    assert_eq!(cols[1].type_(), &Type::TEXT, "name must be text");
+    assert_eq!(cols[2].type_(), &Type::FLOAT8, "score must be float8");
+    assert_eq!(cols[3].type_(), &Type::INT8, "big must be int8");
+    assert_eq!(cols[4].type_(), &Type::BOOL, "flag must be bool");
 }

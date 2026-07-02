@@ -353,6 +353,42 @@ pub async fn write_data_row<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Write a DataRow (D) message from pre-encoded field bytes (text or
+/// binary, per the portal's result format codes — HTAP task 22). `None` is
+/// a SQL NULL (length −1). Mirrors [`write_data_row`] but accepts raw bytes
+/// so binary-format fields (network-order integers, floats, etc.) can be
+/// sent, not just UTF-8 text.
+pub async fn write_data_row_bytes<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    values: &[Option<Vec<u8>>],
+) -> io::Result<()> {
+    let mut body_len = 2i32; // field count
+    for val in values {
+        body_len += 4; // length prefix
+        if let Some(v) = val {
+            body_len += v.len() as i32;
+        }
+    }
+
+    writer.write_u8(b'D').await?;
+    writer.write_i32(body_len + 4).await?;
+    writer.write_i16(values.len() as i16).await?;
+
+    for val in values {
+        match val {
+            Some(v) => {
+                writer.write_i32(v.len() as i32).await?;
+                writer.write_all(v).await?;
+            }
+            None => {
+                writer.write_i32(-1).await?; // NULL
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Write CommandComplete (C) message.
 pub async fn write_command_complete<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
@@ -426,6 +462,34 @@ impl ColumnDesc {
             column_id: 0,
             type_oid: 23, // INT4 OID
             type_size: 4,
+            type_modifier: -1,
+            format_code: 0,
+        }
+    }
+
+    /// Create a column descriptor for an explicit PostgreSQL type OID
+    /// (HTAP task 22). The wire `type_size` is derived from the OID for the
+    /// fixed-width scalar types (so drivers that read it get the right
+    /// value); everything else is variable-length (`-1`). `type_modifier`
+    /// is `-1` (no modifier reported). Text format is used throughout.
+    pub fn with_oid(name: &str, type_oid: u32) -> Self {
+        // Fixed on-wire widths for the fixed-size scalar OIDs; -1 = varlena.
+        let type_size: i16 = match type_oid {
+            16 => 1,           // bool
+            21 => 2,           // int2
+            23 => 4,           // int4
+            20 | 1114 | 1184 => 8, // int8, timestamp, timestamptz
+            700 => 4,          // float4
+            701 => 8,          // float8
+            1082 => 4,         // date
+            _ => -1,           // text, varchar, numeric, uuid, json(b), arrays, bytea
+        };
+        Self {
+            name: name.to_string(),
+            table_oid: 0,
+            column_id: 0,
+            type_oid: type_oid as i32,
+            type_size,
             type_modifier: -1,
             format_code: 0,
         }

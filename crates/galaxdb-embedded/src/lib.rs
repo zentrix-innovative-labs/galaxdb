@@ -80,9 +80,13 @@ pub struct StatementShape {
     /// `NoData`. Columns are reported as text-typed, consistent with the
     /// simple-query result path.
     pub columns: Option<Vec<String>>,
+    /// PostgreSQL type OID per result column (HTAP task 22, Req 5.3),
+    /// aligned 1:1 with `columns`. Resolved from the catalog column's
+    /// declared SQL type via `SqlType::pg_oid`; columns that do not map to a
+    /// catalog column (expressions, aggregates, multi-table joins) report
+    /// TEXT (25). `None` exactly when `columns` is `None`.
+    pub column_type_oids: Option<Vec<u32>>,
 }
-
-/// A statement parsed once for repeated parameterised execution (Req 6/7).
 ///
 /// Holds the parsed AST template (with `$n` placeholders) plus its static
 /// shape, so each `Execute` binds values into a clone of the AST instead
@@ -95,6 +99,9 @@ pub struct PreparedTemplate {
     pub param_count: usize,
     /// Result column names (text-typed) for a SELECT, else `None`.
     pub columns: Option<Vec<String>>,
+    /// PostgreSQL type OID per result column (HTAP task 22), aligned with
+    /// `columns`; see [`StatementShape::column_type_oids`].
+    pub column_type_oids: Option<Vec<u32>>,
     /// Whether this is a read-only statement (a single SELECT) — lets the
     /// caller choose a read vs write lock.
     pub is_read: bool,
@@ -939,10 +946,29 @@ impl Database {
 
         let stmts = parser::parse(&sql_for_parse)?;
         let columns = stmts.first().and_then(|stmt| self.describe_columns(stmt));
+        let column_type_oids = stmts
+            .first()
+            .and_then(|stmt| self.describe_column_oids(stmt));
         Ok(StatementShape {
             param_count,
             columns,
+            column_type_oids,
         })
+    }
+
+    /// The PostgreSQL type OID of each result column of `sql`, aligned with
+    /// the column names from [`describe_statement`](Self::describe_statement),
+    /// or `None` when the statement returns no rows (HTAP task 22). Used by
+    /// the simple-query RowDescription path to report real per-column types
+    /// instead of always-TEXT.
+    pub fn describe_result_oids(&self, sql: &str) -> Option<Vec<u32>> {
+        let sql_for_parse = match split_at_version(sql) {
+            Ok(Some((stripped, _))) => stripped,
+            Ok(None) => sql.to_string(),
+            Err(_) => return None,
+        };
+        let stmts = parser::parse(&sql_for_parse).ok()?;
+        stmts.first().and_then(|stmt| self.describe_column_oids(stmt))
     }
 
     /// All column names of a table in catalog (declaration) order, or a
@@ -980,6 +1006,39 @@ impl Database {
         Some(entry.columns.iter().map(|c| c.name.clone()).collect())
     }
 
+    /// PostgreSQL type OID for each result column of `stmt`, aligned with
+    /// [`describe_columns`](Self::describe_columns) (HTAP task 22). Each
+    /// resolved column name is matched against the target table's catalog
+    /// column and mapped `data_type → SqlType::pg_oid`; a name that does not
+    /// match a catalog column (an expression, aggregate, alias, or a column
+    /// from another table in a join) is reported as TEXT (25) — an honest,
+    /// display-safe default, never a guess at a specific type.
+    fn describe_column_oids(&self, stmt: &AuroraStatement) -> Option<Vec<u32>> {
+        use galaxdb_sql::types::{oid, SqlType};
+        let names = self.describe_columns(stmt)?;
+        // The (single) target table whose catalog columns we resolve against.
+        let entry = match stmt {
+            AuroraStatement::Standard(s) => match s.as_ref() {
+                sqlparser::ast::Statement::Query(q) => {
+                    self.catalog.get_table(&extract_table(q))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let oids = names
+            .iter()
+            .map(|name| {
+                entry
+                    .and_then(|e| e.columns.iter().find(|c| &c.name == name))
+                    .and_then(|c| SqlType::from_sql_name(&c.data_type).ok())
+                    .map(|t| t.pg_oid())
+                    .unwrap_or(oid::TEXT)
+            })
+            .collect();
+        Some(oids)
+    }
+
     /// Prepare a statement template once (extended query protocol, Req 6).
     /// Parses the SQL a single time and resolves its static shape so that
     /// repeated `Execute`s bind parameters into the cached AST without
@@ -989,6 +1048,7 @@ impl Database {
     pub fn prepare(&self, sql: &str) -> GalaxResult<PreparedTemplate> {
         let stmts = parser::parse(sql)?;
         let columns = stmts.first().and_then(|s| self.describe_columns(s));
+        let column_type_oids = stmts.first().and_then(|s| self.describe_column_oids(s));
         // A read-only statement is a single standard `Query` (SELECT). This
         // mirrors the read/write split the wire server uses for locking.
         let is_read = matches!(
@@ -1000,6 +1060,7 @@ impl Database {
             stmts: Arc::new(stmts),
             param_count: count_placeholders(sql),
             columns,
+            column_type_oids,
             is_read,
         })
     }
@@ -3669,6 +3730,32 @@ mod tests {
     fn alter_table_set_storage_unknown_table_errors() {
         let mut db = test_db();
         assert!(db.execute("ALTER TABLE nope SET STORAGE COLUMNAR").is_err());
+    }
+
+    #[test]
+    fn describe_result_oids_maps_catalog_types() {
+        use galaxdb_sql::types::oid;
+        let mut db = test_db();
+        db.execute(
+            "CREATE TABLE typed (id INTEGER PRIMARY KEY, name TEXT, \
+             score DOUBLE PRECISION, big BIGINT, flag BOOLEAN)",
+        )
+        .unwrap();
+
+        // Explicit projection of catalog columns → each column's real OID.
+        let oids = db
+            .describe_result_oids("SELECT id, name, score, big, flag FROM typed")
+            .expect("SELECT resolves result OIDs");
+        assert_eq!(oids, vec![oid::INT4, oid::TEXT, oid::FLOAT8, oid::INT8, oid::BOOL]);
+
+        // SELECT * → all catalog columns in declaration order.
+        let star = db.describe_result_oids("SELECT * FROM typed").unwrap();
+        assert_eq!(star, vec![oid::INT4, oid::TEXT, oid::FLOAT8, oid::INT8, oid::BOOL]);
+
+        // A non-row statement resolves to no OIDs.
+        assert!(db
+            .describe_result_oids("INSERT INTO typed (id) VALUES (1)")
+            .is_none());
     }
 
     #[test]

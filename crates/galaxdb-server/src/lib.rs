@@ -620,6 +620,7 @@ where
                             Portal {
                                 statement: statement.clone(),
                                 values: Vec::new(),
+                                result_formats: Vec::new(),
                             },
                         );
                         write_bind_complete(&mut writer).await?;
@@ -658,18 +659,29 @@ where
                         Some(PreparedStatement::Normal { template, param_types }) => {
                             let oids = resolve_param_oids(param_types, template.param_count);
                             write_parameter_description(&mut writer, &oids).await?;
-                            write_describe_rows(&mut writer, template.columns.clone()).await?;
+                            write_describe_rows(
+                                &mut writer,
+                                template.columns.clone(),
+                                template.column_type_oids.clone(),
+                            )
+                            .await?;
                         }
                     }
                 } else {
                     // Describe portal: RowDescription | NoData (columns come
                     // from the portal's backing prepared statement).
-                    let columns = portals.get(&name).and_then(|p| match prepared.get(&p.statement) {
-                        Some(PreparedStatement::Normal { template, .. }) => template.columns.clone(),
-                        _ => None,
-                    });
+                    let (columns, col_oids) = portals
+                        .get(&name)
+                        .and_then(|p| match prepared.get(&p.statement) {
+                            Some(PreparedStatement::Normal { template, .. }) => Some((
+                                template.columns.clone(),
+                                template.column_type_oids.clone(),
+                            )),
+                            _ => None,
+                        })
+                        .unwrap_or((None, None));
                     if portals.contains_key(&name) {
-                        write_describe_rows(&mut writer, columns).await?;
+                        write_describe_rows(&mut writer, columns, col_oids).await?;
                     } else {
                         write_error_response(
                             &mut writer,
@@ -712,7 +724,11 @@ where
                         // Bind the parsed template + run it — no re-parse
                         // (Req 7). The client already received the
                         // RowDescription from Describe, so emit DataRows +
-                        // CommandComplete only.
+                        // CommandComplete only — but the DataRow bytes must
+                        // honor the result format codes the client requested
+                        // at Bind (text/binary, HTAP task 22).
+                        let col_oids = template.column_type_oids.clone();
+                        let result_formats = p.result_formats.clone();
                         if txn_failed {
                             // Inside a failed transaction every command is
                             // rejected until the block ends (Postgres 25P02).
@@ -736,12 +752,26 @@ where
                             if result.is_err() {
                                 txn_failed = true;
                             }
-                            write_query_result(&mut writer, result, false).await?;
+                            write_query_result(
+                                &mut writer,
+                                result,
+                                false,
+                                col_oids.as_deref(),
+                                Some(&result_formats),
+                            )
+                            .await?;
                         } else {
                             let result =
                                 run_bound_execute(&db, &session, template, p.values.clone())
                                     .await?;
-                            write_query_result(&mut writer, result, false).await?;
+                            write_query_result(
+                                &mut writer,
+                                result,
+                                false,
+                                col_oids.as_deref(),
+                                Some(&result_formats),
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -792,11 +822,15 @@ enum PreparedStatement {
     Copy(galaxdb_wire::copy::CopyCommand),
 }
 
-/// A portal produced by `Bind`: the backing prepared-statement name and
-/// the decoded parameter values to bind at `Execute`.
+/// A portal produced by `Bind`: the backing prepared-statement name, the
+/// decoded parameter values to bind at `Execute`, and the requested result
+/// column format codes (text/binary — HTAP task 22).
 struct Portal {
     statement: String,
     values: Vec<galaxdb_embedded::BoundValue>,
+    /// Result-column format codes from `Bind`: empty → all text; one code →
+    /// applies to every column; otherwise one per column.
+    result_formats: Vec<i16>,
 }
 
 /// Decode the bound parameters of a `Bind` into typed values, producing a
@@ -806,7 +840,7 @@ fn bind_portal(
     statement_name: &str,
     param_formats: &[i16],
     params: &[Option<Vec<u8>>],
-    _result_formats: Vec<i16>,
+    result_formats: Vec<i16>,
 ) -> Result<Portal, String> {
     // Per PostgreSQL: 0 format codes → all text; 1 code → applies to all;
     // otherwise one code per parameter.
@@ -826,6 +860,7 @@ fn bind_portal(
     Ok(Portal {
         statement: statement_name.to_string(),
         values,
+        result_formats,
     })
 }
 
@@ -843,16 +878,27 @@ fn resolve_param_oids(param_types: &[i32], param_count: usize) -> Vec<i32> {
         .collect()
 }
 
-/// Emit a `RowDescription` for the resolved columns (text-typed, matching
-/// the simple-query result path), or `NoData` when the statement returns
-/// no rows.
+/// Emit a `RowDescription` for the resolved columns, reporting each
+/// column's PostgreSQL type OID when known (HTAP task 22) and falling back
+/// to TEXT for any column without a resolved OID, or `NoData` when the
+/// statement returns no rows.
 async fn write_describe_rows<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     columns: Option<Vec<String>>,
+    oids: Option<Vec<u32>>,
 ) -> std::io::Result<()> {
     match columns {
         Some(cols) if !cols.is_empty() => {
-            let descs: Vec<ColumnDesc> = cols.iter().map(|c| ColumnDesc::text(c)).collect();
+            let descs: Vec<ColumnDesc> = cols
+                .iter()
+                .enumerate()
+                .map(|(i, c)| match oids.as_ref().and_then(|o| o.get(i)) {
+                    Some(&oid) => {
+                        ColumnDesc::with_oid(c, galaxdb_wire::result_codec::reportable_oid(oid))
+                    }
+                    None => ColumnDesc::text(c),
+                })
+                .collect();
             write_row_description(writer, &descs).await
         }
         // Empty column list or a non-row statement → NoData.
@@ -897,7 +943,21 @@ async fn run_simple_query<W: AsyncWriteExt + Unpin>(
     }
 
     let result = run_engine(db, session, sql).await?;
-    write_query_result(writer, result, true).await
+    let oids = resolve_result_oids(db, sql).await;
+    write_query_result(writer, result, true, oids.as_deref(), None).await
+}
+
+/// Resolve the per-column PostgreSQL type OIDs to report for `sql`'s result
+/// RowDescription (HTAP task 22), or `None` when the statement returns no
+/// rows or is not a resolvable SELECT. Runs on the blocking pool because it
+/// takes the database read lock and parses the statement.
+async fn resolve_result_oids(db: &Arc<RwLock<Database>>, sql: &str) -> Option<Vec<u32>> {
+    let db = db.clone();
+    let sql = sql.to_string();
+    tokio::task::spawn_blocking(move || db.blocking_read().describe_result_oids(&sql))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// A transaction-control statement recognized by the wire layer
@@ -1017,7 +1077,8 @@ async fn run_simple_query_txn<W: AsyncWriteExt + Unpin>(
         if result.is_err() {
             *txn_failed = true;
         }
-        return write_query_result(writer, result, true).await;
+        let oids = resolve_result_oids(db, sql).await;
+        return write_query_result(writer, result, true, oids.as_deref(), None).await;
     }
 
     // Autocommit (no open transaction): unchanged behavior.
@@ -1372,11 +1433,37 @@ async fn run_engine(
 /// Write an engine result to the wire. `with_row_description` controls
 /// whether a RowDescription precedes the DataRows (true for simple query,
 /// false for extended Execute, which already sent it via Describe).
+/// `col_oids` supplies the per-column PostgreSQL type OIDs (HTAP task 22);
+/// `formats` supplies the per-column result format codes from `Bind`
+/// (text/binary). Both are indexed by column; missing entries default to
+/// TEXT / text-format. Columns are reported and encoded through
+/// `result_codec::reportable_oid` so the advertised type and the on-wire
+/// bytes always agree.
 async fn write_query_result<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     result: galaxdb_common::GalaxResult<galaxdb_embedded::QueryResult>,
     with_row_description: bool,
+    col_oids: Option<&[u32]>,
+    formats: Option<&[i16]>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use galaxdb_wire::result_codec;
+    // The format code requested for result column `i` (0 codes → text; 1 →
+    // all columns; else one per column).
+    let format_for = |i: usize| -> i16 {
+        match formats {
+            None => 0,
+            Some(f) => match f.len() {
+                0 => 0,
+                1 => f[0],
+                _ => *f.get(i).unwrap_or(&0),
+            },
+        }
+    };
+    let oid_for = |i: usize| -> u32 {
+        result_codec::reportable_oid(
+            col_oids.and_then(|o| o.get(i).copied()).unwrap_or(galaxdb_sql::types::oid::TEXT),
+        )
+    };
     match result {
         Ok(galaxdb_embedded::QueryResult::Rows(rows)) => {
             if with_row_description {
@@ -1384,7 +1471,8 @@ async fn write_query_result<W: AsyncWriteExt + Unpin>(
                     first
                         .values
                         .iter()
-                        .map(|(name, _)| ColumnDesc::text(name))
+                        .enumerate()
+                        .map(|(i, (name, _))| ColumnDesc::with_oid(name, oid_for(i)))
                         .collect()
                 } else {
                     vec![]
@@ -1392,9 +1480,19 @@ async fn write_query_result<W: AsyncWriteExt + Unpin>(
                 write_row_description(writer, &col_descs).await?;
             }
             for row in &rows {
-                let values: Vec<Option<&str>> =
-                    row.values.iter().map(|(_, v)| Some(v.as_str())).collect();
-                write_data_row(writer, &values).await?;
+                let fields: Vec<Option<Vec<u8>>> = row
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (_, v))| {
+                        // The executor renders NULL as the literal "NULL";
+                        // preserve that text-format behavior (unchanged) —
+                        // binary NULLs are not distinguished here because the
+                        // value set has no typed NULL marker at this layer.
+                        Some(result_codec::encode_field(v, oid_for(i), format_for(i)))
+                    })
+                    .collect();
+                write_data_row_bytes(writer, &fields).await?;
             }
             write_command_complete(writer, &format!("SELECT {}", rows.len())).await?;
         }
