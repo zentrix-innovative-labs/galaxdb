@@ -3932,6 +3932,55 @@ mod tests {
         assert!(matches!(ok, QueryResult::Rows { .. }));
     }
 
+    /// ORDER BY / LIMIT / OFFSET execute end to end (HTAP task 15.1): the
+    /// classifier routes them to DataFusion and they actually sort/limit/skip
+    /// rather than being parsed-and-ignored by the native scan.
+    #[test]
+    fn order_by_limit_offset_execute_end_to_end() {
+        let mut db = test_db();
+        db.execute("CREATE TABLE nums (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        // Insert out of order so a wrong/no-op ORDER BY is visible.
+        for (id, v) in [(1, 30), (2, 10), (3, 50), (4, 20), (5, 40)] {
+            db.execute(&format!("INSERT INTO nums (id, v) VALUES ({id}, {v})"))
+                .unwrap();
+        }
+        let ids = |r: QueryResult| -> Vec<String> {
+            rows_of(r)
+                .into_iter()
+                .map(|row| row.values.iter().find(|(k, _)| k == "id").unwrap().1.clone())
+                .collect()
+        };
+
+        // ORDER BY v ASC → ids ordered by ascending v (2,4,1,5,3).
+        assert_eq!(
+            ids(db.execute("SELECT id FROM nums ORDER BY v ASC").unwrap()),
+            vec!["2", "4", "1", "5", "3"]
+        );
+        // ORDER BY v DESC → reverse.
+        assert_eq!(
+            ids(db.execute("SELECT id FROM nums ORDER BY v DESC").unwrap()),
+            vec!["3", "5", "1", "4", "2"]
+        );
+        // LIMIT keeps the first N in order.
+        assert_eq!(
+            ids(db.execute("SELECT id FROM nums ORDER BY v ASC LIMIT 2").unwrap()),
+            vec!["2", "4"]
+        );
+        // OFFSET skips the first M, LIMIT then takes N.
+        assert_eq!(
+            ids(db
+                .execute("SELECT id FROM nums ORDER BY v ASC LIMIT 2 OFFSET 1")
+                .unwrap()),
+            vec!["4", "1"]
+        );
+        // OFFSET past the end → empty.
+        assert!(ids(db
+            .execute("SELECT id FROM nums ORDER BY v ASC OFFSET 10")
+            .unwrap())
+        .is_empty());
+    }
+
     /// End-to-end SEMANTIC_MATCH test using the real model. Gated behind
     /// the `online-tests` feature — requires network access to HuggingFace
     /// Hub on first run (downloads ~90 MB for all-MiniLM-L6-v2).
