@@ -85,7 +85,10 @@ fn plan_delete_with_filter() {
 fn plan_update_with_assignments() {
     let plan = plan_update(
         "users".to_string(),
-        vec![("name".to_string(), Value::Text("bob".to_string()))],
+        vec![(
+            "name".to_string(),
+            crate::scalar::ScalarExpr::Literal(Value::Text("bob".to_string())),
+        )],
         None,
     );
 

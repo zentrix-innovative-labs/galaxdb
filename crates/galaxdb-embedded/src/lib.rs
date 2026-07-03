@@ -36,6 +36,7 @@ use galaxdb_sql::executor::{
 use galaxdb_sql::parser;
 use galaxdb_sql::planner::{self, FilterExpr, QueryPlan, SearchStrategy, Value};
 use galaxdb_sql::row_codec;
+use galaxdb_sql::scalar::{ArithOp, ScalarExpr};
 
 /// Re-export of the bound-parameter value type so wire-protocol callers
 /// (the server) can name it without depending on `galaxdb-sql` directly.
@@ -559,8 +560,8 @@ impl Database {
                                 source.body.as_ref() else { continue };
                             for row in &values.rows {
                                 let row_values: Vec<Value> = row.iter()
-                                    .map(value_from_expr)
-                                    .collect();
+                                    .map(|e| scalar_from_expr(e).and_then(|s| s.eval(&[])))
+                                    .collect::<GalaxResult<Vec<Value>>>()?;
                                 let row_plan = QueryPlan::Insert {
                                     table: table.clone(),
                                     columns: column_names.clone(),
@@ -597,12 +598,12 @@ impl Database {
                             table, assignments, selection, ..
                         } => {
                             let tname = table.relation.to_string();
-                            let asns: Vec<(String, Value)> = assignments.iter()
-                                .map(|a| (
+                            let asns: Vec<(String, ScalarExpr)> = assignments.iter()
+                                .map(|a| Ok((
                                     a.target.to_string(),
-                                    value_from_expr(&a.value),
-                                ))
-                                .collect();
+                                    scalar_from_expr(&a.value)?,
+                                )))
+                                .collect::<GalaxResult<Vec<_>>>()?;
                             let filter = selection.as_ref().and_then(filter_from_expr);
                             QueryPlan::Update {
                                 table: tname,
@@ -828,7 +829,10 @@ impl Database {
                 };
                 let mut inserted = 0u64;
                 for row in &values.rows {
-                    let row_values: Vec<Value> = row.iter().map(value_from_expr).collect();
+                    let row_values: Vec<Value> = row
+                        .iter()
+                        .map(|e| scalar_from_expr(e).and_then(|s| s.eval(&[])))
+                        .collect::<GalaxResult<Vec<Value>>>()?;
                     let plan = QueryPlan::Insert {
                         table: table.clone(),
                         columns: column_names.clone(),
@@ -850,10 +854,10 @@ impl Database {
                 ..
             } => {
                 let tname = table.relation.to_string();
-                let asns: Vec<(String, Value)> = assignments
+                let asns: Vec<(String, ScalarExpr)> = assignments
                     .iter()
-                    .map(|a| (a.target.to_string(), value_from_expr(&a.value)))
-                    .collect();
+                    .map(|a| Ok((a.target.to_string(), scalar_from_expr(&a.value)?)))
+                    .collect::<GalaxResult<Vec<_>>>()?;
                 let filter = selection.as_ref().and_then(filter_from_expr);
                 let plan = QueryPlan::Update {
                     table: tname,
@@ -1176,8 +1180,8 @@ impl Database {
                             source.body.as_ref() else { continue };
                         for row in &vals.rows {
                             let row_values: Vec<Value> = row.iter()
-                                .map(value_from_expr)
-                                .collect();
+                                .map(|e| scalar_from_expr(e).and_then(|s| s.eval(&[])))
+                                .collect::<GalaxResult<Vec<Value>>>()?;
                             let row_plan = QueryPlan::Insert {
                                 table: table.clone(),
                                 columns: column_names.clone(),
@@ -1212,9 +1216,9 @@ impl Database {
                         table, assignments, selection, ..
                     } => {
                         let tname = table.relation.to_string();
-                        let asns: Vec<(String, Value)> = assignments.iter()
-                            .map(|a| (a.target.to_string(), value_from_expr(&a.value)))
-                            .collect();
+                        let asns: Vec<(String, ScalarExpr)> = assignments.iter()
+                            .map(|a| Ok((a.target.to_string(), scalar_from_expr(&a.value)?)))
+                            .collect::<GalaxResult<Vec<_>>>()?;
                         let filter = selection.as_ref().and_then(filter_from_expr);
                         QueryPlan::Update { table: tname, assignments: asns, filter }
                     }
@@ -1922,7 +1926,10 @@ impl Database {
 
         let mut count = 0u64;
         for row in &values.rows {
-            let row_values: Vec<Value> = row.iter().map(value_from_expr).collect();
+            let row_values: Vec<Value> = row
+                .iter()
+                .map(|e| scalar_from_expr(e).and_then(|s| s.eval(&[])))
+                .collect::<GalaxResult<Vec<Value>>>()?;
             let plan = QueryPlan::Insert {
                 table: table.clone(),
                 columns: column_names.clone(),
@@ -2250,10 +2257,10 @@ impl Database {
         assignments: &[sqlparser::ast::Assignment],
         selection: Option<&sqlparser::ast::Expr>,
     ) -> GalaxResult<QueryResult> {
-        let aligned: Vec<(String, Value)> = assignments
+        let aligned: Vec<(String, ScalarExpr)> = assignments
             .iter()
-            .map(|a| (a.target.to_string(), value_from_expr(&a.value)))
-            .collect();
+            .map(|a| Ok((a.target.to_string(), scalar_from_expr(&a.value)?)))
+            .collect::<GalaxResult<Vec<_>>>()?;
         let filter = selection.and_then(filter_from_expr);
         let plan = QueryPlan::Update {
             table: table.to_string(),
@@ -3051,6 +3058,63 @@ fn value_from_expr(e: &sqlparser::ast::Expr) -> Value {
             other => Value::Text(format!("{}", other)),
         },
         other => Value::Text(format!("{}", other)),
+    }
+}
+
+/// Translate a `sqlparser` expression in a value position (`INSERT ... VALUES`
+/// or `UPDATE ... SET col = <expr>`) into a GalaxDB [`ScalarExpr`] that the
+/// executor evaluates per row against the old row values.
+///
+/// This replaces the old behavior where a non-literal expression such as
+/// `bal - 30` was silently stringified to the literal text `"bal - 30"`
+/// (data corruption). An expression we cannot represent is a typed
+/// [`GalaxError::FeatureNotSupported`], never a silent wrong value.
+fn scalar_from_expr(e: &sqlparser::ast::Expr) -> GalaxResult<ScalarExpr> {
+    use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
+
+    match e {
+        Expr::Value(_) => Ok(ScalarExpr::Literal(value_from_expr(e))),
+        Expr::Identifier(ident) => Ok(ScalarExpr::Column(ident.value.clone())),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| ScalarExpr::Column(p.value.clone()))
+            .ok_or_else(|| {
+                GalaxError::FeatureNotSupported("empty compound identifier".to_string())
+            }),
+        Expr::Nested(inner) => scalar_from_expr(inner),
+        // A cast in a value position carries no runtime coercion here; evaluate
+        // the inner expression (numeric/text values are coerced at eval time).
+        Expr::Cast { expr, .. } => scalar_from_expr(expr),
+        Expr::UnaryOp { op, expr } => match op {
+            UnaryOperator::Minus => Ok(ScalarExpr::Neg(Box::new(scalar_from_expr(expr)?))),
+            UnaryOperator::Plus => scalar_from_expr(expr),
+            other => Err(GalaxError::FeatureNotSupported(format!(
+                "unary operator {other:?} in a value expression"
+            ))),
+        },
+        Expr::BinaryOp { left, op, right } => {
+            let arith = match op {
+                BinaryOperator::Plus => ArithOp::Add,
+                BinaryOperator::Minus => ArithOp::Sub,
+                BinaryOperator::Multiply => ArithOp::Mul,
+                BinaryOperator::Divide => ArithOp::Div,
+                BinaryOperator::Modulo => ArithOp::Mod,
+                BinaryOperator::StringConcat => ArithOp::Concat,
+                other => {
+                    return Err(GalaxError::FeatureNotSupported(format!(
+                        "binary operator {other:?} in a value expression"
+                    )))
+                }
+            };
+            Ok(ScalarExpr::Binary {
+                op: arith,
+                left: Box::new(scalar_from_expr(left)?),
+                right: Box::new(scalar_from_expr(right)?),
+            })
+        }
+        other => Err(GalaxError::FeatureNotSupported(format!(
+            "expression {other:?} is not supported in a value position"
+        ))),
     }
 }
 
@@ -4036,6 +4100,45 @@ mod tests {
     fn select_nonexistent_fails() {
         let mut db = test_db();
         assert!(db.execute("SELECT * FROM nope").is_err());
+    }
+
+    #[test]
+    fn update_set_column_expression_is_evaluated_not_stringified() {
+        // End-to-end regression for the live-testing data-corruption bug:
+        // `UPDATE t SET bal = bal - 30` stored the literal text "bal - 30".
+        // It must now compute old_bal - 30 = 70.
+        let mut db = test_db();
+        db.execute("CREATE TABLE acct (id INT PRIMARY KEY, bal INT)")
+            .unwrap();
+        db.execute("INSERT INTO acct (id, bal) VALUES (1, 100)")
+            .unwrap();
+        db.execute("UPDATE acct SET bal = bal - 30 WHERE id = 1")
+            .unwrap();
+        match db.execute("SELECT bal FROM acct WHERE id = 1").unwrap() {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                let bal = rows[0]
+                    .values
+                    .iter()
+                    .find(|(k, _)| k == "bal")
+                    .map(|(_, v)| v.clone())
+                    .unwrap();
+                assert_eq!(bal, "70", "expected computed 70, got {bal:?}");
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn update_set_unsupported_expression_is_typed_error_not_silent() {
+        // A value expression we cannot represent (e.g. a function call) must
+        // surface a typed error, never silently store stringified text.
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        db.execute("INSERT INTO t (id, v) VALUES (1, 5)").unwrap();
+        let err = db.execute("UPDATE t SET v = some_func(v) WHERE id = 1");
+        assert!(err.is_err(), "unsupported UPDATE expr must error, got {err:?}");
     }
 
     #[test]

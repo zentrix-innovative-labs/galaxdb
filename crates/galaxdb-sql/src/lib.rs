@@ -8,6 +8,7 @@ pub mod executor;
 pub mod parser;
 pub mod planner;
 pub mod row_codec;
+pub mod scalar;
 pub mod secondary_index;
 pub mod stmt_cache;
 pub mod transaction;

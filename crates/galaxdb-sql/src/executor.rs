@@ -1183,7 +1183,7 @@ fn ctx_table_rows(ctx: &ExecutorContext, table: &str) -> Vec<(Vec<u8>, Vec<u8>)>
 
 fn exec_update(
     table: &str,
-    assignments: &[(String, Value)],
+    assignments: &[(String, crate::scalar::ScalarExpr)],
     filter: &Option<FilterExpr>,
     ctx: &mut ExecutorContext,
 ) -> GalaxResult<ExecuteResult> {
@@ -1235,12 +1235,18 @@ fn exec_update(
         // remove the stale entries after the new row is written.
         let old_cols = cols.clone();
 
-        // Apply assignments.
-        for (col_name, new_value) in assignments {
-            if let Some(slot) = cols.iter_mut().find(|(k, _)| k == col_name) {
-                slot.1 = new_value.clone();
+        // Evaluate every assignment's expression against the OLD row values
+        // FIRST (PostgreSQL semantics: all SET clauses see the pre-update
+        // values, so `SET a = b, b = a` swaps), then apply the results.
+        let mut new_values: Vec<(String, Value)> = Vec::with_capacity(assignments.len());
+        for (col_name, expr) in assignments {
+            new_values.push((col_name.clone(), expr.eval(&old_cols)?));
+        }
+        for (col_name, new_value) in new_values {
+            if let Some(slot) = cols.iter_mut().find(|(k, _)| k == &col_name) {
+                slot.1 = new_value;
             } else {
-                cols.push((col_name.clone(), new_value.clone()));
+                cols.push((col_name, new_value));
             }
         }
 

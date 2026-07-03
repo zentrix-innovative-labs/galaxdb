@@ -68,10 +68,13 @@ pub enum QueryPlan {
         columns: Vec<String>,
         values: Vec<Value>,
     },
-    /// UPDATE rows matching a filter.
+    /// UPDATE rows matching a filter. Each assignment's value is a scalar
+    /// expression evaluated per row against the old (pre-update) values —
+    /// e.g. `SET bal = bal - 30` (HTAP: real expression evaluation, not a
+    /// literal), per PostgreSQL UPDATE semantics.
     Update {
         table: String,
-        assignments: Vec<(String, Value)>,
+        assignments: Vec<(String, crate::scalar::ScalarExpr)>,
         filter: Option<FilterExpr>,
     },
     /// DELETE rows matching a filter.
@@ -267,7 +270,7 @@ pub fn plan_delete(table: String, filter: Option<FilterExpr>) -> QueryPlan {
 /// Plan an UPDATE statement.
 pub fn plan_update(
     table: String,
-    assignments: Vec<(String, Value)>,
+    assignments: Vec<(String, crate::scalar::ScalarExpr)>,
     filter: Option<FilterExpr>,
 ) -> QueryPlan {
     QueryPlan::Update {

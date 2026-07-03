@@ -162,6 +162,19 @@ pub enum GalaxError {
         message: String,
     },
 
+    /// A scalar expression failed at evaluation time (e.g. `SET bal = bal /
+    /// 0`, integer overflow, or arithmetic on non-numeric operands). Carries
+    /// the PostgreSQL SQLSTATE for the specific data exception so clients
+    /// classify it correctly — never silently substituted with a wrong value.
+    #[error("{message}")]
+    Arithmetic {
+        /// PostgreSQL SQLSTATE (e.g. `22012` division_by_zero,
+        /// `22003` numeric_value_out_of_range, `42804` datatype_mismatch).
+        sqlstate: &'static str,
+        /// Human-readable message.
+        message: String,
+    },
+
     /// An internal error that doesn't fit other categories.
     #[error("internal error: {0}")]
     Internal(String),
@@ -200,6 +213,11 @@ impl GalaxError {
 
             // Query-engine errors carry their own SQLSTATE.
             GalaxError::Query { sqlstate, .. } => sqlstate,
+
+            // Class 22 — data exception (arithmetic eval failures carry the
+            // precise SQLSTATE: division_by_zero, numeric_value_out_of_range,
+            // datatype_mismatch, …).
+            GalaxError::Arithmetic { sqlstate, .. } => sqlstate,
 
             // Class 42 — restricted/generated column update (the embedding
             // source column behaves like a GENERATED ALWAYS column).

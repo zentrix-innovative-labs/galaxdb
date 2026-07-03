@@ -471,7 +471,10 @@ fn context_update_changes_value() {
 
     let update = plan_update(
         "users".to_string(),
-        vec![("name".to_string(), Value::Text("alice2".to_string()))],
+        vec![(
+            "name".to_string(),
+            crate::scalar::ScalarExpr::Literal(Value::Text("alice2".to_string())),
+        )],
         Some(FilterExpr::Eq {
             column: "id".to_string(),
             value: Value::Integer(1),
@@ -492,6 +495,49 @@ fn context_update_changes_value() {
 }
 
 #[test]
+fn context_update_evaluates_column_expression() {
+    // Regression: `UPDATE t SET bal = bal - 30` must compute old_bal - 30,
+    // not store the literal text "bal - 30" (the live-testing data-corruption
+    // bug). Verifies real per-row scalar expression evaluation.
+    let mut ctx = test_ctx();
+    std::sync::Arc::make_mut(&mut ctx.catalog)
+        .create_table("users".to_string(), users_entry())
+        .unwrap();
+
+    let insert = plan_insert(
+        "users".to_string(),
+        vec!["id".to_string(), "name".to_string()],
+        vec![Value::Integer(100), Value::Text("checking".to_string())],
+    );
+    execute_with_context(&insert, &mut ctx).unwrap();
+
+    // SET id = id - 30 (id starts at 100 → expect 70).
+    let update = plan_update(
+        "users".to_string(),
+        vec![(
+            "id".to_string(),
+            crate::scalar::ScalarExpr::Binary {
+                op: crate::scalar::ArithOp::Sub,
+                left: Box::new(crate::scalar::ScalarExpr::Column("id".to_string())),
+                right: Box::new(crate::scalar::ScalarExpr::Literal(Value::Integer(30))),
+            },
+        )],
+        None,
+    );
+    let result = execute_with_context(&update, &mut ctx).unwrap();
+    assert_eq!(result, ExecuteResult::RowCount(1));
+
+    let select = plan_select("users".to_string(), vec![], None);
+    match execute_with_context(&select, &mut ctx).unwrap() {
+        ExecuteResult::Rows { rows, .. } => {
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].columns[0].1, Value::Integer(70));
+        }
+        other => panic!("{:?}", other),
+    }
+}
+
+#[test]
 fn context_update_rejects_embedding_source_column() {
     let mut ctx = test_ctx();
     std::sync::Arc::make_mut(&mut ctx.catalog)
@@ -502,7 +548,7 @@ fn context_update_rejects_embedding_source_column() {
         "docs".to_string(),
         vec![(
             "content".to_string(),
-            Value::Text("new text".to_string()),
+            crate::scalar::ScalarExpr::Literal(Value::Text("new text".to_string())),
         )],
         None,
     );
@@ -533,7 +579,10 @@ fn context_update_non_embedding_column_on_embedding_table_succeeds() {
 
     let update = plan_update(
         "docs".to_string(),
-        vec![("id".to_string(), Value::Integer(2))],
+        vec![(
+            "id".to_string(),
+            crate::scalar::ScalarExpr::Literal(Value::Integer(2)),
+        )],
         None,
     );
     let result = execute_with_context(&update, &mut ctx).unwrap();
