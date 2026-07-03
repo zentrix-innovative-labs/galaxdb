@@ -9,7 +9,7 @@ verified ANN-benchmarks dataset.
 
 ## Hardware / provenance
 
-- Instance: AWS `c6id.4xlarge` (`i-0b2dec9226f62db65`), us-east-1
+- Instance: AWS `c6id.4xlarge` (id redacted), us-east-1
 - CPU: Intel Xeon Platinum 8375C @ 2.90 GHz, 16 vCPU
 - RAM: 30 GiB
 - Storage: instance-store NVMe (~885 GiB) at `/mnt/nvme`, xfs, `noatime`

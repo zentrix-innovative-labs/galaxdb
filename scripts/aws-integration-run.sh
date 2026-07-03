@@ -413,7 +413,8 @@ scp "${SSH_OPTS[@]}" \
 # reproduction trail is complete without requiring the user to remember.
 {
   echo "commit: $COMMIT_SHA"
-  echo "instance_id: $INSTANCE_ID"
+  # Do NOT write the raw instance ID — it is account infrastructure metadata
+  # and must never land in a published artifact (engineering-principles §6).
   echo "instance_type: $INSTANCE_TYPE_LABEL"
   echo "region: $AWS_REGION"
   echo "remote_workdir: $REMOTE_WORKDIR"

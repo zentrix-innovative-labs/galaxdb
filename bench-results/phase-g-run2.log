@@ -1,9 +1,9 @@
 [preflight] commit:   8567691d4f7859742c1e6cb54ba8c429ae36d297
-[preflight] instance: i-0b2dec9226f62db65 (c6id.4xlarge) in us-east-1
+[preflight] instance: <redacted> (c6id.4xlarge) in us-east-1
 [preflight] user:     ubuntu
 [preflight] remote:   /mnt/nvme/galaxdb
 [preflight] results:  bench-results/20260510T130506Z
-[1/8] starting i-0b2dec9226f62db65
+[1/8] starting <redacted>
 [2/8] resolving public IP
 [3/8] waiting for SSH
   sshd ready after 2 attempt(s)
@@ -1124,5 +1124,5 @@ Caused by:
   Error: Custom { kind: NotFound, error: "Could not find `protoc`. If `protoc` is installed, try setting the `PROTOC` environment variable to the path of the `protoc` binary. To install it on Debian, run `apt-get install protobuf-compiler`. It is also available at https://github.com/protocolbuffers/protobuf/releases  For more information: https://docs.rs/prost-build/#sourcing-protoc" }
 warning: build failed, waiting for other jobs to finish...
 
-[teardown] stopping i-0b2dec9226f62db65 in us-east-1 (script exit=101)
+[teardown] stopping <redacted> in us-east-1 (script exit=101)
 [teardown] instance final state: stopped

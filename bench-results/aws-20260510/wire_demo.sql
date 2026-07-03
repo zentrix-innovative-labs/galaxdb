@@ -1,6 +1,6 @@
 -- Hitting the GalaxDB wire server from psql over an SSH tunnel.
 -- Every response below comes from target/release/galaxdb-server running
--- on c6id.4xlarge (i-0b2dec9226f62db65), which routes through
+-- on c6id.4xlarge (<redacted>), which routes through
 -- galaxdb-embedded::Database → galaxdb-sql::executor::execute_legacy
 -- against a real galaxdb-storage Engine.
 

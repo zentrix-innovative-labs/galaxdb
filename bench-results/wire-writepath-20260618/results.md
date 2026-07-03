@@ -1,7 +1,7 @@
 # Write-path benchmarks — v2-phase1 wire work + write-path fixes
 
 **Hardware:** AWS c6id.4xlarge (Intel Ice Lake, 16 vCPU, 32 GiB RAM, instance-store NVMe), Ubuntu, `--release`.
-**Instance:** i-0b2dec9226f62db65 (started, run, stopped per engineering-principles §6).
+**Instance:** c6id.4xlarge (id redacted) (started, run, stopped per engineering-principles §6).
 **Date:** 2026-06-18.
 
 All numbers are from real binaries against a real engine/server. Reproduce with the commands shown.

@@ -1,9 +1,9 @@
 [preflight] commit:   8567691d4f7859742c1e6cb54ba8c429ae36d297
-[preflight] instance: i-0b2dec9226f62db65 (c6id.4xlarge) in us-east-1
+[preflight] instance: <redacted> (c6id.4xlarge) in us-east-1
 [preflight] user:     ubuntu
 [preflight] remote:   /mnt/nvme/galaxdb
 [preflight] results:  bench-results/20260510T131442Z
-[1/8] starting i-0b2dec9226f62db65
+[1/8] starting <redacted>
 [2/8] resolving public IP
 [3/8] waiting for SSH
   sshd ready after 1 attempt(s)
@@ -48,8 +48,8 @@ Connection timed out during banner exchange
 rsync: connection unexpectedly closed (0 bytes received so far) [sender]
 rsync error: unexplained error (code 255) at /AppleInternal/Library/BuildRoots/46298ee5-4a1c-11ef-a181-1aec23608739/Library/Caches/com.apple.xbs/Sources/rsync/rsync/io.c(453) [sender=2.6.9]
 
-[teardown] stopping i-0b2dec9226f62db65 in us-east-1 (script exit=255)
+[teardown] stopping <redacted> in us-east-1 (script exit=255)
 [teardown] WARNING: aws ec2 stop-instances returned an error
 [teardown] Please manually confirm the instance is stopped:
-[teardown]   aws ec2 describe-instances --instance-ids i-0b2dec9226f62db65 --region us-east-1
+[teardown]   aws ec2 describe-instances --instance-ids <redacted> --region us-east-1
 [teardown] instance final state: unknown

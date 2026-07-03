@@ -12,7 +12,7 @@
 
 set -euo pipefail
 
-INSTANCE_ID="${GALAXDB_AWS_INSTANCE_ID:-i-0b2dec9226f62db65}"
+INSTANCE_ID="${GALAXDB_AWS_INSTANCE_ID:?Set GALAXDB_AWS_INSTANCE_ID to your benchmark instance ID}"
 AWS_REGION="${AWS_REGION:-us-east-1}"
 SSH_KEY="${GALAXDB_SSH_KEY:-$HOME/.ssh/galaxdb-bench-key.pem}"
 SSH_USER="${GALAXDB_SSH_USER:-ubuntu}"
