@@ -1951,9 +1951,28 @@ impl Database {
                 selection.as_ref(),
             ),
             sqlparser::ast::Statement::Delete(del) => self.exec_delete(del),
-            other => Err(GalaxError::Internal(format!(
-                "unsupported SQL statement: {:?}",
-                std::mem::discriminant(other)
+            // SQL-level PREPARE/EXECUTE/DEALLOCATE are not implemented as
+            // server commands — clients use the wire extended-query protocol
+            // (Parse/Bind/Execute) for prepared statements, which is
+            // supported. Name the construct in a clean, typed error rather
+            // than leaking an internal AST discriminant.
+            sqlparser::ast::Statement::Prepare { .. } => Err(GalaxError::FeatureNotSupported(
+                "SQL-level PREPARE is not supported; use the wire protocol's \
+                 extended-query (Parse/Bind/Execute) prepared statements instead"
+                    .to_string(),
+            )),
+            sqlparser::ast::Statement::Execute { .. } => Err(GalaxError::FeatureNotSupported(
+                "SQL-level EXECUTE is not supported; use the wire protocol's \
+                 extended-query (Parse/Bind/Execute) prepared statements instead"
+                    .to_string(),
+            )),
+            sqlparser::ast::Statement::Deallocate { .. } => Err(GalaxError::FeatureNotSupported(
+                "SQL-level DEALLOCATE is not supported; wire-protocol prepared \
+                 statements are closed with the Close message"
+                    .to_string(),
+            )),
+            other => Err(GalaxError::FeatureNotSupported(format!(
+                "SQL statement is not supported by GalaxDB: {other}"
             ))),
         }
     }

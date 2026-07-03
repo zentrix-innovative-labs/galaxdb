@@ -792,18 +792,40 @@ pub fn parse_at_version(expr: &str) -> GalaxResult<AtVersionExpr> {
         )
     };
 
-    // Check for CONSISTENCY mode
-    let consistency = if remainder.to_uppercase().contains("CONSISTENCY") {
-        let upper_rem = remainder.to_uppercase();
-        if upper_rem.contains("ROW_SNAPSHOT") || upper_rem.contains("'ROW_SNAPSHOT'") {
+    // Anything after the version specifier must be a `CONSISTENCY '<mode>'`
+    // clause and nothing else. `AT VERSION` is the final clause of a query, so
+    // a trailing `WHERE`/`ORDER BY`/`LIMIT` here means the user wrote them in
+    // the wrong order — reject with a clear error rather than silently
+    // dropping the predicate (which would return an unfiltered result).
+    let upper_rem = remainder.trim().to_uppercase();
+    let consistency = if upper_rem.is_empty() {
+        None
+    } else if upper_rem.starts_with("CONSISTENCY") {
+        if upper_rem.contains("ROW_SNAPSHOT") {
             Some(ConsistencyMode::RowSnapshot)
-        } else if upper_rem.contains("SEMANTIC_FRESH") || upper_rem.contains("'SEMANTIC_FRESH'") {
+        } else if upper_rem.contains("SEMANTIC_FRESH") {
             Some(ConsistencyMode::SemanticFresh)
         } else {
-            None
+            return Err(GalaxError::SqlParse {
+                position: 0,
+                message: format!(
+                    "unrecognized CONSISTENCY mode in AT VERSION clause: '{}' \
+                     (expected 'ROW_SNAPSHOT' or 'SEMANTIC_FRESH')",
+                    remainder.trim()
+                ),
+            });
         }
     } else {
-        None
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: format!(
+                "unexpected tokens after the AT VERSION specifier: '{}'. \
+                 AT VERSION must be the final clause of the query — put \
+                 WHERE / ORDER BY / LIMIT before it, e.g. \
+                 SELECT ... FROM t WHERE ... AT VERSION '<tag|timestamp>'",
+                remainder.trim()
+            ),
+        });
     };
 
     Ok(AtVersionExpr {

@@ -111,6 +111,28 @@ fn parse_at_version_with_semantic_fresh() {
     assert_eq!(av.consistency, Some(ConsistencyMode::SemanticFresh));
 }
 
+#[test]
+fn parse_at_version_rejects_trailing_where() {
+    // Regression: `AT VERSION 'x' WHERE ...` must not silently drop the
+    // WHERE (which returned an unfiltered result). It is a typed parse error.
+    let err = parse_at_version("AT VERSION 'baseline' WHERE id = 1").unwrap_err();
+    match err {
+        GalaxError::SqlParse { message, .. } => {
+            assert!(
+                message.contains("final clause"),
+                "expected a 'must be the final clause' error, got: {message}"
+            );
+        }
+        other => panic!("expected SqlParse error, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_at_version_rejects_unknown_consistency_mode() {
+    let err = parse_at_version("AT VERSION 'x' CONSISTENCY 'BOGUS'").unwrap_err();
+    assert!(matches!(err, GalaxError::SqlParse { .. }));
+}
+
 // ── CREATE VERSION TAG ─────────────────────────────────────────────
 
 #[test]
