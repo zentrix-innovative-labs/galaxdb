@@ -2685,7 +2685,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-cluster"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "galaxdb-auth",
  "galaxdb-crypto",
