@@ -94,7 +94,7 @@ impl AwsKmsKeyProvider {
     /// environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
     /// `AWS_SESSION_TOKEN`, region via `GALAXDB_S3_REGION`/`AWS_REGION`/
     /// `AWS_DEFAULT_REGION`). `GALAXDB_KMS_ENDPOINT` overrides the host for
-    /// testing against a KMS-compatible mock.
+    /// testing against a KMS-compatible emulator.
     pub fn from_key_id(key_id: &str) -> GalaxResult<Self> {
         let access_key = require_env("AWS_ACCESS_KEY_ID")?;
         let secret_key = require_env("AWS_SECRET_ACCESS_KEY")?;

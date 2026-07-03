@@ -37,8 +37,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build (release)
-        run: cargo build --release
+      # Release-build only the shipped binaries. A full-workspace `--release`
+      # build LTO-links every binary (benchmarks, chaos, python, …) and, with
+      # `lto = "fat"` + `codegen-units = 1` over the DataFusion/Arrow/Lance
+      # graph, exceeds the runner's memory (OOM / exit 143). The debug test
+      # step below still compiles the entire workspace, so type/compile
+      # coverage is unchanged.
+      - name: Build server + sidecar (release)
+        run: cargo build --release -p galaxdb-server -p galaxdb-sidecar
 
       - name: Run tests
         run: cargo test --workspace --exclude galaxdb-python --lib

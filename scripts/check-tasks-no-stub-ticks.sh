@@ -99,12 +99,11 @@ if grep -rn 'NoOpVectorBackend' crates/ 2>/dev/null; then
   fail=1
 fi
 
-# Forbid AwsKmsKeyProvider as a struct/type anywhere production
-# (allow: doc comments that explicitly say "deliberately no AwsKmsKeyProvider")
-if grep -rn 'AwsKmsKeyProvider' crates/*/src 2>/dev/null | grep -v -E '//!|// |deliberately no'; then
-  echo "::error::'AwsKmsKeyProvider' present outside doc comments — Phase C tripwire."
-  fail=1
-fi
+# NOTE: the former Phase C tripwire forbidding `AwsKmsKeyProvider` in
+# production has been retired. Native cloud KMS (AWS/GCP/Azure over REST) is
+# now implemented in `crates/galaxdb-crypto/src/cloud_kms.rs` with real
+# GenerateDataKey/Decrypt calls and credential-gated integration tests, so the
+# provider types legitimately live in shipped code.
 
 if [[ $fail -ne 0 ]]; then
   echo

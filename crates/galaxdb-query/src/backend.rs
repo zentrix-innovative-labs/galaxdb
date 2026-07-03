@@ -526,7 +526,8 @@ mod tests {
     use arrow::datatypes::SchemaRef;
 
     /// A stub candidate provider standing in for the native HNSW backend
-    /// (engineering-principles §1: mocks only under `#[cfg(test)]`). It
+    /// (engineering-principles §1: test doubles live only under
+    /// `#[cfg(test)]`, as this one does). It
     /// returns a fixed matched subset of a `docs(id, category)` table plus a
     /// `similarity` column — exactly what the embedded provider produces from
     /// a real top-k search, so this test exercises the real analytical path
