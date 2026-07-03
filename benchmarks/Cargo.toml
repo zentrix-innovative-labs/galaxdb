@@ -10,6 +10,9 @@ galaxdb-common = { path = "../crates/galaxdb-common" }
 galaxdb-observe = { path = "../crates/galaxdb-observe" }
 galaxdb-storage = { path = "../crates/galaxdb-storage" }
 galaxdb-sql = { path = "../crates/galaxdb-sql" }
+# Full SQL frontend (native + DataFusion analytical path) for the analytical
+# benchmark (ClickBench-style aggregation + TPC-H-style star join).
+galaxdb-embedded = { path = "../crates/galaxdb-embedded" }
 galaxdb-io = { path = "../crates/galaxdb-io" }
 galaxdb-vector = { path = "../crates/galaxdb-vector" }
 galaxdb-sidecar = { path = "../crates/galaxdb-sidecar" }

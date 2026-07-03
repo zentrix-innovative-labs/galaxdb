@@ -338,8 +338,9 @@ WORKDIR="$1"
 source "$HOME/.cargo/env" 2>/dev/null || true
 cd "$WORKDIR"
 
-# Release build for the bench binary + the test suite.
-cargo build --release -p galaxdb-benchmarks --bin galaxdb-sift-bench
+# Release build for the bench binaries + the test suite.
+cargo build --release -p galaxdb-benchmarks \
+    --bin galaxdb-sift-bench --bin galaxdb-analytical-bench
 
 # Phase E baseline was 675 lib tests across 11 crates; the run passes
 # if that count comes back green. We exclude galaxdb-versioning from
@@ -398,6 +399,37 @@ cd "$WORKDIR"
 REMOTE_BENCH
 
 # ---------------------------------------------------------------------------
+# Step 7b: analytical query benchmark (HTAP task 27) — ClickBench-style
+# single-table aggregation + a TPC-H-style star join over real SST-backed
+# columnar storage. Deterministic synthetic dataset (seed fixed in the
+# binary), 10M fact rows at scale on the instance. Numbers are GalaxDB's own
+# analytical throughput, reproducible from the command below — not the
+# official ClickBench/TPC-H suites (see the binary's header).
+# ---------------------------------------------------------------------------
+
+echo "[7b/8] analytical query benchmark (aggregation + join)"
+ssh "${SSH_OPTS[@]}" "$SSH_USER@$PUBLIC_IP" \
+    bash -s -- \
+      "$REMOTE_WORKDIR" \
+      "$COMMIT_SHA" \
+      "$INSTANCE_TYPE_LABEL" \
+      "$RUN_TIMESTAMP_UTC" \
+      "${GALAXDB_ANALYTICAL_ROWS:-10000000}" <<'REMOTE_ANALYTICAL'
+set -euo pipefail
+WORKDIR="$1"; COMMIT="$2"; INST="$3"; TS="$4"; ROWS="$5"
+# shellcheck source=/dev/null
+source "$HOME/.cargo/env" 2>/dev/null || true
+cd "$WORKDIR"
+
+./target/release/galaxdb-analytical-bench \
+    --rows "$ROWS" \
+    --commit-sha "$COMMIT" \
+    --instance-type "$INST" \
+    --timestamp-utc "$TS" \
+    --output /mnt/nvme/galaxdb/analytical_bench.json
+REMOTE_ANALYTICAL
+
+# ---------------------------------------------------------------------------
 # Step 8: collect results.
 # ---------------------------------------------------------------------------
 
@@ -408,6 +440,9 @@ scp "${SSH_OPTS[@]}" \
 scp "${SSH_OPTS[@]}" \
     "$SSH_USER@$PUBLIC_IP:/mnt/nvme/galaxdb/sift_bench.json" \
     "$LOCAL_RESULTS_DIR/sift_bench.json"
+scp "${SSH_OPTS[@]}" \
+    "$SSH_USER@$PUBLIC_IP:/mnt/nvme/galaxdb/analytical_bench.json" \
+    "$LOCAL_RESULTS_DIR/analytical_bench.json"
 
 # Record the exact command/env that produced these results, so the
 # reproduction trail is complete without requiring the user to remember.
