@@ -891,13 +891,22 @@ impl Database {
                         "SEMANTIC_MATCH is not supported inside a transaction (v1)".into(),
                     ));
                 }
+                // A single-table SELECT whose only analytical feature is
+                // ORDER BY / LIMIT / OFFSET (over bare columns and literal
+                // counts) runs natively over the transaction buffer: scan
+                // (seeing the uncommitted writes the DataFusion path cannot),
+                // then sort + paginate the result in memory. This must be
+                // checked before the analytical rejection below.
+                if let Some(sort_limit) = galaxdb_sql::classify::simple_sort_limit(q) {
+                    return self.exec_txn_sorted_scan(q, &sort_limit, txn, session);
+                }
                 if matches!(
                     galaxdb_sql::classify::classify_query(q),
                     galaxdb_sql::classify::StatementClass::Analytical
                 ) {
                     return Err(GalaxError::FeatureNotSupported(
-                        "analytical queries (joins/aggregates/subqueries/ORDER BY/\
-                         LIMIT) are not supported inside an explicit transaction \
+                        "analytical queries (joins/aggregates/subqueries/GROUP BY/\
+                         DISTINCT) are not supported inside an explicit transaction \
                          (v1); the columnar analytical engine cannot see a \
                          transaction's uncommitted write buffer"
                             .into(),
@@ -917,6 +926,119 @@ impl Database {
                 "statement not supported inside a transaction (v1): {other}"
             ))),
         }
+    }
+
+    /// Native ORDER BY / LIMIT / OFFSET over the transaction buffer.
+    ///
+    /// A single-table SELECT whose only analytical feature is sort/pagination
+    /// cannot use the DataFusion analytical engine inside a transaction (that
+    /// engine reads committed columnar data and cannot see the uncommitted
+    /// write buffer). Instead we run the native filtered scan — which overlays
+    /// the transaction's writes — collect **all** columns so every sort key is
+    /// present, sort in memory with type-aware, NULL-aware comparison, apply
+    /// OFFSET then LIMIT, and finally project to the requested columns. This
+    /// yields correct read-your-writes ordering with no silent fallback.
+    fn exec_txn_sorted_scan(
+        &self,
+        q: &sqlparser::ast::Query,
+        sort_limit: &galaxdb_sql::classify::SortLimit,
+        txn: &galaxdb_sql::executor::TxnHandle,
+        session: Option<galaxdb_auth::SessionContext>,
+    ) -> GalaxResult<QueryResult> {
+        use galaxdb_sql::executor::{ExecuteResult, Row as SqlRow};
+
+        let (projection, filter) = extract_projection_and_filter(q);
+        // Scan all columns (empty projection) so ORDER BY keys are available
+        // even when they are not in the SELECT list.
+        let plan = QueryPlan::FullScan {
+            table: extract_table(q),
+            filter,
+            columns: Vec::new(),
+        };
+        let mut ctx = self.txn_context(txn, session);
+        let ExecuteResult::Rows { mut rows, .. } = execute_with_context(&plan, &mut ctx)? else {
+            // FullScan always yields Rows; anything else is a real bug, not a
+            // case to paper over.
+            return Err(GalaxError::Internal(
+                "in-transaction sorted scan expected row output".into(),
+            ));
+        };
+
+        // Type-aware, NULL-aware, multi-key sort. Null placement is absolute
+        // (NULLS FIRST/LAST), independent of ASC/DESC, per PostgreSQL.
+        rows.sort_by(|a, b| {
+            for key in &sort_limit.order_by {
+                let va = row_column(a, &key.column);
+                let vb = row_column(b, &key.column);
+                let a_null = matches!(va, None | Some(Value::Null));
+                let b_null = matches!(vb, None | Some(Value::Null));
+                let ord = match (a_null, b_null) {
+                    (true, true) => std::cmp::Ordering::Equal,
+                    (true, false) => {
+                        if key.nulls_first {
+                            std::cmp::Ordering::Less
+                        } else {
+                            std::cmp::Ordering::Greater
+                        }
+                    }
+                    (false, true) => {
+                        if key.nulls_first {
+                            std::cmp::Ordering::Greater
+                        } else {
+                            std::cmp::Ordering::Less
+                        }
+                    }
+                    (false, false) => {
+                        let c = value_cmp(va.unwrap(), vb.unwrap());
+                        if key.descending {
+                            c.reverse()
+                        } else {
+                            c
+                        }
+                    }
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+            }
+            std::cmp::Ordering::Equal
+        });
+
+        // OFFSET then LIMIT.
+        let offset = sort_limit.offset.unwrap_or(0);
+        let mut out: Vec<SqlRow> = rows.into_iter().skip(offset).collect();
+        if let Some(limit) = sort_limit.limit {
+            out.truncate(limit);
+        }
+
+        // Project to the requested columns (empty projection = SELECT *).
+        if !projection.is_empty() {
+            for row in &mut out {
+                row.columns = projection
+                    .iter()
+                    .map(|name| {
+                        let v = row
+                            .columns
+                            .iter()
+                            .find(|(k, _)| k == name)
+                            .map(|(_, v)| v.clone())
+                            .unwrap_or(Value::Null);
+                        (name.clone(), v)
+                    })
+                    .collect();
+            }
+        }
+
+        Ok(query_result_from(ExecuteResult::Rows {
+            columns: if projection.is_empty() {
+                out.first()
+                    .map(|r| r.columns.iter().map(|(k, _)| k.clone()).collect())
+                    .unwrap_or_default()
+            } else {
+                projection
+            },
+            rows: out,
+        }))
     }
 
     /// Build an [`ExecutorContext`] wired with every engine subsystem and
@@ -3102,7 +3224,7 @@ fn scalar_from_expr(e: &sqlparser::ast::Expr) -> GalaxResult<ScalarExpr> {
                 BinaryOperator::StringConcat => ArithOp::Concat,
                 other => {
                     return Err(GalaxError::FeatureNotSupported(format!(
-                        "binary operator {other:?} in a value expression"
+                        "binary operator '{other}' in a value expression"
                     )))
                 }
             };
@@ -3112,9 +3234,53 @@ fn scalar_from_expr(e: &sqlparser::ast::Expr) -> GalaxResult<ScalarExpr> {
                 right: Box::new(scalar_from_expr(right)?),
             })
         }
-        other => Err(GalaxError::FeatureNotSupported(format!(
-            "expression {other:?} is not supported in a value position"
+        // A clean, wire-friendly message: name the syntactic form rather than
+        // dumping the full parser AST. Still a typed error — never silent text.
+        Expr::Function(f) => Err(GalaxError::FeatureNotSupported(format!(
+            "function call '{}(...)' is not supported in a value position",
+            f.name
         ))),
+        other => Err(GalaxError::FeatureNotSupported(format!(
+            "expression '{other}' is not supported in a value position"
+        ))),
+    }
+}
+
+/// Look up a column's value in a result row by name.
+fn row_column<'a>(row: &'a SqlRow, name: &str) -> Option<&'a Value> {
+    row.columns.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+}
+
+/// Total order over [`Value`] for in-memory `ORDER BY` (the in-transaction
+/// sorted-scan path). Numeric types compare numerically (int/float mix
+/// promoted to float); text and blobs lexicographically; booleans false <
+/// true. Cross-type comparisons fall back to a stable per-variant rank so the
+/// sort is total and deterministic rather than panicking. NULLs are handled by
+/// the caller (absolute NULLS FIRST/LAST placement) and never reach here.
+fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    use Value::*;
+    match (a, b) {
+        (Integer(x), Integer(y)) => x.cmp(y),
+        (Float(x), Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Integer(x), Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Float(x), Integer(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
+        (Text(x), Text(y)) => x.cmp(y),
+        (Bool(x), Bool(y)) => x.cmp(y),
+        (Blob(x), Blob(y)) => x.cmp(y),
+        _ => value_type_rank(a).cmp(&value_type_rank(b)),
+    }
+}
+
+/// Stable per-variant rank used only to make cross-type `ORDER BY` total.
+fn value_type_rank(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Bool(_) => 1,
+        Value::Integer(_) | Value::Float(_) => 2,
+        Value::Text(_) => 3,
+        Value::Blob(_) => 4,
+        Value::Array(_) => 5,
     }
 }
 
@@ -4127,6 +4293,56 @@ mod tests {
             }
             other => panic!("expected Rows, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn in_txn_order_by_limit_reads_your_writes_sorted() {
+        // Regression: a single-table SELECT with ORDER BY/LIMIT inside a
+        // transaction used to be rejected as "analytical". It must now run
+        // natively over the txn buffer with read-your-writes ordering.
+        let mut db = test_db();
+        db.execute("CREATE TABLE t (id INT PRIMARY KEY, score INT)")
+            .unwrap();
+
+        let txn = db.begin_transaction().unwrap();
+        db.execute_in_txn("INSERT INTO t (id, score) VALUES (1, 30)", &txn, None)
+            .unwrap();
+        db.execute_in_txn("INSERT INTO t (id, score) VALUES (2, 10)", &txn, None)
+            .unwrap();
+        db.execute_in_txn("INSERT INTO t (id, score) VALUES (3, 20)", &txn, None)
+            .unwrap();
+
+        // ORDER BY score ASC over the uncommitted buffer.
+        let asc = db
+            .execute_in_txn("SELECT id FROM t ORDER BY score ASC", &txn, None)
+            .unwrap();
+        match asc {
+            QueryResult::Rows(rows) => {
+                let ids: Vec<String> = rows
+                    .iter()
+                    .map(|r| r.values.iter().find(|(k, _)| k == "id").unwrap().1.clone())
+                    .collect();
+                assert_eq!(ids, vec!["2", "3", "1"], "ascending by score");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+
+        // ORDER BY score DESC LIMIT 2.
+        let top2 = db
+            .execute_in_txn("SELECT id FROM t ORDER BY score DESC LIMIT 2", &txn, None)
+            .unwrap();
+        match top2 {
+            QueryResult::Rows(rows) => {
+                let ids: Vec<String> = rows
+                    .iter()
+                    .map(|r| r.values.iter().find(|(k, _)| k == "id").unwrap().1.clone())
+                    .collect();
+                assert_eq!(ids, vec!["1", "3"], "top-2 by score desc");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+
+        db.rollback_transaction(&txn);
     }
 
     #[test]
