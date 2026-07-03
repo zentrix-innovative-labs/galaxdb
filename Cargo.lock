@@ -2684,6 +2684,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "galaxdb-cluster"
+version = "0.2.0"
+dependencies = [
+ "galaxdb-auth",
+ "galaxdb-crypto",
+]
+
+[[package]]
 name = "galaxdb-common"
 version = "0.3.0"
 dependencies = [
@@ -2801,6 +2809,7 @@ dependencies = [
  "bytes",
  "futures-util",
  "galaxdb-auth",
+ "galaxdb-cluster",
  "galaxdb-common",
  "galaxdb-embedded",
  "galaxdb-observe",

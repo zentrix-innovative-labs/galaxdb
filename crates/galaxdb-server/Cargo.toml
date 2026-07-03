@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 galaxdb-common.workspace = true
 galaxdb-auth = { path = "../galaxdb-auth" }
+galaxdb-cluster.workspace = true
 galaxdb-sql = { path = "../galaxdb-sql" }
 galaxdb-embedded.workspace = true
 galaxdb-observe.workspace = true

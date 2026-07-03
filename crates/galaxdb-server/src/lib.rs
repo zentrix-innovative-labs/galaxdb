@@ -85,6 +85,12 @@ pub struct ServerConfig {
     /// concurrency, unless an explicit override is set here. Defaults to
     /// auto-tune enabled with no overrides.
     pub auto_tune: galaxdb_common::AutoTuneConfig,
+    /// Pluggable provider bundle (task 16). When `None` the server uses
+    /// [`galaxdb_cluster::Providers::single_node_default`] — the all-OSS
+    /// default with trusted-local security, no TDE, and a single-node
+    /// coordinator. Enterprise editions supply their own bundle here; the
+    /// engine never names an enterprise type.
+    pub providers: Option<galaxdb_cluster::Providers>,
 }
 
 impl Default for ServerConfig {
@@ -103,6 +109,7 @@ impl Default for ServerConfig {
             tls_key_path: None,
             audit_log_path: None,
             auto_tune: galaxdb_common::AutoTuneConfig::default(),
+            providers: None,
         }
     }
 }
@@ -153,6 +160,21 @@ pub async fn start(
         addr = %local_addr,
         data_dir = %config.data_dir,
         "GalaxDB server started"
+    );
+
+    // Task 16: resolve the provider bundle. When `None` the OSS default is
+    // used (trusted-local security, no TDE, single-node coordinator). The
+    // bundle is resolved once at startup; its `Arc` fields are cheap to
+    // clone into each connection.
+    let providers = config
+        .providers
+        .clone()
+        .unwrap_or_else(galaxdb_cluster::Providers::single_node_default);
+    tracing::info!(
+        coordinator = %providers.cluster.name(),
+        coordinator_is_leader = providers.cluster.is_leader(),
+        tde = providers.key_spec.is_some(),
+        "provider bundle resolved"
     );
 
     // Task 4 (Req 4): build the security audit sink. A JSONL file when

@@ -1,0 +1,11 @@
+[package]
+name = "galaxdb-cluster"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cluster coordinator seam + Providers bundle registry (semver-stable extension API)"
+
+[dependencies]
+galaxdb-auth.workspace = true
+galaxdb-crypto.workspace = true

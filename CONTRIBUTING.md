@@ -69,6 +69,20 @@ bash scripts/check-tasks-no-stub-ticks.sh
 cargo deny check
 ```
 
+## Extension seams (stable public API)
+
+GalaxDB's open core exposes a set of **trait seams** that an enterprise edition (or a third party) implements without forking the engine. These traits are a **semver-stable public API**: a breaking change to any of them is a semver-major bump of the owning crate, which is the signal downstream pins build against.
+
+| Seam | Crate | Bundled OSS implementation |
+|------|-------|----------------------------|
+| `Authenticator` | `galaxdb-auth` | `ScramAuthenticator`, `TrustedLocalAuthenticator` |
+| `Authorizer` | `galaxdb-auth` | `TableGrantAuthorizer`, `SuperuserBypassAuthorizer` |
+| `AuditSink` | `galaxdb-auth` | `NoOpAuditSink`, `FileAuditSink` |
+| `KeyProvider` | `galaxdb-crypto` | local / env / external-command / Vault |
+| `ClusterCoordinator` | `galaxdb-cluster` | `SingleNodeCoordinator` (no-op, standalone) |
+
+Implementations are selected at process start through the `galaxdb_cluster::Providers` bundle passed to `galaxdb_server::start()`. The open core never names an enterprise type, and `cargo deny` blocks any `galaxdb-enterprise*` crate from entering the OSS dependency graph. When you change one of these traits, treat it as a public-API change: document the change and bump the owning crate's version accordingly.
+
 ## Pull request process
 
 1. Fork the repo and create a branch from `main`.
