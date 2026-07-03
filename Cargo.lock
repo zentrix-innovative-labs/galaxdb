@@ -2652,6 +2652,7 @@ dependencies = [
  "clap",
  "futures-util",
  "galaxdb-common",
+ "galaxdb-embedded",
  "galaxdb-io",
  "galaxdb-observe",
  "galaxdb-server",
