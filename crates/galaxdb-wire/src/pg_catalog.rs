@@ -33,35 +33,211 @@ pub fn try_handle_pg_catalog(sql: &str) -> Option<PgCatalogResult> {
         return None;
     }
 
-    // pg_class — table listing
-    if upper.contains("PG_CLASS") {
-        return Some(handle_pg_class());
+    // Build the full stub table for the targeted catalog relation, then
+    // refine it with the query's WHERE / projection / COUNT(*) so a query
+    // like `SELECT oid FROM pg_type WHERE typname = 'int4'` returns exactly
+    // the matching row/column instead of the whole table.
+    let full = if upper.contains("PG_CLASS") {
+        handle_pg_class()
+    } else if upper.contains("PG_ATTRIBUTE") {
+        handle_pg_attribute()
+    } else if upper.contains("PG_TYPE") {
+        handle_pg_type()
+    } else if upper.contains("PG_NAMESPACE") {
+        handle_pg_namespace()
+    } else if upper.contains("PG_DATABASE") {
+        handle_pg_database()
+    } else {
+        // Unsupported pg_catalog table — return empty result set
+        return Some(PgCatalogResult {
+            columns: vec![],
+            rows: vec![],
+        });
+    };
+
+    Some(refine_with_query(sql, full))
+}
+
+/// Apply the SELECT's WHERE, projection, and `COUNT(*)` to a fully-populated
+/// stub table. Uses a real SQL parse; if the query shape is not one we can
+/// faithfully evaluate (joins, casts, functions other than COUNT(*), or an
+/// unsupported WHERE), we return the full table unchanged — a safe superset
+/// for driver introspection, never a wrong-but-plausible subset.
+fn refine_with_query(sql: &str, full: PgCatalogResult) -> PgCatalogResult {
+    use sqlparser::ast::{SetExpr, Statement};
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let Ok(stmts) = Parser::parse_sql(&PostgreSqlDialect {}, sql) else {
+        return full;
+    };
+    let Some(Statement::Query(q)) = stmts.into_iter().next() else {
+        return full;
+    };
+    let SetExpr::Select(select) = q.body.as_ref() else {
+        return full;
+    };
+
+    // 1. WHERE filtering (equality / AND over the stub columns).
+    let mut rows = full.rows.clone();
+    if let Some(pred) = &select.selection {
+        match apply_where(pred, &full.columns, &rows) {
+            Some(filtered) => rows = filtered,
+            None => return full, // unsupported predicate → safe superset
+        }
     }
 
-    // pg_attribute — column metadata
-    if upper.contains("PG_ATTRIBUTE") {
-        return Some(handle_pg_attribute());
+    // 2. Projection: COUNT(*), explicit columns, or wildcard.
+    apply_projection(&select.projection, &full.columns, rows).unwrap_or(full)
+}
+
+/// Column index (case-insensitive) for a name.
+fn column_index(columns: &[ColumnDesc], name: &str) -> Option<usize> {
+    columns
+        .iter()
+        .position(|c| c.name.eq_ignore_ascii_case(name))
+}
+
+/// Evaluate a supported WHERE predicate against the stub rows. Supports
+/// `col = literal`, `col <> literal`, and `AND` of those. Returns `None` for
+/// any other shape so the caller can safely return the full table.
+fn apply_where(
+    pred: &sqlparser::ast::Expr,
+    columns: &[ColumnDesc],
+    rows: &[PgCatalogRow],
+) -> Option<Vec<PgCatalogRow>> {
+    use sqlparser::ast::{BinaryOperator, Expr};
+
+    match pred {
+        Expr::BinaryOp { left, op, right } => match op {
+            BinaryOperator::And => {
+                let first = apply_where(left, columns, rows)?;
+                apply_where(right, columns, &first)
+            }
+            BinaryOperator::Eq | BinaryOperator::NotEq => {
+                let (col, lit) = binop_col_and_literal(left, right)?;
+                let idx = column_index(columns, &col)?;
+                let want_eq = matches!(op, BinaryOperator::Eq);
+                Some(
+                    rows.iter()
+                        .filter(|row| {
+                            let cell = row.get(idx).and_then(|v| v.as_deref()).unwrap_or("");
+                            (cell == lit) == want_eq
+                        })
+                        .cloned()
+                        .collect(),
+                )
+            }
+            _ => None,
+        },
+        // Parenthesised predicate.
+        Expr::Nested(inner) => apply_where(inner, columns, rows),
+        _ => None,
+    }
+}
+
+/// Extract `(column_name, literal_text)` from the two sides of a binary
+/// comparison, in either order (`col = 'x'` or `'x' = col`).
+fn binop_col_and_literal(
+    left: &sqlparser::ast::Expr,
+    right: &sqlparser::ast::Expr,
+) -> Option<(String, String)> {
+    let col = |e: &sqlparser::ast::Expr| match e {
+        sqlparser::ast::Expr::Identifier(id) => Some(id.value.clone()),
+        sqlparser::ast::Expr::CompoundIdentifier(parts) => {
+            parts.last().map(|p| p.value.clone())
+        }
+        _ => None,
+    };
+    let lit = |e: &sqlparser::ast::Expr| match e {
+        sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s))
+        | sqlparser::ast::Expr::Value(sqlparser::ast::Value::DoubleQuotedString(s)) => {
+            Some(s.clone())
+        }
+        sqlparser::ast::Expr::Value(sqlparser::ast::Value::Number(n, _)) => Some(n.clone()),
+        _ => None,
+    };
+    if let (Some(c), Some(l)) = (col(left), lit(right)) {
+        return Some((c, l));
+    }
+    if let (Some(c), Some(l)) = (col(right), lit(left)) {
+        return Some((c, l));
+    }
+    None
+}
+
+/// Apply the projection list. Returns `None` (caller falls back to the full
+/// table) if any item is neither `*`, a bare column, nor `COUNT(*)`.
+fn apply_projection(
+    projection: &[sqlparser::ast::SelectItem],
+    columns: &[ColumnDesc],
+    rows: Vec<PgCatalogRow>,
+) -> Option<PgCatalogResult> {
+    use sqlparser::ast::{Expr, FunctionArguments, SelectItem};
+
+    // COUNT(*) — a single aggregate item.
+    if projection.len() == 1 {
+        if let SelectItem::UnnamedExpr(Expr::Function(f))
+        | SelectItem::ExprWithAlias {
+            expr: Expr::Function(f),
+            ..
+        } = &projection[0]
+        {
+            if f.name.to_string().eq_ignore_ascii_case("count") {
+                // COUNT(*) or COUNT(<one arg>) over the stub → row count.
+                let is_countable = match &f.args {
+                    FunctionArguments::List(list) => list.args.len() == 1,
+                    _ => false,
+                };
+                if is_countable {
+                    return Some(PgCatalogResult {
+                        columns: vec![ColumnDesc::int4("count")],
+                        rows: vec![vec![Some(rows.len().to_string())]],
+                    });
+                }
+            }
+        }
     }
 
-    // pg_type — type system
-    if upper.contains("PG_TYPE") {
-        return Some(handle_pg_type());
+    // Wildcard anywhere → all columns.
+    if projection
+        .iter()
+        .any(|item| matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)))
+    {
+        return Some(PgCatalogResult {
+            columns: columns.to_vec(),
+            rows,
+        });
     }
 
-    // pg_namespace — schema listing
-    if upper.contains("PG_NAMESPACE") {
-        return Some(handle_pg_namespace());
+    // Explicit column list: every item must resolve to a known column.
+    let mut indices = Vec::with_capacity(projection.len());
+    let mut out_cols = Vec::with_capacity(projection.len());
+    for item in projection {
+        let name = match item {
+            SelectItem::UnnamedExpr(Expr::Identifier(id)) => id.value.clone(),
+            SelectItem::UnnamedExpr(Expr::CompoundIdentifier(parts)) => {
+                parts.last()?.value.clone()
+            }
+            SelectItem::ExprWithAlias {
+                expr: Expr::Identifier(id),
+                ..
+            } => id.value.clone(),
+            _ => return None,
+        };
+        let idx = column_index(columns, &name)?;
+        indices.push(idx);
+        out_cols.push(columns[idx].clone());
     }
 
-    // pg_database — database listing
-    if upper.contains("PG_DATABASE") {
-        return Some(handle_pg_database());
-    }
+    let out_rows = rows
+        .into_iter()
+        .map(|row| indices.iter().map(|&i| row.get(i).cloned().flatten()).collect())
+        .collect();
 
-    // Unsupported pg_catalog table — return empty result set
     Some(PgCatalogResult {
-        columns: vec![],
-        rows: vec![],
+        columns: out_cols,
+        rows: out_rows,
     })
 }
 
@@ -208,6 +384,49 @@ mod tests {
         let result = try_handle_pg_catalog("SELECT * FROM pg_catalog.pg_settings").unwrap();
         assert!(result.columns.is_empty());
         assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn pg_type_where_filters_to_one_row() {
+        let r = try_handle_pg_catalog("SELECT oid, typname FROM pg_catalog.pg_type WHERE typname = 'int4'").unwrap();
+        assert_eq!(r.rows.len(), 1, "WHERE must filter to the single matching type");
+        // projection is oid, typname in that order
+        assert_eq!(r.columns.len(), 2);
+        assert_eq!(r.columns[0].name, "oid");
+        assert_eq!(r.columns[1].name, "typname");
+        assert_eq!(r.rows[0][0].as_deref(), Some("23"));
+        assert_eq!(r.rows[0][1].as_deref(), Some("int4"));
+    }
+
+    #[test]
+    fn pg_type_count_star_returns_scalar() {
+        let full = try_handle_pg_catalog("SELECT * FROM pg_catalog.pg_type").unwrap();
+        let cnt = try_handle_pg_catalog("SELECT COUNT(*) FROM pg_catalog.pg_type").unwrap();
+        assert_eq!(cnt.columns.len(), 1);
+        assert_eq!(cnt.columns[0].name, "count");
+        assert_eq!(cnt.rows.len(), 1);
+        assert_eq!(cnt.rows[0][0].as_deref(), Some(full.rows.len().to_string().as_str()));
+    }
+
+    #[test]
+    fn pg_type_count_star_with_where_counts_filtered() {
+        let cnt = try_handle_pg_catalog("SELECT COUNT(*) FROM pg_type WHERE typname = 'uuid'").unwrap();
+        assert_eq!(cnt.rows[0][0].as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn pg_type_projection_single_column() {
+        let r = try_handle_pg_catalog("SELECT typname FROM pg_type WHERE oid = 25").unwrap();
+        assert_eq!(r.columns.len(), 1);
+        assert_eq!(r.columns[0].name, "typname");
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0][0].as_deref(), Some("text"));
+    }
+
+    #[test]
+    fn pg_type_unmatched_where_returns_no_rows() {
+        let r = try_handle_pg_catalog("SELECT oid FROM pg_type WHERE typname = 'nonesuch'").unwrap();
+        assert!(r.rows.is_empty());
     }
 
     #[test]

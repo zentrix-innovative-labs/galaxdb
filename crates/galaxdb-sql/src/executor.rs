@@ -1090,6 +1090,44 @@ fn exec_insert(
     let key = row_codec::build_primary_key(table, &table_entry, &ordered)?;
     let value_bytes = row_codec::encode_row(&ordered);
 
+    // PRIMARY KEY uniqueness (SQLSTATE 23505). When the table declares a
+    // primary key, an INSERT whose key already maps to a live row is rejected
+    // rather than silently overwriting it. The existence check honors MVCC:
+    // inside a transaction it consults the read-your-writes overlay (buffered
+    // insert = exists, buffered delete = free) then the snapshot; on the
+    // autocommit path it checks the latest committed state. Tombstones
+    // (deleted rows) do not count as existing, so DELETE-then-INSERT of the
+    // same key succeeds.
+    if let Some(pk_col) = table_entry.columns.iter().find(|c| c.primary_key) {
+        let exists = if let Some(txn) = ctx.txn.as_ref() {
+            match txn
+                .writes
+                .lock()
+                .expect("txn writes lock")
+                .get(&key)
+                .cloned()
+            {
+                Some(Some(_)) => true,  // buffered insert/update in this txn
+                Some(None) => false,    // buffered delete (tombstone)
+                None => ctx.engine.get_at(&key, txn.read_ts).is_some(),
+            }
+        } else {
+            ctx.engine.get(&key).is_some()
+        };
+        if exists {
+            let pk_value = ordered
+                .iter()
+                .find(|(n, _)| n == &pk_col.name)
+                .map(|(_, v)| row_codec::value_display(v))
+                .unwrap_or_default();
+            return Err(GalaxError::UniqueViolation {
+                table: table.to_string(),
+                column: pk_col.name.clone(),
+                value: pk_value,
+            });
+        }
+    }
+
     // Inside an explicit transaction: buffer the write (read-your-writes via
     // the overlay) and apply atomically at COMMIT — do not touch the engine
     // (HTAP Phase 5, design §3.6.1). Secondary-index/sidecar hooks for

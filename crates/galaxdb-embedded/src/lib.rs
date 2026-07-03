@@ -1513,6 +1513,14 @@ impl Database {
         q: &sqlparser::ast::Query,
         session: Option<&galaxdb_auth::SessionContext>,
     ) -> GalaxResult<QueryResult> {
+        // FROM-less scalar SELECT (`SELECT 1 + 1`, `version()`,
+        // `current_database()`): evaluate directly, never route to the
+        // analytical engine.
+        if is_from_less_select(q) {
+            let user = session.map(|s| s.role.id.as_str().to_string());
+            return eval_scalar_select(q, user.as_deref());
+        }
+
         // Detect SEMANTIC_MATCH in WHERE and route to vector search.
         if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
             // SEMANTIC_MATCH combined with analytical clauses (JOIN / GROUP BY
@@ -2184,6 +2192,18 @@ impl Database {
     }
 
     fn exec_select(&mut self, q: &sqlparser::ast::Query) -> GalaxResult<QueryResult> {
+        // FROM-less scalar SELECT (`SELECT 1 + 1`, `SELECT version()`,
+        // `SELECT current_database()`): evaluate the projection directly.
+        // These have no base table, so they must not reach the analytical
+        // engine (which would error "references no base table").
+        if is_from_less_select(q) {
+            let user = self
+                .session
+                .as_ref()
+                .map(|s| s.role.id.as_str().to_string());
+            return eval_scalar_select(q, user.as_deref());
+        }
+
         let table = extract_table(q);
 
         // Detect SEMANTIC_MATCH(...) in the WHERE clause and route to
@@ -3303,6 +3323,119 @@ fn value_type_rank(v: &Value) -> u8 {
     }
 }
 
+/// Is `q` a `SELECT` with no `FROM` clause (a scalar/constant projection such
+/// as `SELECT 1 + 1`, `SELECT version()`, `SELECT current_database()`)?
+fn is_from_less_select(q: &sqlparser::ast::Query) -> bool {
+    matches!(
+        q.body.as_ref(),
+        sqlparser::ast::SetExpr::Select(s) if s.from.is_empty()
+    )
+}
+
+/// Evaluate a FROM-less scalar `SELECT` into a single result row.
+///
+/// Each projection item is a constant/arithmetic expression (evaluated by the
+/// [`ScalarExpr`] evaluator against an empty row) or one of the common
+/// PostgreSQL session functions (`version()`, `current_database()`,
+/// `current_user`, `current_schema`, …). Anything else is a typed
+/// [`GalaxError::FeatureNotSupported`] — never a silent wrong value. The
+/// output column is named after an explicit alias, else the function/column
+/// name, else `?column?` (matching PostgreSQL).
+fn eval_scalar_select(
+    q: &sqlparser::ast::Query,
+    current_user: Option<&str>,
+) -> GalaxResult<QueryResult> {
+    use sqlparser::ast::{SelectItem, SetExpr};
+
+    let SetExpr::Select(select) = q.body.as_ref() else {
+        return Err(GalaxError::FeatureNotSupported(
+            "unsupported FROM-less query form".to_string(),
+        ));
+    };
+    if select.selection.is_some() {
+        return Err(GalaxError::FeatureNotSupported(
+            "WHERE is not supported without a FROM clause".to_string(),
+        ));
+    }
+
+    let mut columns: Vec<(String, Value)> = Vec::with_capacity(select.projection.len());
+    for (i, item) in select.projection.iter().enumerate() {
+        let (expr, alias) = match item {
+            SelectItem::UnnamedExpr(e) => (e, None),
+            SelectItem::ExprWithAlias { expr, alias } => (expr, Some(alias.value.clone())),
+            other => {
+                return Err(GalaxError::FeatureNotSupported(format!(
+                    "unsupported projection item without a FROM clause: {other}"
+                )))
+            }
+        };
+        let value = eval_scalar_projection_expr(expr, current_user)?;
+        let name = alias
+            .or_else(|| scalar_output_name(expr))
+            .unwrap_or_else(|| format!("?column?{}", if i == 0 { String::new() } else { i.to_string() }));
+        columns.push((name, value));
+    }
+
+    let col_names: Vec<String> = columns.iter().map(|(k, _)| k.clone()).collect();
+    Ok(query_result_from(ExecuteResult::Rows {
+        columns: col_names,
+        rows: vec![SqlRow { columns }],
+    }))
+}
+
+/// Evaluate one FROM-less projection expression.
+fn eval_scalar_projection_expr(
+    expr: &sqlparser::ast::Expr,
+    current_user: Option<&str>,
+) -> GalaxResult<Value> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Function(f) => eval_builtin_function(&f.name.to_string(), current_user),
+        // `current_user` / `current_schema` parse as bare identifiers/keywords
+        // in some positions.
+        Expr::Identifier(id) => eval_builtin_function(&id.value, current_user),
+        // Constant / arithmetic / concat — reuse the scalar evaluator.
+        _ => scalar_from_expr(expr).and_then(|s| s.eval(&[])),
+    }
+}
+
+/// The PostgreSQL session/informational functions GalaxDB answers for
+/// FROM-less SELECTs. Unknown functions are a typed error.
+fn eval_builtin_function(name: &str, current_user: Option<&str>) -> GalaxResult<Value> {
+    let n = name.to_ascii_lowercase();
+    let user = current_user.unwrap_or("galaxdb");
+    let v = match n.as_str() {
+        // Reported to match the wire handshake's server_version, with a
+        // PostgreSQL-compatible prefix so drivers that sniff version() work.
+        "version" => Value::Text(format!(
+            "PostgreSQL 16.0.0-galaxdb, GalaxDB {} (HTAP)",
+            env!("CARGO_PKG_VERSION")
+        )),
+        "current_database" | "current_catalog" => Value::Text("galaxdb".to_string()),
+        "current_schema" => Value::Text("public".to_string()),
+        "current_user" | "session_user" | "user" | "current_role" => {
+            Value::Text(user.to_string())
+        }
+        other => {
+            return Err(GalaxError::FeatureNotSupported(format!(
+                "function '{other}()' is not supported in a FROM-less SELECT"
+            )))
+        }
+    };
+    Ok(v)
+}
+
+/// Output column name for a FROM-less projection expression (PostgreSQL names
+/// it after the function or column; expressions get `?column?`).
+fn scalar_output_name(expr: &sqlparser::ast::Expr) -> Option<String> {
+    use sqlparser::ast::Expr;
+    match expr {
+        Expr::Function(f) => Some(f.name.to_string().to_ascii_lowercase()),
+        Expr::Identifier(id) => Some(id.value.to_ascii_lowercase()),
+        _ => None,
+    }
+}
+
 fn query_result_from(r: ExecuteResult) -> QueryResult {
     match r {
         ExecuteResult::Rows { rows, .. } => QueryResult::Rows(
@@ -4285,6 +4418,78 @@ mod tests {
     fn select_nonexistent_fails() {
         let mut db = test_db();
         assert!(db.execute("SELECT * FROM nope").is_err());
+    }
+
+    #[test]
+    fn duplicate_primary_key_is_rejected_not_overwritten() {
+        let mut db = test_db();
+        db.execute("CREATE TABLE pk (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.execute("INSERT INTO pk (id, v) VALUES (1, 'a')").unwrap();
+        let err = db.execute("INSERT INTO pk (id, v) VALUES (1, 'b')").unwrap_err();
+        assert!(
+            matches!(err, GalaxError::UniqueViolation { .. }),
+            "second insert of the same PK must be a unique violation, got {err:?}"
+        );
+        // The original row is intact — no silent overwrite.
+        match db.execute("SELECT v FROM pk WHERE id = 1").unwrap() {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values.iter().find(|(k, _)| k == "v").unwrap().1, "a");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_then_reinsert_same_pk_succeeds() {
+        let mut db = test_db();
+        db.execute("CREATE TABLE pk (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.execute("INSERT INTO pk (id, v) VALUES (1, 'a')").unwrap();
+        db.execute("DELETE FROM pk WHERE id = 1").unwrap();
+        // Re-inserting a deleted key is allowed (tombstone is not "exists").
+        db.execute("INSERT INTO pk (id, v) VALUES (1, 'b')").unwrap();
+        match db.execute("SELECT v FROM pk WHERE id = 1").unwrap() {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows[0].values.iter().find(|(k, _)| k == "v").unwrap().1, "b");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_less_scalar_select_evaluates() {
+        let mut db = test_db();
+        // arithmetic
+        match db.execute("SELECT 1 + 1").unwrap() {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].values[0].1, "2");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+        // version() — PostgreSQL-compatible prefix
+        match db.execute("SELECT version()").unwrap() {
+            QueryResult::Rows(rows) => {
+                assert!(rows[0].values[0].1.starts_with("PostgreSQL"));
+                assert!(rows[0].values[0].1.contains("GalaxDB"));
+                assert_eq!(rows[0].values[0].0, "version");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+        // current_database()
+        match db.execute("SELECT current_database()").unwrap() {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows[0].values[0].1, "galaxdb");
+            }
+            other => panic!("expected Rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn from_less_unsupported_function_is_typed_error() {
+        let mut db = test_db();
+        let err = db.execute("SELECT pg_sleep(1)").unwrap_err();
+        assert!(matches!(err, GalaxError::FeatureNotSupported(_)));
     }
 
     #[test]

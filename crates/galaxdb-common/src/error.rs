@@ -62,6 +62,17 @@ pub enum GalaxError {
     #[error("cannot update embedding source column '{column}'; use DELETE + INSERT instead")]
     EmbeddingSourceUpdate { column: String },
 
+    /// An INSERT would create a second row with a primary-key value that
+    /// already exists. GalaxDB enforces PRIMARY KEY uniqueness — the write is
+    /// rejected rather than silently overwriting the existing row (SQLSTATE
+    /// 23505 unique_violation).
+    #[error("duplicate key value violates primary key of table '{table}': key ({column})=({value}) already exists")]
+    UniqueViolation {
+        table: String,
+        column: String,
+        value: String,
+    },
+
     /// A DELETE or UPDATE targeted an append-only system table. Append-
     /// only tables (e.g. `_galaxdb_training_exports`, Req 38 / task 36)
     /// reject any mutation beyond INSERT so the lineage they record
@@ -222,6 +233,9 @@ impl GalaxError {
             // Class 42 — restricted/generated column update (the embedding
             // source column behaves like a GENERATED ALWAYS column).
             GalaxError::EmbeddingSourceUpdate { .. } => "428C9", // generated_always
+
+            // Class 23 — integrity constraint violation.
+            GalaxError::UniqueViolation { .. } => "23505", // unique_violation
 
             // Class 58 — system error (I/O, corruption).
             GalaxError::Io(_)
