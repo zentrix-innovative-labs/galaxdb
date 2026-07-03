@@ -12,14 +12,14 @@ All numbers in this document are measured on real hardware against real datasets
 Source: `ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz`  
 SHA256: `92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a`
 
-**Build:** M=16, ef_construction=200 → 64.0 s (15,631 vec/sec)
+**Build:** M=16, ef_construction=200 → 65.4 s (15,295 vec/sec)
 
 | ef_search | recall@10 | mean latency | p99 latency |
 |-----------|-----------|--------------|-------------|
-| 10        | 0.759     | 50.0 µs      | 92 µs       |
-| 50        | 0.959     | 143.3 µs     | 208 µs      |
-| 100       | 0.983     | 246.6 µs     | 334 µs      |
-| **200**   | **0.990** | **432.1 µs** | **572 µs**  |
+| 10        | 0.756     | 57.7 µs      | 105 µs      |
+| 50        | 0.959     | 156.7 µs     | 229 µs      |
+| 100       | 0.983     | 266.7 µs     | 364 µs      |
+| **200**   | **0.990** | **458.9 µs** | **612 µs**  |
 
 **Reproducing these numbers:**
 
@@ -35,21 +35,31 @@ cargo build --release -p galaxdb-benchmarks
     --output bench-results/sift_bench.json
 ```
 
-> Verified 2026-06-25, commit `f1825c5`, against the SHA256-pinned SIFT-1M dataset.
-> Full provenance JSON: `bench-results/aws-live-20260625/sift_bench.json`.
+> Verified 2026-07-03, commit `6c7811f` (v0.3.0 line), against the SHA256-pinned SIFT-1M dataset.
+> Full provenance JSON: `bench-results/20260703T083602Z/sift_bench.json`. The HNSW path is
+> unchanged by the later SQL/durability fixes, so these numbers hold for v0.3.0. A prior run at
+> `f1825c5` (2026-06-25) gave statistically identical recall (see
+> `bench-results/aws-live-20260625/`).
 
 ---
 
 ## Test Suite — release (AWS c6id.4xlarge)
 
-Confirmed on the same hardware as the vector benchmarks, release build, commit `f1825c5`
-(2026-06-25):
+Confirmed on the same hardware as the vector benchmarks, release build, commit `6c7811f`
+(2026-07-03), `cargo test --release --lib` across 10 crates. Full log:
+`bench-results/20260703T083602Z/`:
 
 | Metric | Result |
 |--------|--------|
-| Rust tests (common, crypto, storage, sql, embedded, vector, wire) | **730 passed / 0 failed** |
-| ↳ includes storage `compaction_driver` (5) + `mvcc_timestamps` (3) integration tests | |
+| Rust tests (common, crypto, storage, sql, embedded, vector, wire, query, …) | **823 passed / 0 failed** |
+| ↳ includes buffered transactions (snapshot isolation + savepoints), analytical `AT VERSION`, columnar `force_compact` rewrite, `result_codec` binary encoding, and the SQL conformance corpus | |
 | Credential-gated cloud-KMS / Vault integration tests | skipped cleanly (no creds) |
+
+> Note: the v0.3.0 production-hardening fixes landed after this run (real UPDATE/INSERT expression
+> evaluation, in-transaction `ORDER BY`/`LIMIT`, `PRIMARY KEY` uniqueness, `pg_catalog`
+> WHERE/projection/COUNT, FROM-less scalar `SELECT`, and durable catalog persistence). They add
+> unit + integration tests that pass locally under `-D warnings`; the next AWS run will fold them
+> into the on-hardware count.
 
 ---
 

@@ -127,6 +127,38 @@ RESTORE FROM '/path/to/backup';
 
 ---
 
+## It's a real SQL database
+
+Alongside the AI primitives, GalaxDB is a transactional, analytical relational engine — not a
+vector store with a SQL veneer.
+
+```sql
+-- Transactions with snapshot isolation, read-your-writes, and savepoints
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;   -- expressions are evaluated
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+SAVEPOINT before_fee;
+UPDATE accounts SET balance = balance - 5 WHERE id = 1;
+ROLLBACK TO before_fee;
+COMMIT;
+
+-- Analytical queries: joins, aggregates, GROUP BY / HAVING, DISTINCT, ORDER BY / LIMIT
+SELECT d.name, COUNT(*), AVG(e.salary)
+FROM employees e JOIN departments d ON e.dept = d.name
+GROUP BY d.name
+HAVING COUNT(*) > 1
+ORDER BY AVG(e.salary) DESC
+LIMIT 10;
+```
+
+Constraints are enforced (a duplicate `PRIMARY KEY` is rejected with SQLSTATE `23505`, never a
+silent overwrite), arithmetic errors are typed (`22012` division-by-zero, `22003` overflow), and
+the schema is **durable** — tables, storage modes, and constraints survive a restart. Analytical
+queries run on an embedded DataFusion engine; single-table point reads, scans, and vector search
+run on the native path.
+
+---
+
 ## Performance
 
 Measured on AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM, 884 GB NVMe), release build.
@@ -135,9 +167,9 @@ Measured on AWS c6id.4xlarge (Intel Xeon Platinum 8375C, 16 vCPU, 32 GiB RAM, 88
 
 | ef_search | recall@10 | mean latency | p99 latency |
 |-----------|-----------|--------------|-------------|
-| 50        | 0.959     | 143 µs       | 208 µs      |
-| 100       | 0.983     | 247 µs       | 334 µs      |
-| **200**   | **0.990** | **432 µs**   | **572 µs**  |
+| 50        | 0.959     | 157 µs       | 229 µs      |
+| 100       | 0.983     | 267 µs       | 364 µs      |
+| **200**   | **0.990** | **459 µs**   | **612 µs**  |
 
 For methodology and the full SIFT-1M run, see the [GalaxDB paper on Zenodo](https://doi.org/10.5281/zenodo.20355229).
 
@@ -155,7 +187,7 @@ Measured with GalaxDB and PostgreSQL 16.14 on the **same instance-store NVMe** (
 
 On durable single-client and low-concurrency writes GalaxDB is competitive with PostgreSQL (within ~12%); PostgreSQL's mature process-per-connection model still scales better past 8 concurrent clients. Bulk ingestion via `COPY` reaches 190k rows/s (25.97× row-by-row INSERT). The in-memory storage path (memtable + ART) sustains ~1.9M rows/s when an fsync is amortized across a batch. See [BENCHMARKS.md](docs/BENCHMARKS.md) for reproduction commands.
 
-**730 Rust tests passing (`--release`, AWS c6id.4xlarge, commit `f1825c5`).**
+**823 Rust tests passing (`--release`, AWS c6id.4xlarge, commit `6c7811f`).**
 
 
 ---
@@ -255,15 +287,25 @@ docker run -p 5433:5433 -p 9090:9090 -v /data:/data \
   harbi256/galaxdb:latest --data-dir /data
 ```
 
+### Windows
+
+- **Python (embedded + client):** `pip install galaxdb-client` — a native `win_amd64` wheel is
+  published, so embedded mode and the remote client work on Windows out of the box.
+- **Server:** run it under **Docker Desktop (WSL2 backend)** with the Docker command above, or use
+  the native `galaxdb-server-windows-x86_64.exe` attached to each release (from v0.3.1 onward). The
+  server is cross-platform Rust (rustls, no OpenSSL; Linux-only io_uring falls back to tokio), and CI
+  builds `galaxdb-server` on a native Windows runner on every change.
+
 ### GitHub Releases
 
-Download pre-built binaries for Linux x86-64 and macOS x86-64 from the [Releases page](https://github.com/zentrix-innovative-labs/galaxdb/releases).
+Download pre-built `galaxdb-server` binaries for Linux (x86-64, aarch64), macOS (x86-64, arm64), and
+Windows x86-64 from the [Releases page](https://github.com/zentrix-innovative-labs/galaxdb/releases).
 
 ### Rust (embed in your application)
 
 ```toml
 [dependencies]
-galaxdb-embedded = "1.0.0-beta"
+galaxdb-embedded = "0.3.0"
 ```
 
 ---
@@ -275,7 +317,7 @@ Every server instance exposes:
 ```bash
 # Health check — reflects real subsystem state
 curl http://localhost:9090/health
-# {"status":"ok","version":"1.0.0-beta.1","subsystems":{"disk_full":false,"sidecar_healthy":true,"connections_active":3}}
+# {"status":"ok","version":"0.3.0","subsystems":{"disk_full":false,"sidecar_healthy":true,"connections_active":3}}
 
 # Prometheus metrics
 curl http://localhost:9090/metrics

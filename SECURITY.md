@@ -4,13 +4,13 @@
 
 | Version | Supported |
 |---------|-----------|
-| v1.x (beta) | ✅ |
+| 0.3.x   | ✅ |
 
 ## Reporting a vulnerability
 
 **Do not open a public GitHub issue for security vulnerabilities.**
 
-Email **security@zentrix.ai** with:
+Email **security@galaxdb.com** with:
 - Description of the vulnerability
 - Steps to reproduce
 - Potential impact

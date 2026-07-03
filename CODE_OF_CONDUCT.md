@@ -19,7 +19,7 @@ We are committed to making participation in GalaxDB a harassment-free experience
 
 ## Enforcement
 
-Instances of unacceptable behaviour may be reported to conduct@zentrix.ai. All complaints will be reviewed and investigated promptly and fairly.
+Instances of unacceptable behaviour may be reported to conduct@galaxdb.com. All complaints will be reviewed and investigated promptly and fairly.
 
 ## Attribution
 

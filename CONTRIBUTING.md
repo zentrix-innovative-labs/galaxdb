@@ -102,4 +102,4 @@ Open a GitHub issue with:
 
 ## Security vulnerabilities
 
-Do not open a public issue for security vulnerabilities. Email security@zentrix.ai instead.
+Do not open a public issue for security vulnerabilities. Email security@galaxdb.com instead.

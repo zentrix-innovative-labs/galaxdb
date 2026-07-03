@@ -19,8 +19,22 @@ The single-node engine is feature-complete and benchmarked on SIFT-1M (see
 
 **Storage** — LSM + PAX columnar storage, ART primary index, Monkey-optimal Bloom filters, NUMA-aware
 buffer pool, Lazy Leveling compaction with MVCC GC, WAL with crash recovery, key-value separation,
-write-stall mitigation, io_uring/tokio backends, and AES-256-GCM encryption at rest with pluggable key
-management (local, environment, external command, HashiCorp Vault).
+write-stall mitigation, io_uring/tokio backends, automatic memory/configuration tuning (buffer pool,
+memtable, compaction concurrency derived from host RAM/CPU), a **durable catalog** (table
+definitions, storage modes, and constraints survive restart), and AES-256-GCM encryption at rest with
+pluggable key management (local, environment, external command, HashiCorp Vault).
+
+**SQL query engine** — relational and analytical SQL over an embedded DataFusion engine: joins,
+aggregates (`COUNT`/`SUM`/`AVG`/`MIN`/`MAX`), `GROUP BY` / `HAVING`, `DISTINCT`, `ORDER BY` /
+`LIMIT` / `OFFSET`, and FROM-less scalar queries (`SELECT 1+1`, `version()`, `current_database()`).
+Single-table point reads, filtered scans, and vector search run on the native path; anything
+analytical routes to DataFusion. `INSERT` / `UPDATE` value positions are real per-row expressions
+(e.g. `SET bal = bal - 30`), `PRIMARY KEY` uniqueness is enforced (SQLSTATE `23505`, never a silent
+overwrite), and arithmetic faults are typed (`22012` division-by-zero, `22003` overflow, `42804`
+type mismatch).
+
+**Transactions** — explicit `BEGIN` / `COMMIT` / `ROLLBACK` with snapshot isolation, read-your-writes
+overlay, `SAVEPOINT` / `ROLLBACK TO`, and write-write conflict detection (SQLSTATE `40001`).
 
 **Vector search** — mutable HNSW with crash-safe delta buffer, SQ8/FP16/RaBitQ quantization, parallel
 construction.
@@ -54,7 +68,6 @@ Completing the open-source engine for production and managed-cloud use. Follow t
 
 ### Durability and completeness
 - Backup and restore to object storage (S3, GCS, Azure Blob, S3-compatible) over REST
-- Automatic memory and configuration tuning
 
 ---
 
