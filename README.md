@@ -294,7 +294,11 @@ docker run -p 5433:5433 -p 9090:9090 -v /data:/data \
 - **Server:** run it under **Docker Desktop (WSL2 backend)** with the Docker command above, or use
   the native `galaxdb-server-windows-x86_64.exe` attached to each release (from v0.3.1 onward). The
   server is cross-platform Rust (rustls, no OpenSSL; Linux-only io_uring falls back to tokio), and CI
-  builds `galaxdb-server` on a native Windows runner on every change.
+  builds `galaxdb-server` on a native Windows runner on every change. The relational, analytical,
+  transactional, storage, and vector-search engine is fully native on Windows.
+- **Embeddings on Windows:** the embedding sidecar (`EMBEDDING MODEL` columns and live
+  `SEMANTIC_MATCH` generation) is Unix-only — it uses Unix-domain sockets — so run it under WSL2 or
+  Docker. Vector search over already-computed vectors works natively.
 
 ### GitHub Releases
 

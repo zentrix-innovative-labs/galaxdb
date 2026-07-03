@@ -90,6 +90,10 @@ allow = [
     "CDLA-Permissive-2.0",
     # aes-gcm / rsa style
     "OpenSSL",
+    # bzip2/libbzip2 license v1.0.6 — permissive BSD-style, used by
+    # libbz2-rs-sys (pure-Rust bzip2, pulled in transitively by the
+    # analytical/columnar compression path). Apache-2.0-compatible.
+    "bzip2-1.0.6",
 ]
 confidence-threshold = 0.8
 # If a new dependency carries an unrecognized license, CI fails and a

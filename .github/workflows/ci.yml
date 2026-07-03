@@ -87,8 +87,14 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Build server + sidecar (release)
-        run: cargo build --release -p galaxdb-server -p galaxdb-sidecar
+      # Only the server is built on Windows. The embedding sidecar *binary* is
+      # Unix-only (`#![cfg(unix)]` — it uses Unix-domain sockets for IPC); its
+      # *library* still compiles on Windows (that's what the server + Python
+      # wheel link against). Native Windows users run the embedding sidecar
+      # under WSL2/Docker; the server, storage, SQL, and vector engine are
+      # fully native.
+      - name: Build server (release)
+        run: cargo build --release -p galaxdb-server
 
       - name: Run core test suites
         run: cargo test -p galaxdb-sql -p galaxdb-embedded -p galaxdb-wire -p galaxdb-server --lib
