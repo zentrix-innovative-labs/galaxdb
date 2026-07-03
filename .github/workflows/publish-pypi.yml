@@ -30,24 +30,26 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install maturin
-        run: pip install maturin
-
-      - name: Install protoc + cmake (needed by build scripts in transitive deps)
-        run: sudo apt-get update -y && sudo apt-get install -y protobuf-compiler cmake
-
+      # Build inside the official manylinux_2_28 container via maturin-action.
+      # Building natively on ubuntu-latest and passing `--manylinux 2_28` fails
+      # the auditwheel policy check (the runner's glibc is newer than the 2_28
+      # baseline), which is why the previous native build broke. The container
+      # also isolates the heavy DataFusion/Lance/pyo3 release compile. protoc +
+      # cmake are installed inside the container via before-script-linux.
       - name: Build wheel (${{ matrix.target }})
-        run: |
-          maturin build --release \
-            --manylinux 2_28 \
-            -m galaxdb-python/Cargo.toml
-        env:
-          PROTOC: /usr/bin/protoc
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}-unknown-linux-gnu
+          manylinux: "2_28"
+          args: --release -m galaxdb-python/Cargo.toml
+          before-script-linux: |
+            if command -v dnf >/dev/null 2>&1; then
+              dnf install -y protobuf-compiler protobuf-devel cmake || dnf install -y protobuf-compiler cmake
+            elif command -v yum >/dev/null 2>&1; then
+              yum install -y protobuf-compiler cmake
+            elif command -v apt-get >/dev/null 2>&1; then
+              apt-get update -y && apt-get install -y protobuf-compiler cmake
+            fi
 
       - uses: actions/upload-artifact@v4
         with:
