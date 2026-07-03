@@ -37,8 +37,8 @@ an aspiration. When a feature is Partial, the limit is named.
 | `CREATE TABLE` | ✅ | Scalar + `EMBEDDING MODEL` columns. |
 | `DROP TABLE [IF EXISTS]` | ✅ | |
 | `ALTER TABLE … SET STORAGE {COLUMNAR\|LEGACY\|ROW}` | ✅ | GalaxDB extension; rewrites on-disk blocks. |
-| `PRIMARY KEY` | 🟡 | Defines the row key; **uniqueness is not enforced** — a repeated PK upserts. |
-| `NOT NULL`, `CHECK`, `UNIQUE`, `FOREIGN KEY` | ❌ | Accepted by the parser, **not enforced**. |
+| `PRIMARY KEY` | ✅ | Defines the row key; **uniqueness is enforced** — a duplicate INSERT fails with SQLSTATE `23505`. |
+| `NOT NULL`, `CHECK`, `UNIQUE` (non-PK), `FOREIGN KEY` | ❌ | Accepted by the parser, **not enforced**. |
 | `CREATE INDEX` / `DROP INDEX` | 🟡 | Single-column secondary indexes only; multi-column rejected. |
 | `CREATE VIEW` / materialized views | ❌ | |
 | `CREATE FUNCTION` / PL/pgSQL / stored procedures | ❌ | |
@@ -50,7 +50,7 @@ an aspiration. When a feature is Partial, the limit is named.
 
 | Feature | Status | Notes |
 |---|---|---|
-| `INSERT … VALUES` | ✅ | Upsert semantics on primary key. |
+| `INSERT … VALUES` | ✅ | Value positions are real expressions; a duplicate primary key fails with SQLSTATE `23505`. |
 | `BULK INSERT` | ✅ | GalaxDB extension; multi-row ingest. |
 | `INSERT … SELECT` | ❌ | Not supported. |
 | `UPDATE … WHERE` | ✅ | |
@@ -130,9 +130,10 @@ PostgreSQL feature set.
   A `pg_dump --data-only` in the COPY text format ingests for tables whose
   schema you have recreated with `CREATE TABLE`.
 - **Schema:** recreate tables with `CREATE TABLE`. Strip unsupported clauses
-  (`FOREIGN KEY`, `CHECK`, `UNIQUE`, sequences/`SERIAL`); supply primary keys
-  explicitly. `NOT NULL`/constraints are accepted but not enforced, so enforce
-  invariants in the application if you rely on them.
+  (`FOREIGN KEY`, `CHECK`, non-PK `UNIQUE`, sequences/`SERIAL`); supply primary
+  keys explicitly — `PRIMARY KEY` uniqueness **is** enforced (a duplicate fails
+  with `23505`). `NOT NULL`/`CHECK`/`UNIQUE`/`FOREIGN KEY` are accepted but not
+  enforced, so enforce those invariants in the application if you rely on them.
 - **What will not port:** stored procedures/PL/pgSQL, triggers, views,
   materialized views, foreign keys, sequences, and multi-column indexes.
 - **Verify, don't assume:** run your driver against a GalaxDB instance and

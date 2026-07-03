@@ -65,8 +65,8 @@ exposing a server beyond loopback.
 ### Encryption at rest
 
 - AES-256-GCM on every PAX block and WAL record. Key management is pluggable with no vendor lock-in:
-  local file, environment variable, external command (any KMS CLI), and HashiCorp Vault Transit.
-  Native cloud KMS providers (AWS/GCP/Azure over REST) are in progress — see [ROADMAP.md](ROADMAP.md).
+  local file, environment variable, external command (any KMS CLI), HashiCorp Vault Transit, and
+  native cloud KMS over REST — AWS KMS, GCP Cloud KMS, and Azure Key Vault.
 - Master keys and credentials are sourced from the environment/config and never emitted in SQL,
   logs, or error messages.
 

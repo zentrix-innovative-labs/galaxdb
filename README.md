@@ -346,6 +346,11 @@ GALAXDB_KEY_PROVIDER=command:aws kms decrypt ... galaxdb-server ...
 
 # HashiCorp Vault Transit
 GALAXDB_KEY_PROVIDER=vault:transit/galaxdb-prod galaxdb-server ...
+
+# Native cloud KMS over REST (no vendor SDK; build with the `cloud-kms` feature)
+GALAXDB_KEY_PROVIDER=aws-kms:alias/galaxdb galaxdb-server ...
+GALAXDB_KEY_PROVIDER=gcp-kms:projects/p/locations/global/keyRings/r/cryptoKeys/k galaxdb-server ...
+GALAXDB_KEY_PROVIDER=azure-kv:my-vault/my-key galaxdb-server ...
 ```
 
 ---
@@ -363,7 +368,7 @@ transport encryption (rustls, no OpenSSL), and role-based access control.
 | TLS transport encryption (TLS 1.2/1.3, rustls) | ✅ Available now |
 | Roles, privileges, GRANT/REVOKE (SQLSTATE 42501) | ✅ Available now |
 | JSONL security audit log (authN/authZ/DDL/admin) | ✅ Available now |
-| Native cloud KMS (AWS/GCP/Azure over REST) | 🚧 In progress |
+| Native cloud KMS (AWS/GCP/Azure over REST) | ✅ Available now |
 | SSO / fine-grained RBAC | Enterprise edition |
 
 Authentication is enabled with `--auth` (or `GALAXDB_AUTH=1`); the initial superuser is provisioned

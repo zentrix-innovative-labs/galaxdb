@@ -49,35 +49,46 @@ equality and range lookups on non-primary-key columns, with a transparent full-s
 **Security** — SCRAM-SHA-256 wire authentication, TLS 1.2/1.3 transport encryption (rustls, no OpenSSL),
 role-based access control with table-level `GRANT` / `REVOKE` (unauthorized statements map to SQLSTATE
 `42501`), and a JSONL security audit log recording authentication, authorization, and admin events.
-AES-256-GCM encryption at rest with pluggable key management (local file, environment, external command,
-HashiCorp Vault).
+AES-256-GCM encryption at rest with pluggable key management: local file, environment, external command,
+HashiCorp Vault, and native cloud KMS over REST — AWS KMS, GCP Cloud KMS, and Azure Key Vault
+(credential-gated integration tests).
 
 **Interfaces** — PostgreSQL wire protocol (simple **and** extended query protocol / prepared statements,
 with a parsed-statement cache), `COPY FROM STDIN` / `COPY TO STDOUT` for bulk ingestion, Python client
-(embedded and remote), `pg_catalog` compatibility, local backup/restore, and full observability
-(`/health`, `/metrics`, tracing).
+(embedded and remote), `pg_catalog` compatibility, and full observability (`/health`, `/metrics`, tracing).
+
+**Backup and restore** — `BACKUP TO` / `RESTORE FROM` to a local path or object storage over REST (no
+vendor SDKs): `s3://` (plus S3-compatible endpoints — MinIO, Cloudflare R2), `gs://` (GCS), and `az://`
+(Azure Blob), with checksum validation and restore-aborts-on-corruption.
+
+The single-node open-source engine is **feature-complete** for the v0.3.0 line: the entire relational +
+analytical + vector + transactional surface above ships today. Remaining OSS work is verification and
+published evidence, not missing features.
 
 ---
 
 ## In progress
 
-Completing the open-source engine for production and managed-cloud use. Follow the linked issues for status.
+Hardening and evidence for the shipped engine — not new capabilities.
 
-### Security
-- Native cloud KMS key providers (AWS KMS, GCP KMS, Azure Key Vault) over REST
-
-### Durability and completeness
-- Backup and restore to object storage (S3, GCS, Azure Blob, S3-compatible) over REST
+- Broader PostgreSQL driver-compatibility matrix: live end-to-end tests against psql, psycopg,
+  JDBC, and SQLAlchemy (tokio-postgres is covered today), and fuller `pg_catalog` table/column listing.
+- Published ClickBench-style analytical + TPC-H-subset benchmarks on named hardware (SIFT-1M vector
+  recall and the full test suite are already published in [BENCHMARKS.md](docs/BENCHMARKS.md)).
+- Merkle-DAG-targeted block pruning for `AT VERSION` time-travel (a performance optimization; results
+  are already correct via commit-timestamp filtering).
 
 ---
 
-## Planned
+## Planned (v2 and research)
+
+Future capabilities beyond the v0.3.0 single-node engine.
 
 - Semantic query caching (`CREATE SEMANTIC CACHE`)
 - Gradient-driven adaptive storage (single-node)
 - Active-learning SQL: `FEEDBACK`, `ORDER BY ACTIVE_LEARNING()`, uncertainty and drift detection
 - Versioned vector-index snapshots (`SEMANTIC_SNAPSHOT`)
-- Serializable Snapshot Isolation
+- Serializable Snapshot Isolation (snapshot isolation ships today)
 - Disk-resident ANN for larger-than-RAM vector sets
 
 ---

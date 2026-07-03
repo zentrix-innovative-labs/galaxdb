@@ -30,12 +30,14 @@
 //!
 //! # Design: no vendor lock-in
 //!
-//! There is deliberately no `AwsKmsKeyProvider`, `GcpKmsKeyProvider`,
-//! or `AzureKeyVaultKeyProvider` in this crate. Operators who need
-//! those services use [`ExternalCommandKeyProvider`] with the vendor's
-//! CLI (`aws kms encrypt ...`, `gcloud kms encrypt ...`, `az keyvault
-//! encrypt ...`) or adapt their wrapper. This keeps the core binary
-//! free of cloud SDKs and their transitive dependency trees.
+//! Native cloud KMS providers — `AwsKmsKeyProvider`, `GcpKmsKeyProvider`,
+//! and `AzureKeyVaultKeyProvider` (see [`crate::cloud_kms`]) — are available
+//! behind the opt-in `cloud-kms` feature. They call each service's REST API
+//! directly with in-crate request signing (AWS SigV4, GCP/Azure OAuth2
+//! bearer) — **no vendor SDK**, so the core binary stays free of cloud SDK
+//! dependency trees. Operators who prefer a CLI, or need a KMS without a
+//! built-in provider, can still use [`ExternalCommandKeyProvider`] with the
+//! vendor's tool (`aws kms ...`, `gcloud kms ...`, `az keyvault ...`).
 
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
