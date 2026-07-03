@@ -14,7 +14,7 @@
 
 ## What is GalaxDB?
 
-Most AI applications bolt together 3–5 separate services: a relational database, a vector database, an embedding API, an object store, and a data pipeline. GalaxDB replaces all of them with a single binary that speaks PostgreSQL wire protocol. The release artifacts stay lightweight: `galaxdb-server` is 7.9 MB and `galaxdb-sidecar` is 7.6 MB.
+Most AI applications bolt together 3–5 separate services: a relational database, a vector database, an embedding API, an object store, and a data pipeline. GalaxDB replaces all of them with a single binary that speaks PostgreSQL wire protocol. It's still one binary and one dependency to deploy — `galaxdb-server` is around 60 MB (it statically links the embedded analytical query engine, Apache Arrow, and the Lance training-export format) and `galaxdb-sidecar` is a separate, optional process for local embedding inference.
 
 ```
 Before GalaxDB:
