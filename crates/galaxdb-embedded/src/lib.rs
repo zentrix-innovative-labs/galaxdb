@@ -269,6 +269,32 @@ impl Database {
         // merge; the worker holds only a Weak<Engine> and exits when this
         // handle is dropped (see Database::drop).
         engine.start_background_compaction();
+
+        // Rebuild the catalog from the durably-persisted schema entries so
+        // tables (and their row data) survive a restart. Without this, DDL
+        // would be in-memory only and every table would vanish on reopen even
+        // though its rows are recovered from the WAL/SSTs. Columnar tables
+        // also need their PAX splitter re-registered so flush/compaction keep
+        // laying rows out in the persisted layout.
+        let catalog = {
+            let mut cat = galaxdb_sql::executor::Catalog::new();
+            for entry in galaxdb_sql::catalog_store::load_all(&engine) {
+                if entry.storage_mode == galaxdb_common::StorageMode::Columnar {
+                    if let Some(splitter) =
+                        galaxdb_sql::columnar::CatalogRowSplitter::from_table_entry(&entry)
+                    {
+                        let prefix = format!("{}:", entry.name).into_bytes();
+                        engine.register_columnar_table(prefix, Arc::new(splitter));
+                    }
+                }
+                let name = entry.name.clone();
+                if let Err(e) = cat.create_table(name.clone(), entry) {
+                    tracing::warn!(table = %name, error = %e, "skipping duplicate catalog entry on open");
+                }
+            }
+            Arc::new(cat)
+        };
+
         Self {
             path,
             engine,
@@ -276,7 +302,7 @@ impl Database {
             merkle_dag: Arc::new(Mutex::new(MerkleDag::new())),
             tag_catalog,
             vector_indexes: Arc::new(RwLock::new(HashMap::new())),
-            catalog: Arc::new(galaxdb_sql::executor::Catalog::new()),
+            catalog,
             session: None,
             audit: None,
             stmt_cache: Mutex::new(galaxdb_sql::StatementCache::new(256)),
@@ -2528,8 +2554,15 @@ impl Database {
     pub fn table_exists(&self, name: &str) -> bool {
         self.catalog.table_exists(name)
     }
+    /// Count of live user rows. Excludes the reserved, durably-persisted
+    /// catalog entries (`__galaxdb_catalog__` namespace), which are engine
+    /// keys carrying schema, not user data.
     pub fn row_count(&self) -> u64 {
-        self.engine.row_count()
+        self.engine
+            .scan_all()
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with(galaxdb_sql::catalog_store::CATALOG_KEY_PREFIX))
+            .count() as u64
     }
 
     /// Register a `FOR TRAINING` version tag pinned at the most
@@ -4421,6 +4454,48 @@ mod tests {
     }
 
     #[test]
+    fn catalog_and_data_survive_reopen() {
+        // Durability regression: the catalog was in-memory only, so after a
+        // restart the tables vanished and their WAL-recovered rows became
+        // unreadable. Schema is now persisted and reloaded on open.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("db");
+        let path = p.to_str().unwrap().to_string();
+
+        {
+            let mut db = Database::open(&path).unwrap();
+            db.execute("CREATE TABLE acct (id INT PRIMARY KEY, bal INT)")
+                .unwrap();
+            db.execute("INSERT INTO acct (id, bal) VALUES (1, 100)").unwrap();
+            db.execute("INSERT INTO acct (id, bal) VALUES (2, 200)").unwrap();
+            db.execute("ALTER TABLE acct SET STORAGE COLUMNAR").unwrap();
+            db.execute("CREATE TABLE tmp (id INT PRIMARY KEY)").unwrap();
+            db.execute("DROP TABLE tmp").unwrap();
+            // ensure durability to disk
+            db.flush().unwrap();
+        }
+
+        // Reopen the same directory: tables and rows must be present.
+        let mut db = Database::open(&path).unwrap();
+        assert!(db.table_exists("acct"), "acct must survive reopen");
+        assert!(!db.table_exists("tmp"), "dropped table must not reappear");
+        match db.execute("SELECT id, bal FROM acct ORDER BY id").unwrap() {
+            QueryResult::Rows(rows) => {
+                assert_eq!(rows.len(), 2);
+                assert_eq!(rows[0].values.iter().find(|(k, _)| k == "bal").unwrap().1, "100");
+                assert_eq!(rows[1].values.iter().find(|(k, _)| k == "bal").unwrap().1, "200");
+            }
+            other => panic!("expected Rows after reopen, got {other:?}"),
+        }
+        // A duplicate insert after reopen must still be rejected (PK metadata
+        // survived, not just the rows).
+        assert!(
+            db.execute("INSERT INTO acct (id, bal) VALUES (1, 999)").is_err(),
+            "PK uniqueness must survive reopen"
+        );
+    }
+
+    #[test]
     fn duplicate_primary_key_is_rejected_not_overwritten() {
         let mut db = test_db();
         db.execute("CREATE TABLE pk (id INT PRIMARY KEY, v TEXT)").unwrap();
@@ -6148,14 +6223,13 @@ mod tests {
         drop(dst_db);
         let mut dst_db = Database::open(dst_path.to_str().unwrap()).unwrap();
 
-        // Recreate the catalog entry so SELECT can resolve the table.
-        // The restored files carry the row bytes; the catalog lives
-        // in memory and is rebuilt from the DDL path. In a full v1
-        // engine the catalog would be persisted too — until that
-        // lands, callers issue the same CREATE TABLE on restore.
-        dst_db
-            .execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT)")
-            .unwrap();
+        // The catalog is persisted and backed up with the SSTs, so the
+        // table's schema is recovered automatically on reopen — no manual
+        // re-CREATE needed.
+        assert!(
+            dst_db.table_exists("items"),
+            "restored catalog must recover the table schema"
+        );
 
         let rows = match dst_db
             .execute("SELECT id, name FROM items")
@@ -6723,10 +6797,11 @@ mod secondary_index_tests {
             db.execute("INSERT INTO k VALUES (2, 'y')").unwrap();
             db.execute("CREATE INDEX idx_v ON k (v)").unwrap();
         }
-        // Reopen and re-register the table in the session catalog, then
-        // query through the index — the entries were recovered.
+        // Reopen: the table's schema is now recovered from the persisted
+        // catalog (no need to re-CREATE it), and the index entries were
+        // recovered through the WAL.
         let mut db = Database::open(p.to_str().unwrap()).unwrap();
-        db.execute("CREATE TABLE k (id INT PRIMARY KEY, v TEXT)").unwrap();
+        assert!(db.table_exists("k"), "table schema survives restart");
         let got = rows(db.execute("SELECT id FROM k WHERE v = 'x'").unwrap());
         assert_eq!(got.len(), 1, "index entry for 'x' survived restart");
         assert_eq!(got[0].values.iter().find(|(c, _)| c == "id").unwrap().1, "1");

@@ -932,9 +932,20 @@ fn exec_create_table(
         storage_mode: default_storage_mode_for_new_table(),
     };
 
+    // Reject a duplicate CREATE before touching storage so we never overwrite
+    // an existing table's persisted schema.
+    if ctx.catalog.table_exists(&stmt.table_name) {
+        return Err(GalaxError::TableAlreadyExists(stmt.table_name.clone()));
+    }
+
     // If this table uses columnar storage, register a splitter so flush /
     // compaction lay its rows out as typed PAX columns (HTAP ADR-0002).
     register_columnar_if_enabled(&stmt.table_name, &entry, ctx);
+
+    // Persist the schema durably so it survives restart: the in-memory
+    // Catalog is rebuilt from these entries on open. The WAL-backed put means
+    // a crash after this point still recovers the table definition.
+    crate::catalog_store::persist_table_entry(&ctx.engine, &entry)?;
 
     Arc::make_mut(&mut ctx.catalog).create_table(stmt.table_name.clone(), entry)?;
     Ok(ExecuteResult::Ok(format!("CREATE TABLE {}", stmt.table_name)))
@@ -975,6 +986,8 @@ fn exec_drop_table(name: &str, if_exists: bool, ctx: &mut ExecutorContext) -> Ga
             // Drop any columnar registration for this table's key prefix.
             ctx.engine
                 .unregister_columnar_table(format!("{name}:").as_bytes());
+            // Remove the persisted schema so it does not reappear on restart.
+            crate::catalog_store::remove_table_entry(&ctx.engine, name)?;
             Ok(ExecuteResult::Ok(format!("DROP TABLE {}", name)))
         }
         Err(GalaxError::TableNotFound(_)) if if_exists => {
@@ -1034,6 +1047,11 @@ fn exec_alter_table_set_storage(
     }
 
     Arc::make_mut(&mut ctx.catalog).set_storage_mode(table, mode)?;
+
+    // Persist the updated storage mode so the change survives restart.
+    if let Some(entry) = ctx.catalog.get_table(table) {
+        crate::catalog_store::persist_table_entry(&ctx.engine, entry)?;
+    }
 
     // Rewrite on-disk blocks into the new layout now (compaction-driven
     // rewrite). `force_compact` runs even with a single SST; a no-op only

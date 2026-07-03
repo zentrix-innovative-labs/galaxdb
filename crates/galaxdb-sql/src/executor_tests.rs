@@ -295,6 +295,13 @@ fn columnar_table_flush_writes_typed_columns_end_to_end() {
             if block.header.row_count == 0 {
                 continue;
             }
+            // Skip blocks that don't hold this table's rows (e.g. the
+            // persisted catalog entry, which is a legacy row under the
+            // reserved `\x00__galaxdb_catalog__:` namespace).
+            let keys = block.read_column(0).unwrap();
+            if keys.first().map(|k| !k.starts_with(b"events:")).unwrap_or(true) {
+                continue;
+            }
             // 2 SQL columns → 3 base + 2 (data,validity) pairs = 7 columns.
             assert_eq!(block.header.column_count, 7);
             let created = block
