@@ -50,6 +50,44 @@ jobs:
         run: cargo clippy --workspace --exclude galaxdb-python -- -D warnings
 
   # -------------------------------------------------------------------
+  # Windows x86_64 — cross-platform coverage (engineering-principles §5).
+  # Builds the server + sidecar and runs the SQL/engine/wire test suites
+  # on a native Windows runner so Windows regressions are caught here,
+  # not by users. rustls (no OpenSSL) and the tokio fallback for the
+  # Linux-only io_uring path make this a first-class target.
+  # -------------------------------------------------------------------
+  windows-build-and-test:
+    name: "Build & Test · Windows x86_64"
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo registry & build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build server + sidecar (release)
+        run: cargo build --release -p galaxdb-server -p galaxdb-sidecar
+
+      - name: Run core test suites
+        run: cargo test -p galaxdb-sql -p galaxdb-embedded -p galaxdb-wire -p galaxdb-server --lib
+
+  # -------------------------------------------------------------------
   # Quality gates — run independently so regressions fail fast.
   # -------------------------------------------------------------------
 

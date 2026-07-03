@@ -173,7 +173,49 @@ jobs:
           path: galaxdb-server-macos-x86_64
 
   # -----------------------------------------------------------------------
-  # Create the GitHub Release and attach all four binaries.
+  # Windows x86_64 — native server binary. Best-effort: `continue-on-error`
+  # so a Windows-specific build hiccup never blocks the Linux/macOS release;
+  # the .exe is attached only when the build succeeds (see github-release).
+  # -----------------------------------------------------------------------
+  build-windows-x86_64:
+    name: "Build · Windows x86_64"
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build server (release)
+        run: cargo build --release -p galaxdb-server
+
+      - name: Rename artifact
+        run: copy target\release\galaxdb-server.exe galaxdb-server-windows-x86_64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: galaxdb-server-windows-x86_64
+          path: galaxdb-server-windows-x86_64.exe
+
+  # -----------------------------------------------------------------------
+  # Create the GitHub Release and attach all built binaries.
   # The release event triggers publish-pypi.yml automatically.
   # -----------------------------------------------------------------------
   github-release:
@@ -183,6 +225,7 @@ jobs:
       - build-linux-aarch64
       - build-macos-arm64
       - build-macos-x86_64
+      - build-windows-x86_64
     runs-on: ubuntu-latest
     permissions:
       contents: write   # needed to create the release
@@ -202,10 +245,15 @@ jobs:
       - name: Compute SHA256 checksums
         run: |
           cd dist
-          sha256sum galaxdb-server-linux-x86_64    > galaxdb-server-linux-x86_64.sha256
-          sha256sum galaxdb-server-linux-aarch64   > galaxdb-server-linux-aarch64.sha256
-          sha256sum galaxdb-server-macos-arm64     > galaxdb-server-macos-arm64.sha256
-          sha256sum galaxdb-server-macos-x86_64    > galaxdb-server-macos-x86_64.sha256
+          # Checksum every server binary that was actually built (the Windows
+          # .exe is best-effort and may be absent), but not existing .sha256s.
+          for f in galaxdb-server-*; do
+            case "$f" in
+              *.sha256) ;;
+              *) sha256sum "$f" > "$f.sha256" ;;
+            esac
+          done
+          ls -lh
 
       - name: Create GitHub Release
         env:
@@ -245,18 +293,12 @@ jobs:
           ### Direct download
           | Platform | Binary |
           |---|---|
-          | Linux x86_64  | \`galaxdb-server-linux-x86_64\`   |
-          | Linux aarch64 | \`galaxdb-server-linux-aarch64\`  |
-          | macOS arm64   | \`galaxdb-server-macos-arm64\`    |
-          | macOS x86_64  | \`galaxdb-server-macos-x86_64\`   |
+          | Linux x86_64  | \`galaxdb-server-linux-x86_64\`       |
+          | Linux aarch64 | \`galaxdb-server-linux-aarch64\`      |
+          | macOS arm64   | \`galaxdb-server-macos-arm64\`        |
+          | macOS x86_64  | \`galaxdb-server-macos-x86_64\`       |
+          | Windows x86_64 | \`galaxdb-server-windows-x86_64.exe\` |
 
-          SHA256 checksums are attached as \`.sha256\` files.
+          Windows users can also run the server under Docker Desktop (WSL2). SHA256 checksums are attached as \`.sha256\` files.
           " \
-            dist/galaxdb-server-linux-x86_64 \
-            dist/galaxdb-server-linux-x86_64.sha256 \
-            dist/galaxdb-server-linux-aarch64 \
-            dist/galaxdb-server-linux-aarch64.sha256 \
-            dist/galaxdb-server-macos-arm64 \
-            dist/galaxdb-server-macos-arm64.sha256 \
-            dist/galaxdb-server-macos-x86_64 \
-            dist/galaxdb-server-macos-x86_64.sha256
+            dist/*
