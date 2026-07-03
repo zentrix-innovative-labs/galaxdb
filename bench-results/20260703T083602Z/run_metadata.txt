@@ -1,0 +1,10 @@
+commit: 6c7811f5ecbfe50e8e291d202a3420ad7228fd78
+instance_id: <redacted>
+instance_type: c6id.4xlarge
+region: us-east-1
+remote_workdir: /mnt/nvme/galaxdb
+remote_dataset_dir: /mnt/nvme/datasets/sift
+sift1m_url: ftp://ftp.irisa.fr/local/texmex/corpus/sift.tar.gz
+sift1m_sha256: 92f1270c5e3a0cb46b89983e72b0511e4df065c31a9fa0276d8c9b1fca5bc81a
+ssh_user: ubuntu
+timestamp_utc: 2026-07-03T08:36:02Z
