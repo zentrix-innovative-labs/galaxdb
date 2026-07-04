@@ -43,18 +43,41 @@ jobs:
           manylinux: "2_28"
           args: --release -m galaxdb-python/Cargo.toml
           before-script-linux: |
-            # manylinux_2_28 is AlmaLinux 8 (dnf). Install protoc + cmake for
-            # transitive build scripts, and openssl-devel + pkgconfig because
-            # hf-hub and lance's reqwest client use native-tls, which links
-            # system OpenSSL on Linux (macOS/Windows use SecureTransport/SChannel).
+            # manylinux_2_28 is AlmaLinux 8 (dnf). Its dnf-packaged protoc
+            # predates proto3-optional support (protoc >= 3.12), so
+            # lance-encoding's build script (which always passes
+            # --experimental_allow_proto3_optional) fails with
+            # "Unknown flag: --experimental_allow_proto3_optional". Download a
+            # modern protoc release directly instead of the distro package.
+            # cmake is for other transitive build scripts; openssl-devel +
+            # pkgconfig + perl-core because hf-hub and lance's reqwest client
+            # use native-tls, which links system OpenSSL on Linux
+            # (macOS/Windows use SecureTransport/SChannel, no OpenSSL needed).
+            PROTOC_VERSION=25.3
+            case "$(uname -m)" in
+              x86_64)  PROTOC_ARCH=x86_64 ;;
+              aarch64) PROTOC_ARCH=aarch_64 ;;
+              *) echo "unsupported arch $(uname -m)"; exit 1 ;;
+            esac
+            curl -fsSLo /tmp/protoc.zip \
+              "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${PROTOC_ARCH}.zip"
+            if command -v unzip >/dev/null 2>&1; then
+              unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+            else
+              python3 -c "import zipfile; zipfile.ZipFile('/tmp/protoc.zip').extractall('/usr/local')"
+            fi
+            chmod +x /usr/local/bin/protoc
+            rm -f /tmp/protoc.zip
+            protoc --version
+
             if command -v dnf >/dev/null 2>&1; then
-              dnf install -y protobuf-compiler cmake openssl-devel pkgconfig perl-core || \
+              dnf install -y cmake openssl-devel pkgconfig perl-core || \
               dnf install -y cmake openssl-devel pkgconfig
             elif command -v yum >/dev/null 2>&1; then
-              yum install -y protobuf-compiler cmake openssl-devel pkgconfig perl-core || \
+              yum install -y cmake openssl-devel pkgconfig perl-core || \
               yum install -y cmake openssl-devel pkgconfig
             elif command -v apt-get >/dev/null 2>&1; then
-              apt-get update -y && apt-get install -y protobuf-compiler cmake libssl-dev pkg-config
+              apt-get update -y && apt-get install -y cmake libssl-dev pkg-config unzip
             fi
 
       - uses: actions/upload-artifact@v4
