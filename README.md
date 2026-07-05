@@ -103,6 +103,13 @@ FROM articles
 WHERE SEMANTIC_MATCH(title, 'climate change policy', 0.75)
   AND published_at > '2024-01-01';
 
+-- Top-k nearest matches — add LIMIT to control how many come back
+-- (without a LIMIT, the default is the 10 nearest)
+SELECT id, title
+FROM articles
+WHERE SEMANTIC_MATCH(title, 'climate change policy', 0.5)
+LIMIT 50;
+
 -- Time-travel query — reproduce exactly what data existed at a point in time
 SELECT * FROM docs AT VERSION 'training-v1';
 
@@ -292,7 +299,7 @@ docker run -p 5433:5433 -p 9090:9090 -v /data:/data \
 - **Python (embedded + client):** `pip install galaxdb-client` — a native `win_amd64` wheel is
   published, so embedded mode and the remote client work on Windows out of the box.
 - **Server:** run it under **Docker Desktop (WSL2 backend)** with the Docker command above, or use
-  the native `galaxdb-server-windows-x86_64.exe` attached to each release (from v0.3.1 onward). The
+  the native `galaxdb-server-windows-x86_64.exe` attached to each release. The
   server is cross-platform Rust (rustls, no OpenSSL; Linux-only io_uring falls back to tokio), and CI
   builds `galaxdb-server` on a native Windows runner on every change. The relational, analytical,
   transactional, storage, and vector-search engine is fully native on Windows.
@@ -309,7 +316,7 @@ Windows x86-64 from the [Releases page](https://github.com/zentrix-innovative-la
 
 ```toml
 [dependencies]
-galaxdb-embedded = "0.3.0"
+galaxdb-embedded = "0.4.0"
 ```
 
 ---
@@ -321,7 +328,7 @@ Every server instance exposes:
 ```bash
 # Health check — reflects real subsystem state
 curl http://localhost:9090/health
-# {"status":"ok","version":"0.3.0","subsystems":{"disk_full":false,"sidecar_healthy":true,"connections_active":3}}
+# {"status":"ok","version":"0.4.0","subsystems":{"disk_full":false,"sidecar_healthy":true,"connections_active":3}}
 
 # Prometheus metrics
 curl http://localhost:9090/metrics

@@ -93,6 +93,39 @@ Future capabilities beyond the v0.4.0 single-node engine.
 
 ---
 
+## Client SDKs and language support
+
+GalaxDB speaks the PostgreSQL wire protocol, so **any language with a Postgres
+driver already connects to the server today** — no GalaxDB-specific SDK is
+required for remote use. The Python client (`galaxdb-client`) is special
+because it also offers **embedded** mode (the engine in-process via PyO3),
+which is the only capability that needs per-language FFI work.
+
+Planned, ranked by value/cost:
+
+1. **Publish the Rust crates to crates.io** (`galaxdb-embedded`, `galaxdb-sql`,
+   and their dependencies). Near-zero cost — they already compile and version
+   together. Rust is the native language, so embedded mode is free here, and it
+   lets other Rust tools build directly on the engine. Do this first.
+2. **"Connect from any language" docs page.** A five-line snippet per popular
+   driver — Go (`pgx`), Node (`pg`), Java/Kotlin (JDBC), .NET (`Npgsql`),
+   Ruby (`pg`) — plus the GalaxDB SQL extensions (`SEMANTIC_MATCH`,
+   `EMBEDDING MODEL`). Highest ROI: pure docs, unlocks the whole ecosystem,
+   and sets correct expectations that no SDK is needed for remote use.
+3. **Thin TypeScript/Node SDK** (wrapper over `pg`, remote-only, no FFI). The
+   AI/RAG/agent audience is overwhelmingly on TS/Node, matching GalaxDB's
+   positioning. Typed helpers: `db.semanticMatch(col, query, threshold, {limit})`,
+   `EMBEDDING MODEL` DDL builders, connection helpers.
+4. **Thin Go module** (wrapper over `pgx`, remote-only). For the infra/platform
+   teams who self-host the server. Build if backend/infra pull materializes.
+
+Explicitly **not** planned near-term: embedded (in-process) bindings for
+JS/Go/Java/.NET — cgo/JNI/napi plus per-platform binary distribution is a large,
+permanent maintenance cost that the wire protocol already makes unnecessary for
+remote use.
+
+---
+
 ## Enterprise edition
 
 Built on the open-source core through stable extension interfaces. The open core never depends on

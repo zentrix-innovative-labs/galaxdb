@@ -16,7 +16,7 @@ Requires Python 3.9+. Pre-built wheels for Linux x86_64, macOS Intel, macOS Appl
 
 - **Full SQL** -- CREATE, INSERT, UPDATE, DELETE, SELECT with WHERE filters
 - **Local embeddings** -- text to vector conversion runs inside the process, no API key needed
-- **Semantic search** -- `SEMANTIC_MATCH(col, 'query', threshold)` in any WHERE clause
+- **Semantic search** -- `SEMANTIC_MATCH(col, 'query', threshold)` in any WHERE clause; add `LIMIT n` for the *n* nearest matches
 - **HNSW vector index** -- recall@10 = 0.990 on SIFT-1M at ef=200
 - **Time-travel queries** -- `SELECT ... AT VERSION 'tag'` to query historical snapshots
 - **Training export** -- `CREATE VERSION TAG ... FOR TRAINING` exports a Lance dataset, zero-copy PyTorch-ready
@@ -98,6 +98,12 @@ rows = conn.execute(
 for row in rows:
     print(row)
 # Returns rows 1 and 4 -- the AI/ML related documents
+
+# SEMANTIC_MATCH is a top-k search. Without a LIMIT it returns the 10
+# nearest matches; add LIMIT to control how many come back:
+rows = conn.execute(
+    "SELECT id, body FROM docs WHERE SEMANTIC_MATCH(body, 'artificial intelligence', 0.3) LIMIT 50"
+)
 
 conn.close()
 ```
@@ -198,7 +204,7 @@ docker run -d -p 5433:5433 -p 9090:9090 \
 ```bash
 # Health check
 curl http://localhost:9090/health
-# {"status":"ok","version":"1.0.0-beta.1","subsystems":{"sidecar_healthy":true}}
+# {"status":"ok","version":"0.4.0","subsystems":{"sidecar_healthy":true}}
 
 # Prometheus metrics
 curl http://localhost:9090/metrics
