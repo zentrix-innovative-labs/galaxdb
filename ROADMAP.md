@@ -61,7 +61,7 @@ with a parsed-statement cache), `COPY FROM STDIN` / `COPY TO STDOUT` for bulk in
 vendor SDKs): `s3://` (plus S3-compatible endpoints — MinIO, Cloudflare R2), `gs://` (GCS), and `az://`
 (Azure Blob), with checksum validation and restore-aborts-on-corruption.
 
-The single-node open-source engine is **feature-complete** for the v0.3.0 line: the entire relational +
+The single-node open-source engine is **feature-complete** as of the v0.4.0 line: the entire relational +
 analytical + vector + transactional surface above ships today. Remaining OSS work is verification and
 published evidence, not missing features.
 
@@ -82,7 +82,7 @@ Hardening and evidence for the shipped engine — not new capabilities.
 
 ## Planned (v2 and research)
 
-Future capabilities beyond the v0.3.0 single-node engine.
+Future capabilities beyond the v0.4.0 single-node engine.
 
 - Semantic query caching (`CREATE SEMANTIC CACHE`)
 - Gradient-driven adaptive storage (single-node)
@@ -106,6 +106,56 @@ enterprise code.
 - Federated queries with differential privacy
 
 For enterprise access, contact the team via the repository.
+
+---
+
+## Changelog
+
+Now that the open-source engine is feature-complete, each release is tracked
+here. Dates are release-tag dates. Versions follow semver; the PyPI client
+(`galaxdb-client`), the Docker image (`harbi256/galaxdb`), and the server
+binaries share the same version.
+
+### v0.4.0
+
+**Fixed — semantic search over the wire.** `SEMANTIC_MATCH` returned zero rows
+for tables loaded through the server (PostgreSQL wire protocol). The concurrent
+`INSERT` path and the `COPY`/bulk-load path computed embeddings via the sidecar
+but never stored the resulting vectors in the index, so queries searched an
+empty index. Embeddings are now populated through a single `on_row_inserted`
+backend hook shared by every write path, verified end-to-end on a real
+7,600-row dataset (semantic precision 0.70–1.00 across categories).
+
+**Fixed — `SEMANTIC_MATCH ... LIMIT n`.** The result set was capped at 10 rows
+regardless of `LIMIT`, and `LIMIT > 100` was silently truncated. A `LIMIT n`
+now returns the *n* nearest matches; a bare `LIMIT` stays on the native
+similarity-ranked path, while `ORDER BY` / `GROUP BY` / `JOIN` route to the
+analytical engine. Without a `LIMIT`, the default page is the 10 nearest.
+
+**Fixed — `SHOW EMBEDDING HEALTH FOR <table>`.** Returned a canned echo string
+over the wire; now reports the real sidecar state and model version.
+
+**Changed — release automation.** The Homebrew formula is regenerated from the
+published release checksums (`scripts/gen-homebrew-formula.sh`) and committed by
+the release workflow; `install.sh` resolves the latest release at runtime
+instead of pinning a version.
+
+### v0.3.0
+
+Open-source single-node engine declared **feature-complete**: the full
+relational + analytical + vector + transactional surface, security, and
+encryption at rest. First distribution across all channels — PyPI
+`galaxdb-client`, the `harbi256/galaxdb` Docker image, and GitHub release
+binaries for Linux/macOS (x86_64 + aarch64) and Windows.
+
+### v0.2.0
+
+Server binary distribution: GitHub release binaries, the `install.sh`
+one-liner, and the Homebrew formula.
+
+### v0.1.x
+
+Initial Python client releases on PyPI.
 
 ---
 

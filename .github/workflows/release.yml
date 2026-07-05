@@ -302,3 +302,49 @@ jobs:
           Windows users can also run the server under Docker Desktop (WSL2). SHA256 checksums are attached as \`.sha256\` files.
           " \
             dist/*
+
+  # -----------------------------------------------------------------------
+  # Regenerate the Homebrew formula from the real release checksums and
+  # commit it back to main. No human edits version or SHA256 by hand —
+  # scripts/gen-homebrew-formula.sh derives every value from the published
+  # `.sha256` assets. install.sh needs no bump: it resolves the latest
+  # release at runtime via the GitHub API.
+  # -----------------------------------------------------------------------
+  update-homebrew-formula:
+    name: "Update Homebrew formula"
+    needs: github-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # needed to push the regenerated formula to main
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Download release checksums
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p /tmp/rel-cksum
+          gh release download "${TAG}" -R "${GITHUB_REPOSITORY}" \
+            -D /tmp/rel-cksum -p '*.sha256'
+
+      - name: Regenerate Formula/galaxdb.rb
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          chmod +x scripts/gen-homebrew-formula.sh
+          ./scripts/gen-homebrew-formula.sh "${TAG#v}" /tmp/rel-cksum
+
+      - name: Commit and push if changed
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if git diff --quiet -- Formula/galaxdb.rb; then
+            echo "Formula already up to date for ${TAG}; nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/galaxdb.rb
+          git commit -m "chore(release): regenerate Homebrew formula for ${TAG} [skip ci]"
+          git push origin main

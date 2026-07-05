@@ -41,6 +41,9 @@ pub enum QueryPlan {
         query_text: String,
         threshold: f64,
         strategy: SearchStrategy,
+        /// Top-k bound from a SQL `LIMIT`. `None` uses the executor's
+        /// default page size; `Some(n)` returns the n nearest matches.
+        limit: Option<usize>,
     },
     /// Hybrid: structured filter + semantic search.
     HybridSearch {
@@ -48,6 +51,8 @@ pub enum QueryPlan {
         filter: FilterExpr,
         semantic: SemanticMatchExpr,
         strategy: SearchStrategy,
+        /// Top-k bound from a SQL `LIMIT` (see `SemanticSearch::limit`).
+        limit: Option<usize>,
     },
     /// Hybrid search over a historical snapshot (task 32.6 SEMANTIC_FRESH).
     /// SEMANTIC_MATCH combined with AT VERSION is only legal when the
@@ -61,6 +66,8 @@ pub enum QueryPlan {
         semantic: SemanticMatchExpr,
         strategy: SearchStrategy,
         at: AtVersionExpr,
+        /// Top-k bound from a SQL `LIMIT` (see `SemanticSearch::limit`).
+        limit: Option<usize>,
     },
     /// INSERT a single row.
     Insert {
@@ -294,11 +301,15 @@ pub fn plan_select(
 }
 
 /// Plan a semantic search with adaptive strategy selection.
+///
+/// `limit` is the SQL `LIMIT` count (top-k bound) when the query carries
+/// one, or `None` to use the executor's default page size.
 pub fn plan_semantic_search(
     table: String,
     semantic: SemanticMatchExpr,
     filter: Option<FilterExpr>,
     stats: Option<&PlannerStats>,
+    limit: Option<usize>,
 ) -> QueryPlan {
     if let Some(filter) = filter {
         let strategy = stats
@@ -310,6 +321,7 @@ pub fn plan_semantic_search(
             filter,
             semantic,
             strategy,
+            limit,
         }
     } else {
         QueryPlan::SemanticSearch {
@@ -318,6 +330,7 @@ pub fn plan_semantic_search(
             query_text: semantic.query.clone(),
             threshold: semantic.threshold,
             strategy: SearchStrategy::HnswWithPostFilter,
+            limit,
         }
     }
 }

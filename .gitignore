@@ -34,11 +34,24 @@ _galaxdb_reserve
 .env.local
 __pycache__/
 
+# Secrets / credentials — never tracked (PyPI token, etc.)
+.pypirc
+.secrets/
+*.token
+
+# Local scratch / working notes — not part of the repo
+.tmp_*
+COMMIT_MSG.tmp
+SESSION_SUMMARY.md
+
 # Kiro specs — internal design docs, not for public repo
 .kiro/
 
 # Internal consolidation docs
 docs/CONSOLIDATION.md
+
+# Internal distribution/release operator reference (channels, publish steps)
+docs/DISTRIBUTIONS.md
 docs/architecture/
 docs/archive/
 

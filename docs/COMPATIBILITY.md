@@ -97,8 +97,8 @@ an aspiration. When a feature is Partial, the limit is named.
 
 | Feature | Status | Notes |
 |---|---|---|
-| `EMBEDDING MODEL` columns | ✅ | Embeddings computed via the sidecar on INSERT. |
-| `SEMANTIC_MATCH(col, query, threshold)` | ✅ | HNSW + delta buffer vector search. |
+| `EMBEDDING MODEL` columns | ✅ | Embeddings computed via the sidecar on `INSERT` **and** `COPY`/bulk load. |
+| `SEMANTIC_MATCH(col, query, threshold)` | ✅ | HNSW + delta buffer vector search. Add `LIMIT n` to return the *n* nearest matches; without a `LIMIT` the default page size is 10. |
 | `WHERE NOT DUPLICATE` | ✅ | Near-duplicate collapsing. |
 | `AT VERSION <tag\|ts>` time-travel | 🟡 | Single-table native scans; not yet in analytical (JOIN) queries or transactions. |
 | `CREATE VERSION TAG` | ✅ | Pins an MVCC snapshot; GC-exempt. |

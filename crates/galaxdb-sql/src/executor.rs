@@ -36,7 +36,6 @@ use std::sync::Arc;
 
 use galaxdb_common::{GalaxError, GalaxResult, StorageMode, Timestamp};
 use galaxdb_sidecar::manager::SidecarManager;
-use galaxdb_sidecar::protocol::EmbedRequest;
 use galaxdb_storage::engine::Engine;
 use galaxdb_versioning::{MerkleDag, MinHashDedup, TagCatalog, SIGNATURE_BYTES};
 
@@ -131,6 +130,40 @@ pub trait VectorSearchBackend: Send + Sync {
     /// implement this. Any backend that manages a real delta buffer
     /// MUST override.
     fn on_row_deleted(&self, _table: &str, _row_key: &[u8]) -> GalaxResult<()> {
+        Ok(())
+    }
+
+    /// Record a row insertion in the vector-index side of the world.
+    ///
+    /// When the SQL executor inserts a row into a table that carries an
+    /// embedding column, it must tell the vector backend so the backend
+    /// can embed the source text (via its sidecar) and store the vector
+    /// in the delta buffer / HNSW graph, keyed by the row's primary key.
+    /// Without this call the row's scalar columns persist but its vector
+    /// is never indexed, so later `SEMANTIC_MATCH` queries silently return
+    /// nothing — the exact defect this hook closes.
+    ///
+    /// `row_key` is the raw primary-key bytes as stored in the engine
+    /// (identical to what `Engine::put_sync` receives). The backend hashes
+    /// it to its internal vector-row-id space (xxh3_64) so results join
+    /// back to table rows in `exec_semantic_search`.
+    ///
+    /// `row` is the fully ordered `(column_name, value)` list for the
+    /// inserted row, so the backend can locate its embedding source column.
+    ///
+    /// Returns a typed error if a configured sidecar fails to embed. When
+    /// no sidecar is configured the backend returns `Ok(())` (embeddings
+    /// are disabled for that deployment; `semantic_search` surfaces
+    /// `SidecarUnavailable`) — never a fabricated vector.
+    ///
+    /// Default implementation is a no-op so test stubs need not implement
+    /// it. Any backend that manages a real delta buffer MUST override.
+    fn on_row_inserted(
+        &self,
+        _table: &str,
+        _row_key: &[u8],
+        _row: &[(String, Value)],
+    ) -> GalaxResult<()> {
         Ok(())
     }
 }
@@ -868,15 +901,17 @@ pub fn execute_with_context(
             query_text,
             threshold,
             strategy,
+            limit,
             ..
-        } => exec_semantic_search(table, query_text, *threshold, *strategy, ctx),
+        } => exec_semantic_search(table, query_text, *threshold, *strategy, *limit, ctx),
 
         QueryPlan::HybridSearch {
             table,
             filter,
             semantic,
             strategy,
-        } => exec_hybrid_search(table, semantic, filter, *strategy, ctx),
+            limit,
+        } => exec_hybrid_search(table, semantic, filter, *strategy, *limit, ctx),
 
         QueryPlan::HybridSearchAtVersion {
             table,
@@ -884,7 +919,16 @@ pub fn execute_with_context(
             semantic,
             strategy,
             at,
-        } => exec_hybrid_search_at_version(table, semantic, filter.as_ref(), *strategy, at, ctx),
+            limit,
+        } => exec_hybrid_search_at_version(
+            table,
+            semantic,
+            filter.as_ref(),
+            *strategy,
+            at,
+            *limit,
+            ctx,
+        ),
 
         QueryPlan::CreateRole(stmt) => exec_create_role(stmt, ctx),
         QueryPlan::DropRole { name, if_exists } => exec_drop_role_principal(name, *if_exists, ctx),
@@ -1167,31 +1211,27 @@ fn exec_insert(
         idx.on_row_inserted(table, &ordered, &key)?;
     }
 
-    // Async sidecar embedding trigger for tables with an embedding column.
-    // This is best-effort: if the sidecar is down the request is queued on
-    // the sidecar's backlog (Req 19.5). Failure here does NOT roll back
-    // the row — the embedding is regenerated later.
+    // Sidecar embedding for tables with an embedding column. The vector
+    // backend embeds the source text and stores the vector in the delta
+    // buffer / HNSW graph so later SEMANTIC_MATCH queries find the row.
+    // This is routed through the backend (not a fire-and-forget
+    // `sidecar.embed` whose result was previously discarded) so that BOTH
+    // the embedded `&mut self` path and the server's concurrent `&self`
+    // path populate the index through the same code.
+    //
+    // The row is already durably written above; embedding generation is
+    // best-effort (Req 19.5 backlog) — a sidecar failure is surfaced in
+    // logs and the vector is regenerated later, rather than faking a
+    // vector or rolling back a committed row.
     if table_entry.has_embedding {
-        if let Some(sidecar) = ctx.sidecar.as_ref() {
-            for col in &table_entry.columns {
-                if !col.is_embedding_source {
-                    continue;
-                }
-                let text = ordered
-                    .iter()
-                    .find(|(name, _)| name == &col.name)
-                    .and_then(|(_, v)| match v {
-                        Value::Text(s) => Some(s.clone()),
-                        _ => None,
-                    });
-                let Some(text) = text else { continue };
-
-                let row_id = xxhash_rust::xxh3::xxh3_64(&key);
-                let _ = sidecar.embed(EmbedRequest {
-                    row_id,
-                    text,
-                    column: col.name.clone(),
-                });
+        if let Some(backend) = ctx.vector_backend.as_ref() {
+            if let Err(e) = backend.on_row_inserted(table, &key, &ordered) {
+                tracing::warn!(
+                    table = %table,
+                    error = %e,
+                    "embedding generation failed for inserted row; \
+                     it will be regenerated by the backlog worker",
+                );
             }
         }
     }
@@ -2373,32 +2413,28 @@ fn exec_bulk_insert(
     // actually has indexes / an embedding column. Plain tables skip this
     // loop entirely, preserving the single-fsync fast path above.
     let has_index = ctx.secondary_index.is_some();
-    let has_embedding = table_entry.has_embedding && ctx.sidecar.is_some();
+    let has_embedding = table_entry.has_embedding && ctx.vector_backend.is_some();
     if has_index || has_embedding {
         for (ordered, (key, _)) in ordered_rows.iter().zip(pairs.iter()) {
             if let Some(idx) = ctx.secondary_index.as_ref() {
                 idx.on_row_inserted(table, ordered, key)?;
             }
+            // Populate the vector index through the backend hook (same
+            // path as exec_insert). Previously this fired `sidecar.embed`
+            // and discarded the result, so BULK INSERT / COPY into a table
+            // with an embedding column stored no vectors and later
+            // SEMANTIC_MATCH silently returned nothing. Best-effort: the
+            // row is already committed; a sidecar failure is logged and
+            // regenerated later (Req 19.5), never faked or rolled back.
             if has_embedding {
-                if let Some(sidecar) = ctx.sidecar.as_ref() {
-                    for col in &table_entry.columns {
-                        if !col.is_embedding_source {
-                            continue;
-                        }
-                        let text = ordered
-                            .iter()
-                            .find(|(name, _)| name == &col.name)
-                            .and_then(|(_, v)| match v {
-                                Value::Text(s) => Some(s.clone()),
-                                _ => None,
-                            });
-                        let Some(text) = text else { continue };
-                        let row_id = xxhash_rust::xxh3::xxh3_64(key);
-                        let _ = sidecar.embed(EmbedRequest {
-                            row_id,
-                            text,
-                            column: col.name.clone(),
-                        });
+                if let Some(backend) = ctx.vector_backend.as_ref() {
+                    if let Err(e) = backend.on_row_inserted(table, key, ordered) {
+                        tracing::warn!(
+                            table = %table,
+                            error = %e,
+                            "embedding generation failed for bulk-inserted row; \
+                             it will be regenerated by the backlog worker",
+                        );
                     }
                 }
             }
@@ -2412,11 +2448,16 @@ fn exec_bulk_insert(
 // Semantic search
 // ---------------------------------------------------------------------------
 
+/// Default top-k page size for a `SEMANTIC_MATCH` query with no SQL `LIMIT`.
+/// An explicit `LIMIT n` overrides this and returns the n nearest matches.
+const DEFAULT_SEMANTIC_LIMIT: usize = 10;
+
 fn exec_semantic_search(
     table: &str,
     query_text: &str,
     threshold: f64,
     strategy: SearchStrategy,
+    limit: Option<usize>,
     ctx: &mut ExecutorContext,
 ) -> GalaxResult<ExecuteResult> {
     let _span = tracing::info_span!(
@@ -2434,7 +2475,8 @@ fn exec_semantic_search(
         .as_ref()
         .ok_or(GalaxError::SidecarUnavailable)?;
 
-    let results = backend.semantic_search(table, query_text, threshold, 10, strategy)?;
+    let k = limit.unwrap_or(DEFAULT_SEMANTIC_LIMIT);
+    let results = backend.semantic_search(table, query_text, threshold, k, strategy)?;
 
     // Join vector results back to actual table rows using the row_id
     // (which is xxh3_64 of the primary key). Scan the table and match.
@@ -2478,6 +2520,7 @@ fn exec_hybrid_search(
     semantic: &SemanticMatchExpr,
     filter: &FilterExpr,
     strategy: SearchStrategy,
+    limit: Option<usize>,
     ctx: &mut ExecutorContext,
 ) -> GalaxResult<ExecuteResult> {
     if !ctx.catalog.table_exists(table) {
@@ -2488,16 +2531,17 @@ fn exec_hybrid_search(
         .as_ref()
         .ok_or(GalaxError::SidecarUnavailable)?;
 
+    let k = limit.unwrap_or(DEFAULT_SEMANTIC_LIMIT);
     let results = match strategy {
         SearchStrategy::BruteForceFiltered => backend.brute_force_filtered(
             table,
             &semantic.query,
             semantic.threshold,
-            10,
+            k,
             filter,
         )?,
         SearchStrategy::HnswWithPostFilter => {
-            backend.semantic_search(table, &semantic.query, semantic.threshold, 10, strategy)?
+            backend.semantic_search(table, &semantic.query, semantic.threshold, k, strategy)?
         }
     };
     Ok(semantic_results_to_rows(&results))
@@ -2521,6 +2565,7 @@ fn exec_hybrid_search_at_version(
     filter: Option<&FilterExpr>,
     strategy: SearchStrategy,
     at: &AtVersionExpr,
+    limit: Option<usize>,
     ctx: &mut ExecutorContext,
 ) -> GalaxResult<ExecuteResult> {
     if !ctx.catalog.table_exists(table) {
@@ -2570,21 +2615,22 @@ fn exec_hybrid_search_at_version(
         .vector_backend
         .as_ref()
         .ok_or(GalaxError::SidecarUnavailable)?;
+    let k = limit.unwrap_or(DEFAULT_SEMANTIC_LIMIT);
     let raw = if let Some(f) = filter {
         match strategy {
             SearchStrategy::BruteForceFiltered => {
-                backend.brute_force_filtered(table, &semantic.query, semantic.threshold, 10, f)?
+                backend.brute_force_filtered(table, &semantic.query, semantic.threshold, k, f)?
             }
             SearchStrategy::HnswWithPostFilter => backend.semantic_search(
                 table,
                 &semantic.query,
                 semantic.threshold,
-                10,
+                k,
                 strategy,
             )?,
         }
     } else {
-        backend.semantic_search(table, &semantic.query, semantic.threshold, 10, strategy)?
+        backend.semantic_search(table, &semantic.query, semantic.threshold, k, strategy)?
     };
 
     // Intersect with rows visible at `read_ts`. Rows that don't exist

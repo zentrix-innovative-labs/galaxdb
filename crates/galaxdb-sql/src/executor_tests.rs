@@ -1077,6 +1077,7 @@ fn context_semantic_search_returns_results() {
         },
         None,
         None,
+        None,
     );
     let result = execute_with_context(&plan, &mut ctx).unwrap();
     match result {
@@ -1106,6 +1107,7 @@ fn context_semantic_search_without_backend_returns_sidecar_unavailable() {
         },
         None,
         None,
+        None,
     );
     let err = execute_with_context(&plan, &mut ctx).unwrap_err();
     assert!(matches!(err, GalaxError::SidecarUnavailable));
@@ -1126,6 +1128,7 @@ fn context_semantic_search_backend_failure_propagates() {
             query: "x".to_string(),
             threshold: 0.5,
         },
+        None,
         None,
         None,
     );
@@ -1160,6 +1163,7 @@ fn context_hybrid_search_brute_force_strategy() {
             value: Value::Integer(100),
         }),
         Some(&stats),
+        None,
     );
     let result = execute_with_context(&plan, &mut ctx).unwrap();
     match result {
@@ -1208,6 +1212,7 @@ fn context_hybrid_search_hnsw_strategy() {
             value: Value::Integer(0),
         }),
         Some(&stats),
+        None,
     );
     let result = execute_with_context(&plan, &mut ctx).unwrap();
     match result {

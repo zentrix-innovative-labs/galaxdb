@@ -212,7 +212,21 @@ SELECT id, body
 FROM docs
 WHERE SEMANTIC_MATCH(body, 'machine learning', 0.5)
   AND id > 2;
+
+-- Control how many matches come back with LIMIT (top-k by similarity)
+SELECT id, body
+FROM docs
+WHERE SEMANTIC_MATCH(body, 'machine learning', 0.3)
+LIMIT 50;
 ```
+
+**How many rows come back:** `SEMANTIC_MATCH` is a top-k nearest-neighbour
+search. Add `LIMIT n` to get the *n* nearest matches above the threshold —
+the query returns them ranked by similarity. Without a `LIMIT`, GalaxDB
+returns a default page of the 10 nearest matches, so if you expect more than
+10 results, always specify a `LIMIT`. (A bare `LIMIT` stays on the fast
+native vector path; adding `ORDER BY`, `GROUP BY`, or a `JOIN` routes the
+matched set through the analytical engine instead.)
 
 **Threshold guide:**
 - `0.8+` — very close matches only (near-duplicates)
@@ -460,7 +474,11 @@ The sidecar downloads the model from HuggingFace Hub on first run (~90 MB for `a
 **SEMANTIC_MATCH returns 0 rows**
 - Check `sidecar_healthy: true` in `/health`
 - Lower the threshold (try `0.3` or `0.2`)
-- Make sure rows were inserted after the sidecar was running (embeddings are computed at insert time)
+- Make sure rows were inserted after the sidecar was running (embeddings are computed at insert time, over both `INSERT` and `COPY`)
+
+**SEMANTIC_MATCH returns at most 10 rows**
+Without a `LIMIT`, GalaxDB returns the 10 nearest matches by default. Add
+`LIMIT n` to get more (e.g. `... SEMANTIC_MATCH(body, 'query', 0.3) LIMIT 100`).
 
 **Port 9090 already in use**
 Use `--observe-port 9091` (or any free port).

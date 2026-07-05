@@ -5,8 +5,27 @@
 set -euo pipefail
 
 REPO="zentrix-innovative-labs/galaxdb"
-VERSION="v0.2.0"
 INSTALL_DIR="${GALAXDB_INSTALL_DIR:-/usr/local/bin}"
+
+# Resolve the version to install. By default we ask the GitHub API for the
+# latest published release so this script never needs editing on a new
+# release. Pin a specific version with GALAXDB_VERSION=v0.3.0 if you need to.
+detect_latest_version() {
+    local api="https://api.github.com/repos/${REPO}/releases/latest"
+    local tag
+    # Parse "tag_name": "v0.3.0" without requiring jq.
+    tag="$(curl -fsSL "$api" \
+        | grep -m1 '"tag_name"' \
+        | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')"
+    if [ -z "$tag" ]; then
+        echo "ERROR: could not determine the latest GalaxDB release from ${api}." >&2
+        echo "       Set GALAXDB_VERSION=vX.Y.Z to install a specific version." >&2
+        exit 1
+    fi
+    echo "$tag"
+}
+
+VERSION="${GALAXDB_VERSION:-$(detect_latest_version)}"
 
 detect_platform() {
     local os arch

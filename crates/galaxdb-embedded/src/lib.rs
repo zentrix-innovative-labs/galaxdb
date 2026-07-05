@@ -126,8 +126,6 @@ struct TableVectorIndex {
     embedding_column: String,
     /// Source text column (for `SEMANTIC_MATCH` lookup).
     source_column: String,
-    /// Row-id counter.
-    next_row_id: u64,
     /// Row-id → vector (for re-ranking).
     vectors: HashMap<u64, Vec<f32>>,
     /// Primary-key bytes → vector row-id. Populated when the sidecar
@@ -1517,14 +1515,26 @@ impl Database {
                 }
             }
             AuroraStatement::ShowEmbeddingHealth { table } => {
-                let msg = table
-                    .as_ref()
-                    .map_or("SHOW EMBEDDING HEALTH".to_string(), |t| {
-                        format!("SHOW EMBEDDING HEALTH FOR {}", t)
-                    });
-                Ok(QueryResult::Rows(vec![QueryRow {
-                    values: vec![("status".to_string(), msg)],
-                }]))
+                // Route through the real executor so this reports the
+                // actual sidecar state + model version (Req 19), not a
+                // canned echo string. Build a read context that carries
+                // the sidecar so `exec_show_embedding_health` can inspect
+                // it.
+                let plan = planner::QueryPlan::ShowEmbeddingHealth {
+                    table: table.clone(),
+                };
+                let mut ctx = ExecutorContext::new(self.engine.clone());
+                ctx.catalog = self.catalog.clone();
+                ctx.sidecar = self.sidecar.clone();
+                // The authorization chokepoint resolves the session role's
+                // grants through the auth store — without it even a valid
+                // read is denied. Mirror the SELECT readonly path.
+                ctx.auth_store =
+                    Some(galaxdb_sql::auth_store::AuthStore::new(self.engine.clone()));
+                ctx.session = session.cloned();
+                ctx.audit = self.audit.clone();
+                let res = execute_with_context(&plan, &mut ctx)?;
+                Ok(query_result_from(res))
             }
             _ => Err(GalaxError::Internal(
                 "execute_readonly only supports SELECT and SHOW; use execute() for \
@@ -1549,23 +1559,26 @@ impl Database {
 
         // Detect SEMANTIC_MATCH in WHERE and route to vector search.
         if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
-            // SEMANTIC_MATCH combined with analytical clauses (JOIN / GROUP BY
-            // / aggregate / ORDER BY / …) → feed the matched candidate set to
-            // the DataFusion analytical engine (HTAP task 16). A plain
-            // single-table SEMANTIC_MATCH stays on the native vector path.
-            if matches!(
-                galaxdb_sql::classify::classify_query(q),
-                galaxdb_sql::classify::StatementClass::Analytical
-            ) {
+            // SEMANTIC_MATCH combined with *genuine* analytical clauses
+            // (JOIN / GROUP BY / aggregate / ORDER BY / …) → feed the matched
+            // candidate set to the DataFusion analytical engine (HTAP task
+            // 16). A bare `LIMIT` / `OFFSET` is NOT such a clause: it stays on
+            // the native similarity-ranked path and becomes the top-k bound,
+            // so `SEMANTIC_MATCH(...) LIMIT n` returns the n nearest matches
+            // (previously LIMIT>100 was silently capped by the analytical
+            // candidate ceiling, and a plain query capped at 10).
+            if galaxdb_sql::classify::is_analytical_beyond_pagination(q) {
                 return self.analytical_semantic_query(q, &semantic_expr, session);
             }
             let table = extract_table(q);
             let (_columns, extra_filter) = extract_projection_and_filter_no_semantic(q);
+            let limit = galaxdb_sql::classify::query_limit(q);
             let plan = planner::plan_semantic_search(
                 table.clone(),
                 semantic_expr,
                 extra_filter,
                 None,
+                limit,
             );
             let mut ctx = ExecutorContext::new(self.engine.clone());
             ctx.catalog = self.catalog.clone();
@@ -1738,10 +1751,16 @@ impl Database {
         // Residual (non-semantic) relational predicate → adaptive strategy.
         let (_proj, residual) = extract_projection_and_filter_no_semantic(q);
 
-        // Cap on the candidate set the analytical query aggregates over. Larger
-        // than the native default (10) because aggregates/joins want the full
-        // matched population, not just a display page.
-        const CANDIDATE_K: usize = 100;
+        // Candidate set the analytical query aggregates/paginates over.
+        // The floor (100) is larger than the native default because
+        // aggregates/joins want the full matched population, not a display
+        // page. An explicit `LIMIT n` larger than the floor raises the
+        // ceiling to `n` so `SEMANTIC_MATCH(...) LIMIT 500` is not silently
+        // truncated to 100 before DataFusion applies the limit.
+        const CANDIDATE_K_FLOOR: usize = 100;
+        let candidate_k = galaxdb_sql::classify::query_limit(q)
+            .map(|n| n.max(CANDIDATE_K_FLOOR))
+            .unwrap_or(CANDIDATE_K_FLOOR);
 
         let backend = EmbeddedVectorBackend {
             sidecar: self.sidecar.clone(),
@@ -1753,14 +1772,14 @@ impl Database {
                 &sem_table,
                 &semantic.query,
                 semantic.threshold,
-                CANDIDATE_K,
+                candidate_k,
                 f,
             )?,
             None => backend.semantic_search(
                 &sem_table,
                 &semantic.query,
                 semantic.threshold,
-                CANDIDATE_K,
+                candidate_k,
                 SearchStrategy::HnswWithPostFilter,
             )?,
         };
@@ -2062,7 +2081,6 @@ impl Database {
                         dim,
                         embedding_column: col.name.clone(),
                         source_column: col.name.clone(),
-                        next_row_id: 0,
                         vectors: HashMap::new(),
                         key_to_row_id: HashMap::new(),
                     };
@@ -2080,11 +2098,11 @@ impl Database {
 
     fn exec_insert(&mut self, ins: &sqlparser::ast::Insert) -> GalaxResult<QueryResult> {
         let table = ins.table_name.to_string();
-        let entry = self
-            .catalog
-            .get_table(&table)
-            .cloned()
-            .ok_or_else(|| GalaxError::TableNotFound(table.clone()))?;
+        // Validate the table exists up front for a clean error before the
+        // per-row loop (execute_with_context re-checks internally).
+        if !self.catalog.table_exists(&table) {
+            return Err(GalaxError::TableNotFound(table.clone()));
+        }
 
         let column_names: Vec<String> = ins
             .columns
@@ -2116,105 +2134,14 @@ impl Database {
             if matches!(res, ExecuteResult::RowCount(_)) {
                 count += 1;
             }
-
-            // Async embedding trigger for tables with an embedding
-            // column. The sidecar-backed path queues the text; on
-            // success the vector lands in the per-table delta buffer
-            // so later SEMANTIC_MATCH queries can find it.
-            if entry.has_embedding {
-                self.generate_embedding_for_row(&table, &entry, &column_names, &row_values);
-            }
+            // Embedding population happens inside `execute_with_context`
+            // (exec_insert → VectorSearchBackend::on_row_inserted), which
+            // both this `&mut self` path and the server's concurrent
+            // `&self` path share. No separate trigger here — that used to
+            // double-embed the wire path or skip it entirely.
         }
 
         Ok(QueryResult::RowCount(count))
-    }
-
-    fn generate_embedding_for_row(
-        &self,
-        table: &str,
-        entry: &galaxdb_sql::executor::TableEntry,
-        column_names: &[String],
-        values: &[Value],
-    ) {
-        let Some(sidecar) = self.sidecar.as_ref() else {
-            return;
-        };
-        let indexes = self.vector_indexes.read().unwrap();
-        let Some(index_meta) = indexes.get(table) else {
-            return;
-        };
-        // Resolve the source-column index in this INSERT's value list.
-        let (source_col_name, source_col_index) = resolve_source_column(
-            entry,
-            column_names,
-            &index_meta.source_column,
-        );
-        let Some(idx) = source_col_index else {
-            return;
-        };
-        let Value::Text(text) = &values[idx] else {
-            return;
-        };
-        let text = text.clone();
-        drop(indexes);
-
-        // Compute the storage primary key for this row so we can
-        // remember the mapping `primary_key -> vector_row_id`. SQL
-        // DELETEs later use this to tombstone the right delta-buffer
-        // entry (task 18.6). Failure to build the key is non-fatal —
-        // the row still gets embedded, it just can't be reverse-mapped
-        // later. We log at warn level so operators see the drift.
-        let row_key = match row_codec::align_values(entry, column_names, values)
-            .and_then(|ordered| row_codec::build_primary_key(table, entry, &ordered))
-        {
-            Ok(k) => Some(k),
-            Err(e) => {
-                tracing::warn!(
-                    table = %table,
-                    error = %e,
-                    "could not compute primary key for embedding row; \
-                     DELETE of this row will not tombstone its vector",
-                );
-                None
-            }
-        };
-
-        let row_id = {
-            // Use xxh3_64(storage_key) as the row_id so it matches
-            // what exec_semantic_search uses when joining results back
-            // to table rows. The sequential next_row_id counter was
-            // causing a mismatch — the executor joins by xxh3_64(key)
-            // but the delta buffer had sequential ids.
-            match &row_key {
-                Some(k) => xxhash_rust::xxh3::xxh3_64(k),
-                None => {
-                    // Fallback: sequential id when key isn't available.
-                    let mut indexes = self.vector_indexes.write().unwrap();
-                    let Some(mut_idx) = indexes.get_mut(table) else {
-                        return;
-                    };
-                    let id = mut_idx.next_row_id;
-                    mut_idx.next_row_id += 1;
-                    id
-                }
-            }
-        };
-
-        let request = EmbedRequest {
-            row_id,
-            text,
-            column: source_col_name,
-        };
-        if let Ok(response) = sidecar.embed(request) {
-            let mut indexes = self.vector_indexes.write().unwrap();
-            if let Some(mut_idx) = indexes.get_mut(table) {
-                mut_idx.delta.insert(row_id, response.embedding.clone());
-                mut_idx.vectors.insert(row_id, response.embedding);
-                if let Some(key) = row_key {
-                    mut_idx.key_to_row_id.insert(key, row_id);
-                }
-            }
-        }
     }
 
     fn exec_select(&mut self, q: &sqlparser::ast::Query) -> GalaxResult<QueryResult> {
@@ -2235,21 +2162,21 @@ impl Database {
         // Detect SEMANTIC_MATCH(...) in the WHERE clause and route to
         // the vector search path instead of a full scan.
         if let Some(semantic_expr) = extract_semantic_match_from_query(q) {
-            // SEMANTIC_MATCH + analytical clauses → analytical candidate path
-            // (HTAP task 16); a plain single-table match stays native.
-            if matches!(
-                galaxdb_sql::classify::classify_query(q),
-                galaxdb_sql::classify::StatementClass::Analytical
-            ) {
+            // SEMANTIC_MATCH + *genuine* analytical clauses → analytical
+            // candidate path (HTAP task 16). A bare LIMIT/OFFSET stays native
+            // and becomes the top-k bound (see select_readonly for details).
+            if galaxdb_sql::classify::is_analytical_beyond_pagination(q) {
                 let session = self.session.clone();
                 return self.analytical_semantic_query(q, &semantic_expr, session.as_ref());
             }
             let (_columns, extra_filter) = extract_projection_and_filter_no_semantic(q);
+            let limit = galaxdb_sql::classify::query_limit(q);
             let plan = planner::plan_semantic_search(
                 table.clone(),
                 semantic_expr,
                 extra_filter,
                 None,
+                limit,
             );
             let mut ctx = self.context();
             let res = execute_with_context(&plan, &mut ctx)?;
@@ -2497,6 +2424,9 @@ impl Database {
             table_name,
             expr.clone(),
             None,
+            None,
+            // Standalone SEMANTIC_MATCH (not a SELECT) carries no SQL LIMIT;
+            // use the executor's default page size.
             None,
         );
         self.dispatch(plan)
@@ -3227,6 +3157,71 @@ impl VectorSearchBackend for EmbeddedVectorBackend {
             idx.delta.delete(row_id);
             idx.vectors.remove(&row_id);
             idx.key_to_row_id.remove(row_key);
+        }
+
+        Ok(())
+    }
+
+    fn on_row_inserted(
+        &self,
+        table: &str,
+        row_key: &[u8],
+        row: &[(String, Value)],
+    ) -> GalaxResult<()> {
+        // No sidecar configured → embeddings are disabled for this
+        // deployment. Scalar SQL still works and `semantic_search`
+        // surfaces `SidecarUnavailable`. Never fabricate a vector.
+        let Some(sidecar) = self.sidecar.as_ref() else {
+            return Ok(());
+        };
+
+        // Resolve the embedding source column and its text value for this
+        // table's index. If the table has no vector index, or this row
+        // carries no text in the source column, there is nothing to embed.
+        let (source_column, text) = {
+            let indexes = self.indexes.read().unwrap();
+            let Some(idx) = indexes.get(table) else {
+                return Ok(());
+            };
+            let source_column = idx.source_column.clone();
+            let text = row
+                .iter()
+                .find(|(name, _)| name == &source_column)
+                .and_then(|(_, v)| match v {
+                    Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                });
+            match text {
+                Some(t) => (source_column, t),
+                None => return Ok(()),
+            }
+        };
+
+        // Use xxh3_64(primary_key) as the vector row-id so results join
+        // back to table rows in `exec_semantic_search` (which hashes the
+        // same key) and so `on_row_deleted` can tombstone the right entry.
+        let row_id = xxhash_rust::xxh3::xxh3_64(row_key);
+
+        let response = sidecar
+            .embed(EmbedRequest {
+                row_id,
+                text,
+                column: source_column,
+            })
+            .map_err(|e| {
+                GalaxError::Internal(format!(
+                    "embedding sidecar failed for insert into '{table}': {e}"
+                ))
+            })?;
+
+        // Store the vector in both the delta buffer (searched by
+        // SEMANTIC_MATCH) and the re-rank vector map, and remember the
+        // primary-key → row-id mapping so a later DELETE can tombstone it.
+        let mut indexes = self.indexes.write().unwrap();
+        if let Some(idx) = indexes.get_mut(table) {
+            idx.delta.insert(row_id, response.embedding.clone());
+            idx.vectors.insert(row_id, response.embedding);
+            idx.key_to_row_id.insert(row_key.to_vec(), row_id);
         }
 
         Ok(())
@@ -4144,23 +4139,6 @@ fn literal_value(expr: &sqlparser::ast::Expr) -> Option<Value> {
         },
         _ => None,
     }
-}
-
-/// Find the column name and its index in `column_names` (the explicit
-/// INSERT column list) that corresponds to the table's embedding source
-/// column. If `column_names` is empty the index is resolved
-/// positionally against `entry.columns`.
-fn resolve_source_column(
-    entry: &galaxdb_sql::executor::TableEntry,
-    column_names: &[String],
-    source_col: &str,
-) -> (String, Option<usize>) {
-    if !column_names.is_empty() {
-        let idx = column_names.iter().position(|n| n == source_col);
-        return (source_col.to_string(), idx);
-    }
-    let idx = entry.columns.iter().position(|c| c.name == source_col);
-    (source_col.to_string(), idx)
 }
 
 // ---------------------------------------------------------------------------
@@ -5238,6 +5216,107 @@ mod tests {
             other => panic!("expected Rows, got {:?}", other),
         }
     }
+
+    /// Regression test for the wire-protocol SEMANTIC_MATCH defect: the
+    /// server routes INSERT through `execute_dml_concurrent` (`&self`) and
+    /// SELECT through `execute_readonly_with_session` (`&self`), NOT the
+    /// `&mut self` `execute()` path the other online tests use. Before the
+    /// fix, `execute_dml_concurrent` never populated the vector index, so
+    /// SEMANTIC_MATCH over the wire returned zero rows silently. This test
+    /// drives the exact server paths and asserts a non-empty result.
+    ///
+    /// ```text
+    /// cargo test -p galaxdb-embedded --features online-tests --release \
+    ///   semantic_match_concurrent_wire_path
+    /// ```
+    #[cfg(feature = "online-tests")]
+    #[test]
+    fn semantic_match_concurrent_wire_path() {
+        const MODEL_ID: &str = "sentence-transformers/all-MiniLM-L6-v2";
+        const MODEL_DIM: usize = 384;
+
+        let sidecar_binary = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("galaxdb-sidecar");
+        if !sidecar_binary.exists() {
+            let status = std::process::Command::new("cargo")
+                .args(["build", "-p", "galaxdb-sidecar"])
+                .status()
+                .expect("cargo build");
+            assert!(status.success(), "failed to build sidecar binary");
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("semantic_wire_db");
+        std::mem::forget(dir);
+        let mut db = Database::open_with_sidecar(
+            db_path.to_str().unwrap(),
+            sidecar_binary.to_str().unwrap(),
+            MODEL_ID,
+        )
+        .unwrap();
+
+        // DDL still goes through the write path (as the server does).
+        db.execute(&format!(
+            "CREATE TABLE docs (id INT PRIMARY KEY, \
+             content TEXT EMBEDDING MODEL '{MODEL_ID}' DIM {MODEL_DIM})"
+        ))
+        .unwrap();
+
+        // INSERT via the CONCURRENT path — the one the server uses for DML
+        // and the one that was broken.
+        db.execute_dml_concurrent(
+            "INSERT INTO docs (id, content) VALUES (1, 'machine learning is great')",
+            None,
+        )
+        .unwrap();
+        db.execute_dml_concurrent(
+            "INSERT INTO docs (id, content) VALUES (2, 'rust programming language')",
+            None,
+        )
+        .unwrap();
+        db.execute_dml_concurrent(
+            "INSERT INTO docs (id, content) VALUES (3, 'deep neural networks for vision')",
+            None,
+        )
+        .unwrap();
+
+        // The concurrent INSERT path must now populate the vector index.
+        {
+            let indexes = db.vector_indexes.read().unwrap();
+            let idx = indexes.get("docs").unwrap();
+            assert_eq!(
+                idx.delta.vector_count(),
+                3,
+                "concurrent INSERT path must produce three sidecar embeddings \
+                 (this is the regression: it used to be 0)"
+            );
+        }
+
+        // SELECT via the READONLY path — the one the server uses for reads.
+        let result = db
+            .execute_readonly_with_session(
+                "SELECT id, content FROM docs \
+                 WHERE SEMANTIC_MATCH(content, 'machine learning', 0.0)",
+                None,
+            )
+            .unwrap();
+        match result {
+            QueryResult::Rows(rows) => {
+                assert!(
+                    !rows.is_empty(),
+                    "SEMANTIC_MATCH over the concurrent+readonly (wire) path must \
+                     return results now that the index is populated"
+                );
+            }
+            other => panic!("expected Rows, got {:?}", other),
+        }
+    }
+
     // Before Phase I, `exec_select`, `exec_update`, and `exec_delete`
     // hard-coded `filter: None`, silently ignoring the WHERE clause.
     // These tests drive real SQL through `Database::execute` and assert

@@ -186,7 +186,7 @@ fn plan_semantic_search_without_filter() {
         threshold: 0.8,
     };
 
-    let plan = plan_semantic_search("docs".to_string(), semantic, None, None);
+    let plan = plan_semantic_search("docs".to_string(), semantic, None, None, None);
 
     match plan {
         QueryPlan::SemanticSearch {
@@ -224,6 +224,7 @@ fn plan_hybrid_search_with_stats() {
         semantic,
         Some(filter),
         Some(&stats),
+        None,
     );
 
     match plan {

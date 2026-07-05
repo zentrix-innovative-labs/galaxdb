@@ -39,6 +39,28 @@ pub fn classify_query(q: &Query) -> StatementClass {
     }
 }
 
+/// The `LIMIT` count of `q`, if present and a plain non-negative integer
+/// literal. The semantic vector path uses this to treat
+/// `SEMANTIC_MATCH(...) LIMIT n` as a top-n search instead of silently
+/// capping at the default page size. A non-literal limit (`LIMIT ?`,
+/// `LIMIT a+b`) returns `None`, in which case the default applies.
+pub fn query_limit(q: &Query) -> Option<usize> {
+    q.limit.as_ref().and_then(expr_to_usize)
+}
+
+/// True when `q` has an analytical feature *beyond* a bare `LIMIT` / `OFFSET`
+/// — a JOIN, aggregate, GROUP BY, DISTINCT, HAVING, window function,
+/// ORDER BY, subquery, or set operation. A query that is analytical *only*
+/// because it carries `LIMIT` / `OFFSET` returns `false`.
+///
+/// The semantic vector path uses this to keep `SEMANTIC_MATCH(...) LIMIT n`
+/// on the similarity-ranked native path (applying the limit as a top-k
+/// bound) rather than routing it to DataFusion, which would not preserve
+/// similarity order without an explicit `ORDER BY`.
+pub fn is_analytical_beyond_pagination(q: &Query) -> bool {
+    has_order_by(q) || !body_is_native_single_table(q)
+}
+
 /// Is the query body a single-table SELECT with no join, subquery, DISTINCT,
 /// HAVING, GROUP BY, aggregate, or window function? (Ignores ORDER BY / LIMIT
 /// / OFFSET, which are handled separately.)
