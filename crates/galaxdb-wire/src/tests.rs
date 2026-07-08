@@ -325,3 +325,92 @@ fn extract_message_types(buf: &[u8]) -> Vec<u8> {
     }
     types
 }
+
+// ── Wire backward-compat contract (v0.5 Workstream B, task B.6) ────────────
+//
+// These pin the PostgreSQL wire contract so a *patch* release can never
+// silently change framing that existing clients (psql, tokio-postgres, JDBC,
+// pgx, Npgsql, …) depend on (Req 5.4). A deliberate protocol change must edit
+// these asserts — they are the tripwire.
+
+/// Read a backend message's leading type byte and its self-describing length
+/// field (the Int32 after the type byte, which per the PG protocol counts
+/// itself but not the type byte).
+fn tag_and_len(buf: &[u8]) -> (u8, i32) {
+    let len = i32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+    (buf[0], len)
+}
+
+#[test]
+fn protocol_version_is_pinned_to_pg_3_0() {
+    // 3 << 16 | 0. Changing this rejects every existing client at startup.
+    assert_eq!(PROTOCOL_VERSION, 196608);
+    assert_eq!(crate::tls::SSL_REQUEST_CODE, 80_877_103);
+}
+
+#[tokio::test]
+async fn backend_message_framing_is_pinned() {
+    // Fixed-size / simple messages: exact type byte + length field.
+    let mut b = Vec::new();
+    write_auth_ok(&mut b).await.unwrap();
+    assert_eq!(tag_and_len(&b), (b'R', 8));
+
+    b.clear();
+    write_backend_key_data(&mut b, 1, 2).await.unwrap();
+    assert_eq!(tag_and_len(&b), (b'K', 12));
+    assert_eq!(b.len(), 13);
+
+    b.clear();
+    write_ready_for_query(&mut b, b'I').await.unwrap();
+    assert_eq!(tag_and_len(&b), (b'Z', 5));
+    assert_eq!(*b.last().unwrap(), b'I');
+
+    b.clear();
+    write_command_complete(&mut b, "SELECT 1").await.unwrap();
+    assert_eq!(b[0], b'C');
+
+    b.clear();
+    write_parameter_status(&mut b, "server_version", "16.0.0-galaxdb")
+        .await
+        .unwrap();
+    assert_eq!(b[0], b'S');
+
+    b.clear();
+    write_error_response(&mut b, "08P01", "boom").await.unwrap();
+    assert_eq!(b[0], b'E');
+
+    // Extended-protocol acknowledgements are all empty-body (length 4).
+    b.clear();
+    write_parse_complete(&mut b).await.unwrap();
+    assert_eq!(tag_and_len(&b), (b'1', 4));
+    b.clear();
+    write_bind_complete(&mut b).await.unwrap();
+    assert_eq!(tag_and_len(&b), (b'2', 4));
+    b.clear();
+    write_close_complete(&mut b).await.unwrap();
+    assert_eq!(tag_and_len(&b), (b'3', 4));
+    b.clear();
+    write_no_data(&mut b).await.unwrap();
+    assert_eq!(tag_and_len(&b), (b'n', 4));
+    b.clear();
+    write_empty_query_response(&mut b).await.unwrap();
+    assert_eq!(tag_and_len(&b), (b'I', 4));
+    b.clear();
+    write_portal_suspended(&mut b).await.unwrap();
+    assert_eq!(tag_and_len(&b), (b's', 4));
+}
+
+#[tokio::test]
+async fn row_and_data_framing_is_pinned() {
+    let cols = [ColumnDesc::text("id")];
+    let mut b = Vec::new();
+    write_row_description(&mut b, &cols).await.unwrap();
+    assert_eq!(b[0], b'T');
+    // Column count is the Int16 right after the length field.
+    assert_eq!(i16::from_be_bytes([b[5], b[6]]), 1);
+
+    b.clear();
+    write_data_row(&mut b, &[Some("42")]).await.unwrap();
+    assert_eq!(b[0], b'D');
+    assert_eq!(i16::from_be_bytes([b[5], b[6]]), 1);
+}
