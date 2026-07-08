@@ -36,7 +36,52 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as TokioMutex;
 
+use galaxdb_common::format::{self, FormatHeader, FORMAT_HEADER_SIZE};
+
 use super::record::{WalRecord, WalRecordType};
+
+/// Size of the WAL superblock (a `format::WAL` header) written at offset 0 of a
+/// versioned WAL file. Records begin immediately after it.
+const WAL_HEADER_SIZE: u64 = FORMAT_HEADER_SIZE as u64;
+
+/// Map a typed format error to an `io::Error` for the WAL's `io::Result` API.
+fn format_err_to_io(e: galaxdb_common::GalaxError) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, e.to_string())
+}
+
+/// Determine where WAL records begin in an existing file.
+///
+/// Returns `WAL_HEADER_SIZE` if the file opens with a valid, in-range versioned
+/// superblock (`format::WAL`), or `0` for a legacy/headerless file (records from
+/// offset 0, treated as format v1) and for a missing/empty file. A superblock
+/// whose version is out of range surfaces a typed `FormatTooOld`/`FormatTooNew`
+/// (mapped to `InvalidData`) — the rollback-safety refusal.
+fn wal_data_start(path: &Path) -> io::Result<u64> {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e),
+    };
+    let mut magic = [0u8; 4];
+    match file.read_exact(&mut magic) {
+        Ok(()) => {}
+        // Fewer than 4 bytes: empty/tiny file → no header.
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(0),
+        Err(e) => return Err(e),
+    }
+    if magic != format::WAL.magic {
+        // Legacy records (first byte is a record type 0x01–0x06) or a zero-fill
+        // prefix — either way, no versioned superblock. Read from offset 0.
+        return Ok(0);
+    }
+    // Versioned superblock: parse + range-check the full 16-byte header.
+    let mut buf = [0u8; FORMAT_HEADER_SIZE];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut buf)?;
+    let header = FormatHeader::from_bytes(&buf, format::WAL.magic).map_err(format_err_to_io)?;
+    format::WAL.check(header.format_version).map_err(format_err_to_io)?;
+    Ok(WAL_HEADER_SIZE)
+}
 
 /// Default WAL pre-allocation size: 64 MiB written as real zero blocks.
 pub const DEFAULT_WAL_PREALLOCATE_BYTES: u64 = 64 * 1024 * 1024;
@@ -97,6 +142,10 @@ struct WriteState {
     file: File,
     write_offset: u64,
     file_len: u64,
+    /// Byte offset where records begin: `WAL_HEADER_SIZE` for a versioned file,
+    /// `0` for a legacy/headerless one. Legacy files migrate to versioned on
+    /// the next `truncate_to_checkpoint` rewrite.
+    data_start: u64,
 }
 
 /// The WAL writer.
@@ -136,14 +185,18 @@ fn zero_fill(file: &mut File, from_offset: u64, count: u64) -> io::Result<()> {
 
 /// Scan an existing WAL to find the logical end (offset just past the last
 /// valid record). Stops at the first invalid/zero record or EOF.
-fn scan_logical_end(path: &Path) -> io::Result<u64> {
-    let file = match File::open(path) {
+fn scan_logical_end(path: &Path, data_start: u64) -> io::Result<u64> {
+    let mut file = match File::open(path) {
         Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(data_start),
         Err(e) => return Err(e),
     };
+    // Skip the superblock (if any) so scanning starts at the first record.
+    if data_start > 0 {
+        file.seek(SeekFrom::Start(data_start))?;
+    }
     let mut reader = BufReader::new(file);
-    let mut offset: u64 = 0;
+    let mut offset: u64 = data_start;
     loop {
         match WalRecord::deserialize(&mut reader) {
             Ok(Some(rec)) => offset += rec.serialize().len() as u64,
@@ -161,7 +214,19 @@ impl WalWriter {
             fs::create_dir_all(parent)?;
         }
 
-        let logical_end = scan_logical_end(&config.wal_path)?;
+        // A brand-new (missing or zero-length) WAL gets a versioned superblock;
+        // an existing file is opened as-is (versioned if it already has a header,
+        // else legacy from offset 0).
+        let is_fresh = match fs::metadata(&config.wal_path) {
+            Ok(m) => m.len() == 0,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => true,
+            Err(e) => return Err(e),
+        };
+        let mut data_start = if is_fresh {
+            WAL_HEADER_SIZE
+        } else {
+            wal_data_start(&config.wal_path)?
+        };
 
         let mut file = OpenOptions::new()
             .read(true)
@@ -169,6 +234,17 @@ impl WalWriter {
             .create(true)
             .truncate(false) // never truncate on open — WAL recovery reads prior records
             .open(&config.wal_path)?;
+
+        if is_fresh {
+            // Stamp the superblock at offset 0; records begin at WAL_HEADER_SIZE.
+            let header = FormatHeader::new(format::WAL.magic, format::WAL.current_write).to_bytes();
+            file.seek(SeekFrom::Start(0))?;
+            file.write_all(&header)?;
+            file.sync_all()?;
+            data_start = WAL_HEADER_SIZE;
+        }
+
+        let logical_end = scan_logical_end(&config.wal_path, data_start)?;
 
         // Pre-allocate real zero blocks up to at least `preallocate_bytes`.
         let cur_len = file.metadata()?.len();
@@ -198,6 +274,7 @@ impl WalWriter {
                 file,
                 write_offset: logical_end,
                 file_len,
+                data_start,
             }),
             sync_file: Mutex::new(sync_file),
             last_checkpoint: TokioMutex::new(None),
@@ -325,10 +402,16 @@ impl WalWriter {
             ws.file.seek(SeekFrom::Start(cp_info.offset))?;
             ws.file.read_exact(&mut remaining)?;
 
+            // Rewrite the file: superblock at offset 0, then the retained
+            // records. This is also the migration point for a legacy WAL —
+            // after a truncate it is always versioned.
+            let header = FormatHeader::new(format::WAL.magic, format::WAL.current_write).to_bytes();
             ws.file.set_len(0)?;
             ws.file.seek(SeekFrom::Start(0))?;
+            ws.file.write_all(&header)?;
             ws.file.write_all(&remaining)?;
-            let new_end = remaining.len() as u64;
+            ws.data_start = WAL_HEADER_SIZE;
+            let new_end = WAL_HEADER_SIZE + remaining.len() as u64;
             let want = new_end.max(self.prealloc_chunk);
             if want > new_end {
                 zero_fill(&mut ws.file, new_end, want - new_end)?;
@@ -343,7 +426,8 @@ impl WalWriter {
 
         let mut last_cp = self.last_checkpoint.lock().await;
         if let Some(ref mut info) = *last_cp {
-            info.offset = 0;
+            // The retained checkpoint record now sits just past the superblock.
+            info.offset = WAL_HEADER_SIZE;
         }
         tracing::info!(checkpoint_seq_no = cp_info.seq_no, "WAL truncated to checkpoint");
         Ok(())
@@ -366,13 +450,19 @@ impl WalWriter {
 /// the pre-allocated tail terminates replay cleanly.
 #[allow(dead_code)]
 pub fn recover_wal(wal_path: &Path) -> io::Result<(Vec<WalRecord>, u64)> {
-    let file = match File::open(wal_path) {
+    // Skip the versioned superblock (if present); a legacy WAL reads from 0.
+    // A too-new superblock is refused here as a typed error (rollback safety).
+    let data_start = wal_data_start(wal_path)?;
+    let mut file = match File::open(wal_path) {
         Ok(f) => f,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 1)),
         Err(e) => return Err(e),
     };
-    if file.metadata()?.len() == 0 {
+    if file.metadata()?.len() <= data_start {
         return Ok((Vec::new(), 1));
+    }
+    if data_start > 0 {
+        file.seek(SeekFrom::Start(data_start))?;
     }
 
     let mut reader = BufReader::new(file);

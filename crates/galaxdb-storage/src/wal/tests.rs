@@ -445,8 +445,10 @@ async fn recovery_with_corrupt_records() {
     // First, figure out where records are by reading them
     let file_data = std::fs::read(&wal_path).unwrap();
 
-    // Find the approximate offset of the 3rd record by reading first two
+    // Records begin after the versioned superblock (v0.5+). Skip it before
+    // parsing so offsets line up with the on-disk layout.
     let mut cursor = Cursor::new(&file_data);
+    cursor.set_position(galaxdb_common::format::FORMAT_HEADER_SIZE as u64);
     let r1 = WalRecord::deserialize(&mut cursor).unwrap().unwrap();
     let r2 = WalRecord::deserialize(&mut cursor).unwrap().unwrap();
     let offset_of_third = cursor.position() as usize;
@@ -672,4 +674,113 @@ async fn recovery_time_under_30_seconds() {
         "Recovery took {:?}, which exceeds the 30-second target",
         elapsed
     );
+}
+
+// ---------------------------------------------------------------------------
+// v0.5 format versioning: superblock, legacy read, newer-format refusal, restart
+// ---------------------------------------------------------------------------
+
+/// A legacy (pre-v0.5) WAL with no superblock — records from offset 0 — still
+/// recovers cleanly (backward-compat, Req 5.1).
+#[tokio::test]
+async fn legacy_headerless_wal_still_recovers() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join("legacy.wal");
+
+    let mut buf = Vec::new();
+    for i in 0..3u64 {
+        let rec = WalRecord::new(WalRecordType::RowPut, i + 1, format!("legacy-{i}").into_bytes());
+        buf.extend_from_slice(&rec.serialize());
+    }
+    std::fs::write(&wal_path, &buf).unwrap();
+
+    let (records, next_seq) = recover_wal(&wal_path).unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].payload, b"legacy-0".to_vec());
+    assert_eq!(records[2].payload, b"legacy-2".to_vec());
+    assert_eq!(next_seq, 4);
+}
+
+/// A WAL superblock whose format version is newer than this engine supports is
+/// refused (rollback safety, Req 5.2) — surfaced as an InvalidData I/O error.
+#[tokio::test]
+async fn future_wal_superblock_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join("future.wal");
+    let config = WalWriterConfig {
+        wal_path: wal_path.clone(),
+        preallocate_bytes: 65536,
+        ..Default::default()
+    };
+
+    {
+        let writer = WalWriter::new(config).unwrap();
+        writer
+            .append_sync(WalRecordType::RowPut, b"x".to_vec())
+            .unwrap();
+        writer.shutdown();
+    }
+
+    // Bump the superblock format_version (bytes 4..6 of the header) beyond current.
+    let mut data = std::fs::read(&wal_path).unwrap();
+    let future = galaxdb_common::format::WAL.current_write + 1;
+    data[4..6].copy_from_slice(&future.to_le_bytes());
+    std::fs::write(&wal_path, &data).unwrap();
+
+    let err = recover_wal(&wal_path).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("newer"),
+        "expected a too-new format refusal, got: {err}"
+    );
+
+    // Opening the writer on the too-new file is likewise refused.
+    let reopen = WalWriter::new(WalWriterConfig {
+        wal_path: wal_path.clone(),
+        preallocate_bytes: 65536,
+        ..Default::default()
+    });
+    assert!(reopen.is_err(), "WalWriter::new must refuse a too-new superblock");
+}
+
+/// Simulate a restart: write via WalWriter, drop it, reopen via WalWriter::new
+/// (which must detect the superblock and position records after it), append
+/// more, and confirm every record recovers. This is the crash/restart-safety
+/// path for the versioned WAL.
+#[tokio::test]
+async fn reopen_after_restart_preserves_records_with_header() {
+    let dir = tempfile::tempdir().unwrap();
+    let wal_path = dir.path().join("restart.wal");
+    let cfg = || WalWriterConfig {
+        wal_path: wal_path.clone(),
+        preallocate_bytes: 65536,
+        ..Default::default()
+    };
+
+    {
+        let writer = WalWriter::new(cfg()).unwrap();
+        for i in 0..3 {
+            writer
+                .append_sync(WalRecordType::RowPut, format!("r{i}").into_bytes())
+                .unwrap();
+        }
+        writer.shutdown();
+    }
+
+    // The file must carry a versioned superblock now.
+    let data = std::fs::read(&wal_path).unwrap();
+    assert_eq!(&data[0..4], &galaxdb_common::format::WAL.magic);
+
+    {
+        let writer = WalWriter::new(cfg()).unwrap();
+        writer
+            .append_sync(WalRecordType::RowPut, b"after-restart".to_vec())
+            .unwrap();
+        writer.shutdown();
+    }
+
+    let (records, _) = recover_wal(&wal_path).unwrap();
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0].payload, b"r0".to_vec());
+    assert_eq!(records[3].payload, b"after-restart".to_vec());
 }

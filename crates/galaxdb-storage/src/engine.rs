@@ -2419,6 +2419,36 @@ mod tests {
         Engine::new(config).unwrap()
     }
 
+    /// Full crash-recovery path: write rows (WAL only, no flush), drop the
+    /// engine to simulate a restart, reopen on the same data dir, and confirm
+    /// every row replays from the versioned WAL. Exercises the v0.5 WAL
+    /// superblock end to end through `WalWriter::new` + `recover_wal`.
+    #[tokio::test]
+    async fn engine_recovers_rows_from_versioned_wal_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            data_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+
+        {
+            let engine = Engine::new(config.clone()).unwrap();
+            engine.put_sync(b"k1".to_vec(), b"v1".to_vec()).unwrap();
+            engine.put_sync(b"k2".to_vec(), b"v2".to_vec()).unwrap();
+            engine.delete_sync(b"k2").unwrap();
+            // Drop without flush: rows live only in the WAL + memtable.
+        }
+
+        // The on-disk WAL must carry the versioned superblock.
+        let wal_bytes = std::fs::read(dir.path().join("wal.log")).unwrap();
+        assert_eq!(&wal_bytes[0..4], &galaxdb_common::format::WAL.magic);
+
+        // Reopen: recover_wal replays the records past the superblock.
+        let engine = Engine::new(config).unwrap();
+        assert_eq!(engine.get(b"k1"), Some(b"v1".to_vec()));
+        assert_eq!(engine.get(b"k2"), None, "delete must survive recovery");
+    }
+
     /// A test [`RowColumnSplitter`] that splits a row value of the form
     /// `id_le(8 bytes) ++ name_bytes` into an `Int64` column and a `Text`
     /// column. Stands in for the real SQL-layer splitter (which uses the
