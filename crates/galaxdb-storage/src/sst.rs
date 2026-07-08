@@ -39,11 +39,23 @@
 
 use galaxdb_common::{GalaxError, GalaxResult};
 
-/// SST file footer magic number.
+/// Legacy (pre-v0.5) SST footer magic — a footer with no explicit format
+/// version. Files written before format versioning still open via this path
+/// and are treated as format version 1.
 pub const SST_FOOTER_MAGIC: u32 = 0x53535446; // "SSTF"
 
-/// Footer size: index_offset(8) + block_count(4) + magic(4) = 16 bytes.
+/// Versioned SST footer magic (v0.5+): the footer carries an explicit
+/// `format_version` before the magic. A distinct magic lets a reader tell a
+/// versioned footer from a legacy one unambiguously (the version field sits
+/// where a legacy footer had none).
+pub const SST_FOOTER_MAGIC_V2: u32 = 0x53535456; // "SSTV"
+
+/// Legacy footer size: index_offset(8) + block_count(4) + magic(4) = 16 bytes.
 pub const SST_FOOTER_SIZE: usize = 16;
+
+/// Versioned footer size: index_offset(8) + block_count(4) + format_version(2)
+/// + magic(4) = 18 bytes.
+pub const SST_FOOTER_SIZE_V2: usize = 18;
 
 /// Entry in the block index: where each PAX block lives in the SST file.
 #[derive(Debug, Clone)]
@@ -101,42 +113,65 @@ impl SstBlockIndex {
             buf.extend_from_slice(&entry.block_len.to_le_bytes());
         }
 
-        // Footer
+        // Versioned footer (v0.5+): index_offset | block_count | format_version | magic.
         buf.extend_from_slice(&index_offset.to_le_bytes());
         buf.extend_from_slice(&block_count.to_le_bytes());
-        buf.extend_from_slice(&SST_FOOTER_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&galaxdb_common::format::SST.current_write.to_le_bytes());
+        buf.extend_from_slice(&SST_FOOTER_MAGIC_V2.to_le_bytes());
 
         buf
+    }
+
+    /// Parse the trailing footer, accepting both the versioned (v0.5+) and the
+    /// legacy layouts. Returns `(index_offset, block_count, footer_size)`.
+    ///
+    /// A versioned footer's `format_version` is range-checked against the
+    /// engine's supported range (typed `FormatTooOld` / `FormatTooNew`, the
+    /// rollback-safety refusal). A legacy footer is treated as format v1.
+    fn parse_footer(data: &[u8]) -> GalaxResult<(u64, u32, usize)> {
+        if data.len() < SST_FOOTER_SIZE {
+            return Err(GalaxError::Internal("SST file too small for footer".into()));
+        }
+        let end = data.len();
+        let trailing_magic = u32::from_le_bytes(
+            data[end - 4..end]
+                .try_into()
+                .map_err(|_| GalaxError::Internal("bad footer magic".into()))?,
+        );
+        match trailing_magic {
+            SST_FOOTER_MAGIC_V2 => {
+                if data.len() < SST_FOOTER_SIZE_V2 {
+                    return Err(GalaxError::Internal("SST file too small for versioned footer".into()));
+                }
+                let fs = end - SST_FOOTER_SIZE_V2;
+                let index_offset = u64::from_le_bytes(data[fs..fs + 8].try_into().unwrap());
+                let block_count = u32::from_le_bytes(data[fs + 8..fs + 12].try_into().unwrap());
+                let format_version = u16::from_le_bytes(data[fs + 12..fs + 14].try_into().unwrap());
+                galaxdb_common::format::SST.check(format_version)?;
+                Ok((index_offset, block_count, SST_FOOTER_SIZE_V2))
+            }
+            SST_FOOTER_MAGIC => {
+                // Legacy footer: no explicit version → implicitly format v1.
+                let fs = end - SST_FOOTER_SIZE;
+                let index_offset = u64::from_le_bytes(data[fs..fs + 8].try_into().unwrap());
+                let block_count = u32::from_le_bytes(data[fs + 8..fs + 12].try_into().unwrap());
+                Ok((index_offset, block_count, SST_FOOTER_SIZE))
+            }
+            other => Err(GalaxError::Internal(format!(
+                "SST footer magic mismatch: expected {:#x} or {:#x}, got {:#x}",
+                SST_FOOTER_MAGIC_V2, SST_FOOTER_MAGIC, other
+            ))),
+        }
     }
 
     /// Deserialize a block index from SST file data.
     /// Reads the footer first to find the index offset, then reads the index.
     pub fn from_file_data(data: &[u8]) -> GalaxResult<Self> {
-        if data.len() < SST_FOOTER_SIZE {
-            return Err(GalaxError::Internal("SST file too small for footer".into()));
-        }
-
-        // Read footer (last 16 bytes)
-        let footer_start = data.len() - SST_FOOTER_SIZE;
-        let index_offset = u64::from_le_bytes(
-            data[footer_start..footer_start + 8].try_into()
-                .map_err(|_| GalaxError::Internal("bad footer index_offset".into()))?
-        ) as usize;
-        let block_count = u32::from_le_bytes(
-            data[footer_start + 8..footer_start + 12].try_into()
-                .map_err(|_| GalaxError::Internal("bad footer block_count".into()))?
-        ) as usize;
-        let magic = u32::from_le_bytes(
-            data[footer_start + 12..footer_start + 16].try_into()
-                .map_err(|_| GalaxError::Internal("bad footer magic".into()))?
-        );
-
-        if magic != SST_FOOTER_MAGIC {
-            return Err(GalaxError::Internal(format!(
-                "SST footer magic mismatch: expected {:#x}, got {:#x}",
-                SST_FOOTER_MAGIC, magic
-            )));
-        }
+        // Accepts both the versioned (v0.5+) and legacy footer layouts.
+        let (index_offset, block_count, footer_size) = Self::parse_footer(data)?;
+        let index_offset = index_offset as usize;
+        let block_count = block_count as usize;
+        let footer_start = data.len() - footer_size;
 
         // Read block index
         let mut offset = index_offset + 4; // skip block_count (already read from footer)
@@ -164,25 +199,7 @@ impl SstBlockIndex {
     /// Read just the footer from a file to get block count and index offset.
     /// This reads only 16 bytes from the end of the file.
     pub fn read_footer(data: &[u8]) -> GalaxResult<(u64, u32)> {
-        if data.len() < SST_FOOTER_SIZE {
-            return Err(GalaxError::Internal("data too small for SST footer".into()));
-        }
-        let footer_start = data.len() - SST_FOOTER_SIZE;
-        let index_offset = u64::from_le_bytes(
-            data[footer_start..footer_start + 8].try_into()
-                .map_err(|_| GalaxError::Internal("bad footer".into()))?
-        );
-        let block_count = u32::from_le_bytes(
-            data[footer_start + 8..footer_start + 12].try_into()
-                .map_err(|_| GalaxError::Internal("bad footer".into()))?
-        );
-        let magic = u32::from_le_bytes(
-            data[footer_start + 12..footer_start + 16].try_into()
-                .map_err(|_| GalaxError::Internal("bad footer".into()))?
-        );
-        if magic != SST_FOOTER_MAGIC {
-            return Err(GalaxError::Internal("not an SST file (bad magic)".into()));
-        }
+        let (index_offset, block_count, _footer_size) = Self::parse_footer(data)?;
         Ok((index_offset, block_count))
     }
 }
@@ -213,6 +230,61 @@ mod tests {
         assert_eq!(recovered.entries[1].block_len, 2048);
         assert_eq!(recovered.entries[2].file_offset, 3072);
         assert_eq!(recovered.entries[2].block_len, 512);
+    }
+
+    /// Build a legacy (pre-v0.5) 16-byte SSTF footer by hand and confirm a
+    /// current reader still opens it (backward-compat read, Req 5.1).
+    #[test]
+    fn legacy_footer_still_reads() {
+        let mut index = SstBlockIndex::new();
+        index.add_block(0, 1024);
+        index.add_block(1024, 2048);
+        let index_offset = 3072u64;
+
+        // Hand-serialize the index + a *legacy* footer (no format_version).
+        let mut file_data = vec![0u8; index_offset as usize];
+        file_data.extend_from_slice(&(index.entries.len() as u32).to_le_bytes());
+        for e in &index.entries {
+            file_data.extend_from_slice(&e.file_offset.to_le_bytes());
+            file_data.extend_from_slice(&e.block_len.to_le_bytes());
+        }
+        file_data.extend_from_slice(&index_offset.to_le_bytes());
+        file_data.extend_from_slice(&(index.entries.len() as u32).to_le_bytes());
+        file_data.extend_from_slice(&SST_FOOTER_MAGIC.to_le_bytes()); // legacy SSTF
+
+        let recovered = SstBlockIndex::from_file_data(&file_data).unwrap();
+        assert_eq!(recovered.block_count(), 2);
+        assert_eq!(recovered.entries[1].block_len, 2048);
+    }
+
+    /// A versioned footer whose format_version exceeds what this engine writes
+    /// must be refused with a typed FormatTooNew (rollback safety, Req 5.2).
+    #[test]
+    fn future_footer_version_refused() {
+        let mut index = SstBlockIndex::new();
+        index.add_block(0, 512);
+        let index_offset = 512u64;
+
+        let mut file_data = vec![0u8; index_offset as usize];
+        file_data.extend_from_slice(&index.serialize_with_footer(index_offset));
+
+        // Bump the format_version (the 2 bytes just before the 4-byte magic).
+        let end = file_data.len();
+        let future = galaxdb_common::format::SST.current_write + 1;
+        file_data[end - 6..end - 4].copy_from_slice(&future.to_le_bytes());
+
+        match SstBlockIndex::from_file_data(&file_data).err() {
+            Some(GalaxError::FormatTooNew {
+                artifact,
+                found,
+                current,
+            }) => {
+                assert_eq!(artifact, "SST");
+                assert_eq!(found, future);
+                assert_eq!(current, galaxdb_common::format::SST.current_write);
+            }
+            other => panic!("expected FormatTooNew, got {other:?}"),
+        }
     }
 
     #[test]
