@@ -43,8 +43,15 @@ pub const DEFAULT_BLOB_THRESHOLD: usize = 1024;
 /// GC trigger: compact a blob file when discardable space exceeds this ratio.
 pub const GC_DISCARD_RATIO: f64 = 0.50;
 
-/// Magic bytes prepended to each blob entry on disk for validation.
+/// Legacy (pre-v0.5) blob entry magic — an entry with no explicit format
+/// version. Entries written before format versioning still read via this path
+/// and are treated as format version 1.
 const BLOB_ENTRY_MAGIC: u32 = 0x424C4F42; // "BLOB"
+
+/// Versioned blob entry magic (v0.5+): the header carries an explicit
+/// `format_version` after the magic. A distinct magic lets `read` tell a
+/// versioned entry from a legacy one unambiguously.
+const BLOB_ENTRY_MAGIC_V2: u32 = 0x424C4232; // "BLB2"
 
 /// Size of a serialized [`BlobRef`] in bytes.
 /// file_id (8) + offset (8) + length (4) = 20 bytes.
@@ -147,7 +154,9 @@ pub fn should_separate(value: &[u8], threshold: usize) -> bool {
 /// ```text
 /// [magic: u32][length: u32][content_hash: 16 bytes][value: length bytes][checksum: u64]
 /// ```
-const BLOB_ENTRY_HEADER_SIZE: usize = 4 + 4 + CONTENT_HASH_SIZE; // 24 bytes
+const BLOB_ENTRY_HEADER_SIZE: usize = 4 + 4 + CONTENT_HASH_SIZE; // legacy: 24 bytes
+/// Versioned header: magic(4) + format_version(2) + length(4) + content_hash(16) = 26 bytes.
+const BLOB_ENTRY_HEADER_SIZE_V2: usize = 4 + 2 + 4 + CONTENT_HASH_SIZE;
 const BLOB_ENTRY_FOOTER_SIZE: usize = 8; // checksum
 
 /// A single writer queue that writes to its own blob file.
@@ -187,9 +196,11 @@ impl BlobWriter {
         let entry_offset = self.offset;
         let length = value.len() as u32;
 
-        // Build the entry
-        let mut entry = Vec::with_capacity(BLOB_ENTRY_HEADER_SIZE + value.len() + BLOB_ENTRY_FOOTER_SIZE);
-        entry.extend_from_slice(&BLOB_ENTRY_MAGIC.to_le_bytes());
+        // Build the versioned entry (v0.5+): magic | format_version | length | hash | value.
+        let mut entry =
+            Vec::with_capacity(BLOB_ENTRY_HEADER_SIZE_V2 + value.len() + BLOB_ENTRY_FOOTER_SIZE);
+        entry.extend_from_slice(&BLOB_ENTRY_MAGIC_V2.to_le_bytes());
+        entry.extend_from_slice(&galaxdb_common::format::BLOB.current_write.to_le_bytes());
         entry.extend_from_slice(&length.to_le_bytes());
         entry.extend_from_slice(hash);
         entry.extend_from_slice(value);
@@ -357,20 +368,45 @@ impl BlobLog {
         let mut file = File::open(&path)?;
         file.seek(SeekFrom::Start(blob_ref.offset))?;
 
-        // Read header
-        let mut header = [0u8; BLOB_ENTRY_HEADER_SIZE];
-        file.read_exact(&mut header)?;
+        // Read the magic first, then the rest of the header sized per variant
+        // (versioned v0.5+ vs legacy). `header` holds the exact on-disk header
+        // bytes so the checksum (computed over header || value) verifies for
+        // both layouts.
+        let mut magic_buf = [0u8; 4];
+        file.read_exact(&mut magic_buf)?;
+        let magic = u32::from_le_bytes(magic_buf);
 
-        // Validate magic
-        let magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
-        if magic != BLOB_ENTRY_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid blob entry magic: {:#010x}", magic),
-            ));
-        }
+        let (header, length) = match magic {
+            BLOB_ENTRY_MAGIC_V2 => {
+                let mut rest = [0u8; BLOB_ENTRY_HEADER_SIZE_V2 - 4];
+                file.read_exact(&mut rest)?;
+                let format_version = u16::from_le_bytes(rest[0..2].try_into().unwrap());
+                galaxdb_common::format::BLOB
+                    .check(format_version)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                let length = u32::from_le_bytes(rest[2..6].try_into().unwrap());
+                let mut header = Vec::with_capacity(BLOB_ENTRY_HEADER_SIZE_V2);
+                header.extend_from_slice(&magic_buf);
+                header.extend_from_slice(&rest);
+                (header, length)
+            }
+            BLOB_ENTRY_MAGIC => {
+                let mut rest = [0u8; BLOB_ENTRY_HEADER_SIZE - 4];
+                file.read_exact(&mut rest)?;
+                let length = u32::from_le_bytes(rest[0..4].try_into().unwrap());
+                let mut header = Vec::with_capacity(BLOB_ENTRY_HEADER_SIZE);
+                header.extend_from_slice(&magic_buf);
+                header.extend_from_slice(&rest);
+                (header, length)
+            }
+            other => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid blob entry magic: {:#010x}", other),
+                ));
+            }
+        };
 
-        let length = u32::from_le_bytes(header[4..8].try_into().unwrap());
         if length != blob_ref.length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

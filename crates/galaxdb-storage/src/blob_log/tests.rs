@@ -404,3 +404,74 @@ fn gc_reclaims_space_after_compaction() {
         assert_eq!(value, all_values[i]);
     }
 }
+
+// ── v0.5 format versioning: backward-compat read + newer-format refusal ──
+
+/// A value written by the current engine reads back intact (versioned entry).
+#[test]
+fn versioned_blob_entry_roundtrips() {
+    let (blob_log, _dir) = create_test_blob_log();
+    let value = large_value(4096);
+    let (_hash, blob_ref) = blob_log.write(&value).unwrap();
+    assert_eq!(blob_log.read(&blob_ref).unwrap(), value);
+}
+
+/// A hand-written **legacy** (pre-v0.5, `BLOB` magic, no version field) entry
+/// is still read by the current engine (backward-compat, Req 5.1).
+#[test]
+fn legacy_blob_entry_still_reads() {
+    let (blob_log, dir) = create_test_blob_log();
+    let blob_dir = dir.path().join("blobs");
+    let value = large_value(200);
+    let hash = content_hash(&value);
+
+    let mut entry = Vec::new();
+    entry.extend_from_slice(&BLOB_ENTRY_MAGIC.to_le_bytes()); // legacy magic
+    entry.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    entry.extend_from_slice(&hash);
+    entry.extend_from_slice(&value);
+    let checksum = xxh3_64(&entry);
+    entry.extend_from_slice(&checksum.to_le_bytes());
+    std::fs::write(blob_dir.join("blob_99.dat"), &entry).unwrap();
+
+    let br = BlobRef {
+        file_id: 99,
+        offset: 0,
+        length: value.len() as u32,
+    };
+    assert_eq!(blob_log.read(&br).unwrap(), value);
+}
+
+/// A versioned entry whose format_version exceeds what this engine supports is
+/// refused (rollback safety, Req 5.2) — surfaced as an InvalidData I/O error
+/// carrying the typed FormatTooNew message.
+#[test]
+fn future_blob_entry_version_refused() {
+    let (blob_log, dir) = create_test_blob_log();
+    let blob_dir = dir.path().join("blobs");
+    let value = large_value(120);
+    let hash = content_hash(&value);
+    let future = galaxdb_common::format::BLOB.current_write + 1;
+
+    let mut entry = Vec::new();
+    entry.extend_from_slice(&BLOB_ENTRY_MAGIC_V2.to_le_bytes());
+    entry.extend_from_slice(&future.to_le_bytes());
+    entry.extend_from_slice(&(value.len() as u32).to_le_bytes());
+    entry.extend_from_slice(&hash);
+    entry.extend_from_slice(&value);
+    let checksum = xxh3_64(&entry);
+    entry.extend_from_slice(&checksum.to_le_bytes());
+    std::fs::write(blob_dir.join("blob_98.dat"), &entry).unwrap();
+
+    let br = BlobRef {
+        file_id: 98,
+        offset: 0,
+        length: value.len() as u32,
+    };
+    let err = blob_log.read(&br).unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    assert!(
+        err.to_string().contains("newer"),
+        "expected a too-new format refusal, got: {err}"
+    );
+}
