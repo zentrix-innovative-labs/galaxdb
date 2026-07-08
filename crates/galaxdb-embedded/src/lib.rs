@@ -220,7 +220,7 @@ impl Database {
             ..Default::default()
         };
         let engine = Engine::new(config)?;
-        Ok(Self::from_engine(path, engine))
+        Self::from_engine(path, engine)
     }
 
     /// Open (or create) a database applying auto-tuned sizes (Req 12).
@@ -247,13 +247,13 @@ impl Database {
             ..Default::default()
         };
         let engine = Engine::new(config)?;
-        Ok(Self::from_engine(path, engine))
+        Self::from_engine(path, engine)
     }
 
     /// Assemble a [`Database`] around an already-opened engine. Shared by
     /// [`open`](Self::open) and [`open_with_tuning`](Self::open_with_tuning)
     /// so the handle's auxiliary state is constructed in exactly one place.
-    fn from_engine(path: PathBuf, engine: Engine) -> Self {
+    fn from_engine(path: PathBuf, engine: Engine) -> GalaxResult<Self> {
         let engine = Arc::new(engine);
         let tag_catalog = Arc::new(Mutex::new(TagCatalog::new()));
         // Make runtime compaction tag-aware: its MVCC garbage collector
@@ -276,7 +276,9 @@ impl Database {
         // laying rows out in the persisted layout.
         let catalog = {
             let mut cat = galaxdb_sql::executor::Catalog::new();
-            for entry in galaxdb_sql::catalog_store::load_all(&engine) {
+            // Refuses to open if any persisted catalog entry is a newer format
+            // than this engine understands (rollback safety, Req 5.2).
+            for entry in galaxdb_sql::catalog_store::load_all(&engine)? {
                 if entry.storage_mode == galaxdb_common::StorageMode::Columnar {
                     if let Some(splitter) =
                         galaxdb_sql::columnar::CatalogRowSplitter::from_table_entry(&entry)
@@ -293,7 +295,7 @@ impl Database {
             Arc::new(cat)
         };
 
-        Self {
+        Ok(Self {
             path,
             engine,
             sidecar: None,
@@ -305,7 +307,7 @@ impl Database {
             audit: None,
             stmt_cache: Mutex::new(galaxdb_sql::StatementCache::new(256)),
             txn_manager: Arc::new(galaxdb_sql::transaction::TransactionManager::new()),
-        }
+        })
     }
 
     /// Open a database with an embedding sidecar attached.

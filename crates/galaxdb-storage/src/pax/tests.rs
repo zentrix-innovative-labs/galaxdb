@@ -165,6 +165,38 @@ fn corrupt_magic_number_rejected() {
     }
 }
 
+#[test]
+fn future_format_version_refused() {
+    // A PAX block whose format_version is newer than this engine writes must
+    // be refused with a typed FormatTooNew, not mis-parsed as the current
+    // layout. format_version is the u8 right after the 4-byte magic.
+    let col = make_int32_column(&[1, 2, 3]);
+    let block = PaxBlock::write(1, 100, &[col]).unwrap();
+    let mut serialized = block.serialize().unwrap();
+
+    let future = (galaxdb_common::format::PAX.current_write + 1) as u8;
+    serialized[4] = future;
+
+    // Recompute the trailing checksum so the version check (not the checksum)
+    // is what rejects the block.
+    let checksum_offset = serialized.len() - 8;
+    let new_checksum = xxh3_64(&serialized[..checksum_offset]);
+    serialized[checksum_offset..].copy_from_slice(&new_checksum.to_le_bytes());
+
+    match PaxBlock::deserialize(&serialized).err() {
+        Some(GalaxError::FormatTooNew {
+            artifact,
+            found,
+            current,
+        }) => {
+            assert_eq!(artifact, "PAX block");
+            assert_eq!(found, future as u16);
+            assert_eq!(current, galaxdb_common::format::PAX.current_write);
+        }
+        other => panic!("expected FormatTooNew, got: {:?}", other),
+    }
+}
+
 // --- Compression Correctness Tests ---
 
 #[test]

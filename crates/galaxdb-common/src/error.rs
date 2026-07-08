@@ -28,6 +28,34 @@ pub enum GalaxError {
     #[error("corrupt WAL record at sequence {seq_no}")]
     CorruptWalRecord { seq_no: u64 },
 
+    /// An on-disk artifact is written in a format **older** than this engine
+    /// can read (below `min_readable`). Distinct from `FormatTooNew` so the
+    /// operator can tell "upgrade your data" from "downgrade is unsafe".
+    #[error("{artifact} on-disk format v{found} is too old for this engine (minimum readable v{min_readable}); data written by an unsupported older release")]
+    FormatTooOld {
+        /// Which artifact (e.g. `"SST"`, `"WAL"`, `"HNSW index"`, `"catalog"`).
+        artifact: &'static str,
+        /// The format version found in the file header.
+        found: u16,
+        /// The oldest format version this engine can read.
+        min_readable: u16,
+    },
+
+    /// An on-disk artifact is written in a format **newer** than this engine
+    /// understands. The engine refuses to open it rather than risk a
+    /// best-effort read that could corrupt or silently drop data — this is
+    /// the rollback-safety guarantee (a previous binary never mis-reads data
+    /// written by a newer one).
+    #[error("{artifact} on-disk format v{found} is newer than this engine supports (max v{current}); refusing to open to avoid data corruption — use an engine build ≥ the writer")]
+    FormatTooNew {
+        /// Which artifact (e.g. `"SST"`, `"WAL"`, `"HNSW index"`, `"catalog"`).
+        artifact: &'static str,
+        /// The format version found in the file header.
+        found: u16,
+        /// The newest format version this engine can write/read.
+        current: u16,
+    },
+
     // -- Capacity / resource errors --
     /// The disk is full; writes are blocked.
     #[error("disk full: writes are blocked until space is freed")]
@@ -241,6 +269,8 @@ impl GalaxError {
             GalaxError::Io(_)
             | GalaxError::ChecksumMismatch { .. }
             | GalaxError::InvalidMagic(_)
+            | GalaxError::FormatTooOld { .. }
+            | GalaxError::FormatTooNew { .. }
             | GalaxError::CorruptWalRecord { .. } => "58030", // io_error
 
             // Everything else (Internal, AppendOnlyTable, Encryption, Kms,

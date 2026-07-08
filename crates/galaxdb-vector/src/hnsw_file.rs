@@ -168,12 +168,12 @@ impl MmapHnswGraph {
                 "not an HNSW file: magic {:#x}, expected {:#x}", magic, HNSW_MAGIC
             )));
         }
+        // Route on the on-disk format version via the shared support table:
+        // a version below `min_readable` is a typed FormatTooOld, above
+        // `current_write` a typed FormatTooNew (the rollback-safety refusal),
+        // instead of the old exact-equality that failed both cases the same way.
         let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
-        if version != HNSW_VERSION {
-            return Err(GalaxError::Internal(format!(
-                "unsupported HNSW version: {}, expected {}", version, HNSW_VERSION
-            )));
-        }
+        galaxdb_common::format::HNSW.check(version as u16)?;
 
         let header = HnswFileHeader {
             dim: u32::from_le_bytes(data[8..12].try_into().unwrap()),
@@ -335,6 +335,66 @@ mod tests {
             graph.entry_point().unwrap(),
             mmap_graph.entry_point()
         );
+    }
+
+    #[test]
+    fn newer_format_version_is_refused() {
+        // Write a valid v1 file, then bump the on-disk version field to a
+        // value beyond `current_write` and confirm the reader refuses it with
+        // a typed FormatTooNew (rollback-safety), not a best-effort read.
+        let dim = 8;
+        let config = HnswConfig::new(dim).with_m(4).with_ef_construction(20);
+        let mut graph = HnswGraph::new(config);
+        graph.insert(0, vec![0.1; dim]);
+        graph.insert(1, vec![0.2; dim]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v_future.hnsw");
+        write_hnsw_file(&graph, &path).unwrap();
+
+        // Header version lives at bytes 4..8 (u32 LE). Set it to current + 1.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let future = (HNSW_VERSION + 1).to_le_bytes();
+        bytes[4..8].copy_from_slice(&future);
+        std::fs::write(&path, &bytes).unwrap();
+
+        match MmapHnswGraph::open(&path).err() {
+            Some(GalaxError::FormatTooNew {
+                artifact,
+                found,
+                current,
+            }) => {
+                assert_eq!(artifact, "HNSW index");
+                assert_eq!(found, (HNSW_VERSION + 1) as u16);
+                assert_eq!(current, galaxdb_common::format::HNSW.current_write);
+            }
+            other => panic!("expected FormatTooNew, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zero_format_version_is_too_old() {
+        // A v0 file (below min_readable=1) is a typed FormatTooOld.
+        let dim = 8;
+        let config = HnswConfig::new(dim).with_m(4).with_ef_construction(20);
+        let mut graph = HnswGraph::new(config);
+        graph.insert(0, vec![0.3; dim]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v_old.hnsw");
+        write_hnsw_file(&graph, &path).unwrap();
+
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[4..8].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+
+        match MmapHnswGraph::open(&path).err() {
+            Some(GalaxError::FormatTooOld { artifact, found, .. }) => {
+                assert_eq!(artifact, "HNSW index");
+                assert_eq!(found, 0);
+            }
+            other => panic!("expected FormatTooOld, got {other:?}"),
+        }
     }
 
     #[test]

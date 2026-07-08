@@ -36,6 +36,25 @@ use crate::executor::{CatalogColumn, TableEntry};
 /// disjoint from every `"{table}:"` user-row namespace.
 pub const CATALOG_KEY_PREFIX: &[u8] = b"\x00__galaxdb_catalog__:";
 
+/// The catalog record family tag. The on-disk first line is
+/// `"{CATALOG_MAGIC}{version}"` (e.g. `GXCAT1`), fusing magic + format version.
+pub const CATALOG_MAGIC: &str = "GXCAT";
+
+/// Current catalog record format version (the `1` in `GXCAT1`). Kept in step
+/// with `galaxdb_common::format::CATALOG.current_write`.
+pub const CATALOG_FORMAT_VERSION: u16 = 1;
+
+/// Extract the format version from a catalog record's first line, if the line
+/// is a recognized `GXCAT<version>` tag. Returns `None` for bytes that are not
+/// a catalog record at all (foreign/corrupt), which callers skip; a recognized
+/// tag with an unparsable version yields `None` as well (treated as malformed).
+fn catalog_record_version(bytes: &[u8]) -> Option<u16> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let first_line = text.split('\n').next()?;
+    let digits = first_line.strip_prefix(CATALOG_MAGIC)?;
+    digits.parse::<u16>().ok()
+}
+
 /// The storage key a table's catalog entry is persisted under.
 pub fn catalog_key(table: &str) -> Vec<u8> {
     let mut k = CATALOG_KEY_PREFIX.to_vec();
@@ -46,7 +65,7 @@ pub fn catalog_key(table: &str) -> Vec<u8> {
 /// Serialize a [`TableEntry`] into the `GXCAT1` byte format.
 pub fn encode_table_entry(entry: &TableEntry) -> Vec<u8> {
     let mut lines: Vec<String> = Vec::with_capacity(6 + entry.columns.len() * 5);
-    lines.push("GXCAT1".to_string());
+    lines.push(format!("{CATALOG_MAGIC}{CATALOG_FORMAT_VERSION}"));
     lines.push(entry.name.clone());
     lines.push(bool_str(entry.has_embedding).to_string());
     lines.push(bool_str(entry.append_only).to_string());
@@ -118,15 +137,30 @@ pub fn remove_table_entry(engine: &Engine, table: &str) -> GalaxResult<()> {
         .map_err(|e| GalaxError::Internal(format!("failed to remove catalog entry: {e}")))
 }
 
-/// Load every persisted table entry from the engine. Malformed records are
-/// skipped (logged by the caller if desired), never fatal.
-pub fn load_all(engine: &Arc<Engine>) -> Vec<TableEntry> {
-    engine
+/// Load every persisted table entry from the engine.
+///
+/// Version safety (Req 5.2, rollback safety): a catalog record whose format
+/// version is **newer** than this engine writes is refused with a typed
+/// [`GalaxError::FormatTooNew`] rather than silently skipped — otherwise a
+/// rollback onto newer-written catalog rows would make tables *vanish* instead
+/// of failing loudly. Genuinely malformed / foreign records (no `GXCAT` tag)
+/// are still skipped, never fatal, so a single corrupt entry can't block open.
+pub fn load_all(engine: &Arc<Engine>) -> GalaxResult<Vec<TableEntry>> {
+    let mut out = Vec::new();
+    for (_k, v) in engine
         .scan_all_with_prefix(Some(CATALOG_KEY_PREFIX))
         .into_iter()
         .filter(|(k, _)| k.starts_with(CATALOG_KEY_PREFIX))
-        .filter_map(|(_, v)| decode_table_entry(&v))
-        .collect()
+    {
+        // Gate on the record's declared version before trusting its layout.
+        if let Some(version) = catalog_record_version(&v) {
+            galaxdb_common::format::CATALOG.check(version)?;
+        }
+        if let Some(entry) = decode_table_entry(&v) {
+            out.push(entry);
+        }
+    }
+    Ok(out)
 }
 
 fn bool_str(b: bool) -> &'static str {
@@ -210,6 +244,38 @@ mod tests {
     fn malformed_returns_none() {
         assert!(decode_table_entry(b"not a catalog record").is_none());
         assert!(decode_table_entry(b"GXCAT1\nusers\n1").is_none());
+    }
+
+    #[test]
+    fn version_is_extracted_from_record() {
+        // A real encoded entry advertises the current version.
+        let bytes = encode_table_entry(&sample());
+        assert_eq!(catalog_record_version(&bytes), Some(CATALOG_FORMAT_VERSION));
+        // A future-versioned tag parses to its number.
+        assert_eq!(catalog_record_version(b"GXCAT2\nusers\n..."), Some(2));
+        // Non-catalog bytes are unrecognized (skipped by load_all, never fatal).
+        assert_eq!(catalog_record_version(b"random bytes"), None);
+    }
+
+    #[test]
+    fn newer_catalog_version_is_refused_by_gate() {
+        // The load gate uses format::CATALOG.check on the parsed version. A
+        // newer version must be a typed FormatTooNew (rollback safety), not a
+        // silent skip that would make the table vanish.
+        let ver = catalog_record_version(b"GXCAT2\nusers\n...").unwrap();
+        match galaxdb_common::format::CATALOG.check(ver) {
+            Err(galaxdb_common::GalaxError::FormatTooNew {
+                artifact, found, ..
+            }) => {
+                assert_eq!(artifact, "catalog");
+                assert_eq!(found, 2);
+            }
+            other => panic!("expected FormatTooNew, got {other:?}"),
+        }
+        // The current version passes the gate.
+        assert!(galaxdb_common::format::CATALOG
+            .check(CATALOG_FORMAT_VERSION)
+            .is_ok());
     }
 
     #[test]

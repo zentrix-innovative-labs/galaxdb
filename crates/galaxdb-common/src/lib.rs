@@ -7,10 +7,12 @@
 pub mod autotune;
 pub mod config;
 pub mod error;
+pub mod format;
 pub mod types;
 
 // Re-export commonly used items at crate root for convenience.
 pub use autotune::{AutoTuneConfig, EffectiveTuning, SystemResources, TuningSource};
 pub use config::GalaxConfig;
 pub use error::{GalaxError, GalaxResult};
+pub use format::{FormatHeader, FormatSupport, WriterVersion, FORMAT_VERSION};
 pub use types::{BlockId, ColumnType, RowId, StorageMode, TableId, Timestamp};

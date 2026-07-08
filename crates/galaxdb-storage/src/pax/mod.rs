@@ -310,6 +310,11 @@ impl PaxBlock {
             return Err(GalaxError::InvalidMagic(header.magic));
         }
 
+        // Route on the block's format version: too-old → typed FormatTooOld,
+        // too-new → typed FormatTooNew (refuse rather than mis-parse a future
+        // layout as v1). The version byte was previously read but ignored.
+        galaxdb_common::format::PAX.check(header.format_version as u16)?;
+
         // Read column data
         let column_data_start = cursor.position() as usize;
         let total_column_data_len: u64 = header
