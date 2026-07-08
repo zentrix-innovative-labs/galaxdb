@@ -105,18 +105,26 @@ impl SstRegistry {
 
     /// Register an SST file by reading its block index from the footer.
     /// The block index is small (12 bytes per block) and kept in memory.
-    fn register(&mut self, sst_id: u64, path: PathBuf) {
+    fn register(&mut self, sst_id: u64, path: PathBuf) -> GalaxResult<()> {
         // Read the SST file to extract the block index from the footer.
         // The block index is at the end of the file and is typically < 1KB.
-        let block_index = if let Ok(data) = std::fs::read(&path) {
-            crate::sst::SstBlockIndex::from_file_data(&data).unwrap_or_else(|_| {
-                // Fallback for legacy single-block SSTs (no footer)
-                let mut idx = crate::sst::SstBlockIndex::new();
-                idx.add_block(0, data.len() as u32);
-                idx
-            })
-        } else {
-            crate::sst::SstBlockIndex::new()
+        let block_index = match std::fs::read(&path) {
+            Ok(data) => match crate::sst::SstBlockIndex::from_file_data(&data) {
+                Ok(idx) => idx,
+                // A too-new / too-old footer is a hard refusal — never silently
+                // mis-read it as one legacy block (rollback safety, Req 5.2).
+                Err(e @ (GalaxError::FormatTooNew { .. } | GalaxError::FormatTooOld { .. })) => {
+                    return Err(e);
+                }
+                // Genuine legacy single-block SST (no footer) or other parse
+                // issue: treat the whole file as one block.
+                Err(_) => {
+                    let mut idx = crate::sst::SstBlockIndex::new();
+                    idx.add_block(0, data.len() as u32);
+                    idx
+                }
+            },
+            Err(_) => crate::sst::SstBlockIndex::new(),
         };
 
         self.entries.insert(sst_id, SstEntry {
@@ -125,6 +133,7 @@ impl SstRegistry {
             #[cfg(feature = "aegis-tde")]
             encrypted: false,
         });
+        Ok(())
     }
 
     #[cfg(feature = "aegis-tde")]
@@ -133,15 +142,20 @@ impl SstRegistry {
         sst_id: u64,
         path: PathBuf,
         _tde: &galaxdb_crypto::AegisTdeModule,
-    ) {
-        let block_index = if let Ok(data) = std::fs::read(&path) {
-            crate::sst::SstBlockIndex::from_file_data(&data).unwrap_or_else(|_| {
-                let mut idx = crate::sst::SstBlockIndex::new();
-                idx.add_block(0, data.len() as u32);
-                idx
-            })
-        } else {
-            crate::sst::SstBlockIndex::new()
+    ) -> GalaxResult<()> {
+        let block_index = match std::fs::read(&path) {
+            Ok(data) => match crate::sst::SstBlockIndex::from_file_data(&data) {
+                Ok(idx) => idx,
+                Err(e @ (GalaxError::FormatTooNew { .. } | GalaxError::FormatTooOld { .. })) => {
+                    return Err(e);
+                }
+                Err(_) => {
+                    let mut idx = crate::sst::SstBlockIndex::new();
+                    idx.add_block(0, data.len() as u32);
+                    idx
+                }
+            },
+            Err(_) => crate::sst::SstBlockIndex::new(),
         };
 
         self.entries.insert(sst_id, SstEntry {
@@ -149,6 +163,7 @@ impl SstRegistry {
             block_index,
             encrypted: true,
         });
+        Ok(())
     }
 
     /// Read a single value by doing a targeted block read.
@@ -359,7 +374,7 @@ impl Engine {
                 tracing::warn!(file = %name, "skipping SST with unparsable id during open");
                 continue;
             };
-            registry.register(sst_id, path);
+            registry.register(sst_id, path)?;
             if sst_id > max_sst_id {
                 max_sst_id = sst_id;
             }
@@ -747,14 +762,14 @@ impl Engine {
                 #[cfg(feature = "aegis-tde")]
                 {
                     if let Some(tde) = &self.tde {
-                        registry.register_encrypted(file_sst_id, sst_path.clone(), tde);
+                        registry.register_encrypted(file_sst_id, sst_path.clone(), tde)?;
                     } else {
-                        registry.register(file_sst_id, sst_path.clone());
+                        registry.register(file_sst_id, sst_path.clone())?;
                     }
                 }
                 #[cfg(not(feature = "aegis-tde"))]
                 {
-                    registry.register(file_sst_id, sst_path.clone());
+                    registry.register(file_sst_id, sst_path.clone())?;
                 }
             }
 
@@ -2364,14 +2379,14 @@ impl Engine {
                 #[cfg(feature = "aegis-tde")]
                 {
                     if let Some(tde) = &self.tde {
-                        reg.register_encrypted(sid, path.clone(), tde);
+                        reg.register_encrypted(sid, path.clone(), tde)?;
                     } else {
-                        reg.register(sid, path.clone());
+                        reg.register(sid, path.clone())?;
                     }
                 }
                 #[cfg(not(feature = "aegis-tde"))]
                 {
-                    reg.register(sid, path.clone());
+                    reg.register(sid, path.clone())?;
                 }
                 for (key, block_index, row_offset) in &out.art_targets {
                     self.art.relocate_if_points_to(
