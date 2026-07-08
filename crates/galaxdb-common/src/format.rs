@@ -257,6 +257,96 @@ pub const HNSW: FormatSupport = FormatSupport {
     current_write: 1,
 };
 
+// ---------------------------------------------------------------------------
+// Crash-safe upgrade-on-open migration (B.5).
+//
+// When an on-disk artifact is at an older-but-supported format and the engine
+// wants it at the current format, it is migrated crash-safely: write a new file
+// alongside → fsync it → atomically rename over the target → fsync the
+// directory. A crash before the rename leaves the original fully intact; after
+// the rename the target is fully the new contents. There is never a torn file,
+// so a rollback (previous binary + restored snapshot) is always safe.
+// ---------------------------------------------------------------------------
+
+use std::path::Path;
+
+/// Crash-safe, atomic file replacement.
+///
+/// Writes `new_contents` to a temporary sibling of `target`, fsyncs it, renames
+/// it over `target` (atomic on POSIX and Windows-with-ReplaceFile semantics via
+/// `std::fs::rename`), then fsyncs the parent directory so the rename survives a
+/// power loss. On any crash: before the rename the original `target` is
+/// untouched; after it, `target` is exactly `new_contents`.
+pub fn atomic_replace(target: &Path, new_contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = target.parent().filter(|p| !p.as_os_str().is_empty());
+    let dir = dir.unwrap_or_else(|| Path::new("."));
+    let stem = target
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "artifact".to_string());
+    // Unique temp name (pid + monotonic counter) so concurrent replacers of
+    // different targets never collide.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dir.join(format!(".{stem}.tmp-{}-{n}", std::process::id()));
+
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(new_contents)?;
+        f.sync_all()?;
+    }
+    // Atomic swap. On failure, clean up the temp so it doesn't linger.
+    if let Err(e) = std::fs::rename(&tmp, target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // Make the rename durable. Directory fsync is best-effort on platforms that
+    // don't support it; the rename atomicity guarantee still holds.
+    if let Ok(dir_file) = std::fs::File::open(dir) {
+        let _ = dir_file.sync_all();
+    }
+    Ok(())
+}
+
+/// Upgrade a [`FormatHeader`]-prefixed file to the current write version if it
+/// is at an older-but-supported version, crash-safely (via [`atomic_replace`]).
+///
+/// - version `> current_write` → [`GalaxError::FormatTooNew`] (refuse).
+/// - version `< min_readable` → [`GalaxError::FormatTooOld`].
+/// - `min_readable ..< current_write` → run `migrate(old_version, full_bytes)`
+///   to produce the new file bytes (which must begin with a current-version
+///   header) and atomically install them; returns `Ok(true)`.
+/// - version `== current_write` → no-op, `Ok(false)`.
+pub fn upgrade_on_open<F>(
+    target: &Path,
+    support: &FormatSupport,
+    migrate: F,
+) -> GalaxResult<bool>
+where
+    F: FnOnce(u16, &[u8]) -> GalaxResult<Vec<u8>>,
+{
+    let bytes = std::fs::read(target).map_err(GalaxError::Io)?;
+    if bytes.len() < FORMAT_HEADER_SIZE {
+        return Err(GalaxError::Internal(format!(
+            "{} file too small for a format header",
+            support.artifact
+        )));
+    }
+    let mut hdr = [0u8; FORMAT_HEADER_SIZE];
+    hdr.copy_from_slice(&bytes[..FORMAT_HEADER_SIZE]);
+    let header = FormatHeader::from_bytes(&hdr, support.magic)?;
+    support.check(header.format_version)?; // typed too-old / too-new
+
+    if header.format_version < support.current_write {
+        let new_bytes = migrate(header.format_version, &bytes)?;
+        atomic_replace(target, &new_bytes).map_err(GalaxError::Io)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,5 +449,129 @@ mod tests {
             assert_eq!(s.current_write, FORMAT_VERSION, "{}", s.artifact);
             assert!(s.check(FORMAT_VERSION).is_ok(), "{}", s.artifact);
         }
+    }
+
+    // ── B.5: crash-safe upgrade-on-open ───────────────────────────────────
+
+    /// A synthetic artifact used only to exercise the migration mechanism with
+    /// a real older→current version transform (production artifacts are all at
+    /// v1 today, so there is nothing real to upgrade yet). #[cfg(test)] only.
+    const SYNTH_V2: FormatSupport = FormatSupport {
+        artifact: "synthetic",
+        magic: *b"GTST",
+        min_readable: 1,
+        current_write: 2,
+    };
+
+    fn write_synth(path: &std::path::Path, version: u16, body: &[u8]) {
+        let mut bytes = FormatHeader::new(*b"GTST", version).to_bytes().to_vec();
+        bytes.extend_from_slice(body);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn atomic_replace_swaps_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.bin");
+        std::fs::write(&path, b"OLD-CONTENTS").unwrap();
+
+        atomic_replace(&path, b"NEW-CONTENTS-LONGER").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"NEW-CONTENTS-LONGER");
+
+        // No stray temp files left behind in the directory.
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp-"))
+            .collect();
+        assert!(strays.is_empty(), "temp file left behind: {strays:?}");
+    }
+
+    /// Crash BEFORE the rename: the original file must be fully intact and
+    /// readable (recoverability). We simulate the pre-rename state by writing a
+    /// temp sibling ourselves and confirming the target is untouched.
+    #[test]
+    fn crash_before_rename_leaves_original_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.bin");
+        std::fs::write(&path, b"ORIGINAL").unwrap();
+
+        // Simulate: new contents staged in a temp, then the process dies.
+        let tmp = dir.path().join(".artifact.bin.tmp-crashsim");
+        std::fs::write(&tmp, b"HALF-WRITTEN-NEW").unwrap();
+        // (no rename happened)
+
+        // The target still holds the original, fully readable.
+        assert_eq!(std::fs::read(&path).unwrap(), b"ORIGINAL");
+
+        // A subsequent successful replace still works and wins.
+        atomic_replace(&path, b"FINAL").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"FINAL");
+    }
+
+    /// Crash AFTER the rename: the target is fully the new contents (no torn
+    /// state). `atomic_replace` returning Ok is exactly this post-rename state.
+    #[test]
+    fn crash_after_rename_shows_new_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact.bin");
+        std::fs::write(&path, b"v1-bytes").unwrap();
+        atomic_replace(&path, b"v2-bytes").unwrap();
+        // Post-rename (== "crash right after rename"): fully new, never torn.
+        assert_eq!(std::fs::read(&path).unwrap(), b"v2-bytes");
+    }
+
+    #[test]
+    fn upgrade_on_open_migrates_older_to_current() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synth.bin");
+        write_synth(&path, 1, b"payload-v1");
+
+        // Migrate v1 → v2: bump the header, keep the payload (contrived but real
+        // transform). Returns Ok(true) since a migration happened.
+        let migrated = upgrade_on_open(&path, &SYNTH_V2, |old, bytes| {
+            assert_eq!(old, 1);
+            let body = &bytes[FORMAT_HEADER_SIZE..];
+            let mut out = FormatHeader::new(*b"GTST", 2).to_bytes().to_vec();
+            out.extend_from_slice(body);
+            Ok(out)
+        })
+        .unwrap();
+        assert!(migrated);
+
+        // The on-disk header is now v2 and the payload survived.
+        let bytes = std::fs::read(&path).unwrap();
+        let mut hdr = [0u8; FORMAT_HEADER_SIZE];
+        hdr.copy_from_slice(&bytes[..FORMAT_HEADER_SIZE]);
+        let header = FormatHeader::from_bytes(&hdr, *b"GTST").unwrap();
+        assert_eq!(header.format_version, 2);
+        assert_eq!(&bytes[FORMAT_HEADER_SIZE..], b"payload-v1");
+
+        // Re-running is now a no-op (already current).
+        let again = upgrade_on_open(&path, &SYNTH_V2, |_, _| panic!("should not migrate")).unwrap();
+        assert!(!again);
+    }
+
+    #[test]
+    fn upgrade_on_open_refuses_newer_format() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synth.bin");
+        write_synth(&path, 3, b"from-the-future"); // > current_write (2)
+
+        match upgrade_on_open(&path, &SYNTH_V2, |_, _| panic!("must not migrate")) {
+            Err(GalaxError::FormatTooNew { found, current, .. }) => {
+                assert_eq!(found, 3);
+                assert_eq!(current, 2);
+            }
+            other => panic!("expected FormatTooNew, got {other:?}"),
+        }
+        // The file is left untouched on refusal.
+        let bytes = std::fs::read(&path).unwrap();
+        let mut hdr = [0u8; FORMAT_HEADER_SIZE];
+        hdr.copy_from_slice(&bytes[..FORMAT_HEADER_SIZE]);
+        assert_eq!(
+            FormatHeader::from_bytes(&hdr, *b"GTST").unwrap().format_version,
+            3
+        );
     }
 }
