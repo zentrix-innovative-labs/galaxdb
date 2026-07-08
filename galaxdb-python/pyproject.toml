@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "galaxdb-client"
-version = "0.4.0"
+version = "0.5.0"
 description = "GalaxDB Python client -- SQL, vector search, and local embeddings in one database"
 readme = "README.md"
 license = { text = "Apache-2.0" }

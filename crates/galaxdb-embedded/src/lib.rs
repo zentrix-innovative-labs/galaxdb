@@ -367,6 +367,158 @@ impl Database {
         }
 
         self.sidecar = Some(Arc::new(mgr));
+
+        // Vectors are not persisted on disk today — they live in the in-memory
+        // HNSW + delta buffer. On a restart the row data survives (WAL/SST) but
+        // the vector index does not, so SEMANTIC_MATCH would fail with
+        // "table not found" for every recovered embedding table. Rebuild each
+        // such table's index now by re-embedding its durable rows with the just-
+        // attached model (deterministic: the same model reproduces the same
+        // vectors, so search results are identical to before the restart).
+        self.rebuild_vector_indexes()?;
+        Ok(())
+    }
+
+    /// Reconstruct the in-memory vector index for every persisted table that
+    /// has an embedding column, by re-embedding its stored rows through the
+    /// attached sidecar. Called once when a sidecar is attached (open time), so
+    /// semantic search survives a server restart. A no-op when no sidecar is
+    /// attached or no embedding tables exist.
+    ///
+    /// This is O(rows × embed_cost) at open. It is correct across WAL
+    /// checkpoints because it reads the durable row data (not the ephemeral
+    /// WAL delta records). Persisting the HNSW graph to disk to avoid the
+    /// re-embed cost on large tables is a tracked follow-up.
+    fn rebuild_vector_indexes(&mut self) -> GalaxResult<()> {
+        let Some(sidecar) = self.sidecar.clone() else {
+            return Ok(());
+        };
+
+        // Readiness gate. On a restart the *stale* `sidecar.sock` from the
+        // previous run is still on the data volume, so `attach_sidecar`'s
+        // "socket file exists" check can pass a moment before the freshly
+        // spawned sidecar has removed the stale file and bound its listener.
+        // Probe with a real embed until the sidecar actually answers (or a
+        // bounded timeout elapses) so the rebuild — and the first user query —
+        // never race the listener with a spurious "connection refused".
+        {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                match sidecar.embed(EmbedRequest::query(
+                    0,
+                    "sidecar readiness probe".to_string(),
+                    String::new(),
+                )) {
+                    Ok(_) => break,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(200));
+                    }
+                    Err(e) => {
+                        return Err(GalaxError::Internal(format!(
+                            "sidecar did not become ready for vector-index rebuild: {e}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        let entries = galaxdb_sql::catalog_store::load_all(&self.engine)?;
+        for entry in entries {
+            if !entry.has_embedding {
+                continue;
+            }
+            // The embedding source column is the one flagged in the catalog.
+            let Some(src) = entry.columns.iter().find(|c| c.is_embedding_source) else {
+                continue;
+            };
+            let source_column = src.name.clone();
+            let prefix = format!("{}:", entry.name).into_bytes();
+
+            let rows = self.engine.scan_all_with_prefix(Some(&prefix));
+            let mut idx: Option<TableVectorIndex> = None;
+            let mut rebuilt: u64 = 0;
+
+            for (key, value) in rows {
+                if !key.starts_with(&prefix) {
+                    continue;
+                }
+                let cols = galaxdb_sql::row_codec::decode_row(&value);
+                let text = cols.iter().find(|(n, _)| n == &source_column).and_then(|(_, v)| {
+                    match v {
+                        Value::Text(s) => Some(s.clone()),
+                        _ => None,
+                    }
+                });
+                let Some(text) = text else {
+                    continue; // row carries no text in the source column
+                };
+                // Same row-id convention as `on_row_inserted`: xxh3_64 of the
+                // full storage key, so search results join back to table rows.
+                let row_id = xxhash_rust::xxh3::xxh3_64(&key);
+                let resp = sidecar
+                    .embed(EmbedRequest::document(row_id, text, source_column.clone()))
+                    .map_err(|e| {
+                        GalaxError::Internal(format!(
+                            "rebuilding vector index for '{}': embedding failed: {e}",
+                            entry.name
+                        ))
+                    })?;
+                let dim = resp.embedding.len();
+                let index = idx.get_or_insert_with(|| {
+                    let config = HnswConfig::new(dim).with_max_elements(1_000_000);
+                    TableVectorIndex {
+                        hnsw: HnswGraph::new(config),
+                        delta: DeltaBuffer::new(dim),
+                        dim,
+                        embedding_column: source_column.clone(),
+                        source_column: source_column.clone(),
+                        vectors: HashMap::new(),
+                        key_to_row_id: HashMap::new(),
+                    }
+                });
+                index.delta.insert(row_id, resp.embedding.clone());
+                index.vectors.insert(row_id, resp.embedding);
+                index.key_to_row_id.insert(key.clone(), row_id);
+                rebuilt += 1;
+            }
+
+            // A table with an embedding column but no rows still needs a
+            // registered (empty) index so SEMANTIC_MATCH returns zero rows
+            // rather than "table not found". Probe the model for its dimension.
+            if idx.is_none() {
+                let probe = sidecar
+                    .embed(EmbedRequest::document(0, "dimension probe".to_string(), source_column.clone()))
+                    .map_err(|e| {
+                        GalaxError::Internal(format!(
+                            "rebuilding vector index for '{}': dimension probe failed: {e}",
+                            entry.name
+                        ))
+                    })?;
+                let dim = probe.embedding.len();
+                let config = HnswConfig::new(dim).with_max_elements(1_000_000);
+                idx = Some(TableVectorIndex {
+                    hnsw: HnswGraph::new(config),
+                    delta: DeltaBuffer::new(dim),
+                    dim,
+                    embedding_column: source_column.clone(),
+                    source_column: source_column.clone(),
+                    vectors: HashMap::new(),
+                    key_to_row_id: HashMap::new(),
+                });
+            }
+
+            if let Some(index) = idx {
+                self.vector_indexes
+                    .write()
+                    .unwrap()
+                    .insert(entry.name.clone(), index);
+                tracing::info!(
+                    table = %entry.name,
+                    rows = rebuilt,
+                    "rebuilt vector index on open (re-embedded durable rows)"
+                );
+            }
+        }
         Ok(())
     }
 

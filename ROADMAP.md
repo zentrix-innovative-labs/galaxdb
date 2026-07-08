@@ -149,6 +149,60 @@ here. Dates are release-tag dates. Versions follow semver; the PyPI client
 (`galaxdb-client`), the Docker image (`harbi256/galaxdb`), and the server
 binaries share the same version.
 
+### v0.5.0
+
+**Added — multi-architecture embedding models.** The sidecar is no longer a
+single hardcoded BERT path. Models are selected at runtime by HuggingFace id
+through a `TextEmbedder` trait + `ModelSpec` registry, each carrying its own
+pooling, instruction/document prefixes, native dimension, and license. The
+launch set spans five architectures, all verified against real weights on CPU:
+`all-MiniLM-L6-v2` (BERT/mean, default), `BGE-M3` (XLM-RoBERTa/CLS, 1024-d,
+multilingual), `Qwen3-Embedding` 0.6B/4B/8B (decoder/last-token, one loader,
+up to 4096-d), and two custom bidirectional encoders — **EmbeddingGemma-300M**
+(Gemma 3 made bidirectional + sentence-transformers Dense heads + mean pooling)
+and **LFM2.5-Embedding-350M** (non-causal short-conv + bidirectional GQA, CLS).
+Query vs document embedding is now distinguished over the sidecar protocol so
+asymmetric models retrieve correctly. An unknown/unsupported model id is a
+typed error + exit — never a silent substitution. See `docs/EMBEDDING_MODELS.md`.
+
+**Added — upgrade-safe on-disk format versioning.** Every persistent artifact
+(WAL, SST, PAX block, blob log, catalog, HNSW index) now carries an explicit,
+range-checked format version. A newer engine reads data written by older
+formats (backward-compatible), and any format **newer** than the running binary
+supports is *refused* with a typed error rather than mis-read — the guarantee
+that makes rolling a binary back on the same volume safe. Adds a crash-safe
+upgrade-on-open primitive (write-new → fsync → atomic rename → fsync-dir) with
+crash-injection tests, and a cross-version integration test proving forward
+reads + newer-format refusal through the real engine open path. The PostgreSQL
+wire framing is pinned by a contract test so patch releases stay
+client-compatible.
+
+**Fixed — semantic search survives a restart.** The per-table vector index
+(HNSW + delta buffer) lived only in memory. After a server restart the row data
+survived (WAL/SST) but the index did not, so `SEMANTIC_MATCH` on a recovered
+table failed with "table not found" — semantic search silently broke on every
+restart. On open, the engine now rebuilds each embedding table's index by
+re-embedding its durable rows through the attached model (deterministic: the
+same model reproduces the same vectors, so results are identical to before the
+restart). Verified end-to-end on a real 600-row AG News dataset: precision holds
+(0.90) across a restart.
+
+**Fixed — sidecar restart race.** A stale `sidecar.sock` left on the data volume
+by the previous run could make the engine try to embed before the freshly
+spawned sidecar was accepting connections, causing a "connection refused" panic
+on restart. Attaching the sidecar now waits for it to actually answer before
+proceeding, so the socket file existing is no longer mistaken for readiness.
+
+**Fixed — SST cross-version corruption path.** The SST registry silently
+swallowed every footer-parse error into a single-block legacy fallback, so an
+SST footer written by a *newer* engine would be mis-read as one giant legacy
+block instead of refused. It now propagates the typed too-old / too-new format
+errors and falls back only for a genuine legacy no-footer SST.
+
+**Compatibility.** Existing v0.4 databases open unchanged; the default model
+stays `all-MiniLM-L6-v2`. Legacy (pre-versioning) WAL/SST/blob files are read
+as format v1 and migrated to the versioned layout on the next rewrite.
+
 ### v0.4.0
 
 **Fixed — semantic search over the wire.** `SEMANTIC_MATCH` returned zero rows

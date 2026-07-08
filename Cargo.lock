@@ -2615,7 +2615,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-auth"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
  "galaxdb-common",
@@ -2633,7 +2633,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-backup"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.22.1",
  "galaxdb-common",
@@ -2648,7 +2648,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-benchmarks"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "clap",
@@ -2687,7 +2687,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-cluster"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "galaxdb-auth",
  "galaxdb-crypto",
@@ -2695,7 +2695,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-common"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2705,7 +2705,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-crypto"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aegis",
  "aes-gcm",
@@ -2725,7 +2725,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-embedded"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "galaxdb-auth",
@@ -2747,7 +2747,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-io"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "galaxdb-common",
  "io-uring",
@@ -2759,7 +2759,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-observe"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "axum",
  "galaxdb-common",
@@ -2775,7 +2775,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-python"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "galaxdb-common",
  "galaxdb-embedded",
@@ -2792,7 +2792,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-query"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "async-trait",
@@ -2807,7 +2807,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "bytes",
  "futures-util",
@@ -2833,7 +2833,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-sidecar"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "candle-core",
  "candle-nn",
@@ -2852,7 +2852,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-sql"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "galaxdb-auth",
  "galaxdb-backup",
@@ -2871,7 +2871,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-storage"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "criterion",
  "crossbeam-skiplist",
@@ -2892,7 +2892,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-vector"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "galaxdb-common",
  "half",
@@ -2905,7 +2905,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-versioning"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "arrow",
  "galaxdb-common",
@@ -2920,7 +2920,7 @@ dependencies = [
 
 [[package]]
 name = "galaxdb-wire"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "galaxdb-common",
  "galaxdb-sql",

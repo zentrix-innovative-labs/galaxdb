@@ -316,7 +316,7 @@ Windows x86-64 from the [Releases page](https://github.com/zentrix-innovative-la
 
 ```toml
 [dependencies]
-galaxdb-embedded = "0.4.0"
+galaxdb-embedded = "0.5.0"
 ```
 
 ---
@@ -328,7 +328,7 @@ Every server instance exposes:
 ```bash
 # Health check — reflects real subsystem state
 curl http://localhost:9090/health
-# {"status":"ok","version":"0.4.0","subsystems":{"disk_full":false,"sidecar_healthy":true,"connections_active":3}}
+# {"status":"ok","version":"0.5.0","subsystems":{"disk_full":false,"sidecar_healthy":true,"connections_active":3}}
 
 # Prometheus metrics
 curl http://localhost:9090/metrics
