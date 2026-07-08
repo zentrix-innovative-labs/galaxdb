@@ -79,6 +79,7 @@ fn sidecar_embed_request_response() {
         row_id: 42,
         text: "hello world".to_string(),
         column: "content_embedding".to_string(),
+        is_query: false,
     });
     write_message(&mut writer, &req).unwrap();
 
@@ -145,6 +146,7 @@ fn sidecar_deterministic_embeddings() {
         row_id: 1,
         text: "the quick brown fox".to_string(),
         column: "emb".to_string(),
+        is_query: false,
     });
     write_message(&mut writer, &req1).unwrap();
     let resp1 = read_message(&mut reader).unwrap();
@@ -153,6 +155,7 @@ fn sidecar_deterministic_embeddings() {
         row_id: 2,
         text: "the quick brown fox".to_string(),
         column: "emb".to_string(),
+        is_query: false,
     });
     write_message(&mut writer, &req2).unwrap();
     let resp2 = read_message(&mut reader).unwrap();
@@ -179,6 +182,7 @@ fn sidecar_deterministic_embeddings() {
         row_id: 3,
         text: "a completely unrelated sentence about quantum physics".to_string(),
         column: "emb".to_string(),
+        is_query: false,
     });
     write_message(&mut writer, &req3).unwrap();
     let resp3 = read_message(&mut reader).unwrap();
@@ -203,6 +207,7 @@ fn sidecar_deterministic_embeddings() {
         row_id: 4,
         text: "the quick brown fox jumps".to_string(),
         column: "emb".to_string(),
+        is_query: false,
     });
     write_message(&mut writer, &req4).unwrap();
     let emb4 = match read_message(&mut reader).unwrap() {

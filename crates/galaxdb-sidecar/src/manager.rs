@@ -468,11 +468,11 @@ mod tests {
         assert!(wait_for_socket(&socket, SOCKET_READY_TIMEOUT));
 
         let response = mgr
-            .embed(EmbedRequest {
-                row_id: 1,
-                text: "hello world".to_string(),
-                column: "emb".to_string(),
-            })
+            .embed(EmbedRequest::document(
+                1,
+                "hello world".to_string(),
+                "emb".to_string(),
+            ))
             .unwrap();
 
         assert_eq!(response.row_id, 1);
@@ -500,11 +500,11 @@ mod tests {
         assert!(mgr.is_degraded());
 
         // Embed should fail and add to backlog.
-        let result = mgr.embed(EmbedRequest {
-            row_id: 1,
-            text: "test".to_string(),
-            column: "emb".to_string(),
-        });
+        let result = mgr.embed(EmbedRequest::document(
+            1,
+            "test".to_string(),
+            "emb".to_string(),
+        ));
         assert!(result.is_err());
         assert_eq!(mgr.backlog_size(), 1);
     }
@@ -544,16 +544,8 @@ mod tests {
         let mgr = SidecarManager::new(config);
 
         // Add requests to backlog while sidecar is down.
-        mgr.add_to_backlog(EmbedRequest {
-            row_id: 1,
-            text: "a".to_string(),
-            column: "emb".to_string(),
-        });
-        mgr.add_to_backlog(EmbedRequest {
-            row_id: 2,
-            text: "b".to_string(),
-            column: "emb".to_string(),
-        });
+        mgr.add_to_backlog(EmbedRequest::document(1, "a".to_string(), "emb".to_string()));
+        mgr.add_to_backlog(EmbedRequest::document(2, "b".to_string(), "emb".to_string()));
         assert_eq!(mgr.backlog_size(), 2);
 
         // Start sidecar and wait for it to be ready.
@@ -564,11 +556,11 @@ mod tests {
         );
 
         // Verify the sidecar is actually accepting connections.
-        let test_result = mgr.send_embed_request(&EmbedRequest {
-            row_id: 99,
-            text: "test".to_string(),
-            column: "emb".to_string(),
-        });
+        let test_result = mgr.send_embed_request(&EmbedRequest::document(
+            99,
+            "test".to_string(),
+            "emb".to_string(),
+        ));
         assert!(
             test_result.is_ok(),
             "sidecar should be accepting connections after model load"

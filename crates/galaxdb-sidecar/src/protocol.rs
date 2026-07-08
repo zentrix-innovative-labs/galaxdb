@@ -28,6 +28,37 @@ pub struct EmbedRequest {
     pub text: String,
     /// The embedding column name.
     pub column: String,
+    /// Whether this text is a search **query** (vs a stored **document**).
+    ///
+    /// Asymmetric embedding models (Qwen3-Embedding, EmbeddingGemma,
+    /// LFM2.5-Embedding) apply a different instruction/prefix to queries and
+    /// documents. Symmetric models (all-MiniLM, BGE-M3) ignore this. Defaults
+    /// to `false` (document) so older clients that omit the field keep the
+    /// prior document-embedding behavior.
+    #[serde(default)]
+    pub is_query: bool,
+}
+
+impl EmbedRequest {
+    /// Construct a request to embed a stored **document** row.
+    pub fn document(row_id: u64, text: String, column: String) -> Self {
+        Self {
+            row_id,
+            text,
+            column,
+            is_query: false,
+        }
+    }
+
+    /// Construct a request to embed a search **query**.
+    pub fn query(row_id: u64, text: String, column: String) -> Self {
+        Self {
+            row_id,
+            text,
+            column,
+            is_query: true,
+        }
+    }
 }
 
 /// Response from sidecar to engine: embedding result.
@@ -69,6 +100,13 @@ pub struct StatusResponse {
     pub dimensions: usize,
     pub in_flight: usize,
     pub max_in_flight: usize,
+    /// Backbone architecture (e.g. `bert`, `qwen3`, `gemma3_bidirectional`). Additive:
+    /// older sidecars omit it and it deserializes to an empty string.
+    #[serde(default)]
+    pub architecture: String,
+    /// Pooling strategy (e.g. `mean`, `cls`, `last_token`). Additive (see `architecture`).
+    #[serde(default)]
+    pub pooling: String,
 }
 
 /// Envelope for all sidecar messages.
@@ -143,6 +181,7 @@ mod tests {
             row_id: 42,
             text: "hello world".to_string(),
             column: "content_embedding".to_string(),
+            is_query: true,
         });
 
         let mut buf = Vec::new();
@@ -156,6 +195,7 @@ mod tests {
                 assert_eq!(req.row_id, 42);
                 assert_eq!(req.text, "hello world");
                 assert_eq!(req.column, "content_embedding");
+                assert!(req.is_query);
             }
             _ => panic!("expected EmbedRequest"),
         }
@@ -214,6 +254,8 @@ mod tests {
             dimensions: 384,
             in_flight: 100,
             max_in_flight: 10_000,
+            architecture: "bert".to_string(),
+            pooling: "mean".to_string(),
         });
 
         let mut buf = Vec::new();

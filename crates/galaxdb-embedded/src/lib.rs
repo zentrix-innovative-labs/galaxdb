@@ -3066,11 +3066,8 @@ impl VectorSearchBackend for EmbeddedVectorBackend {
             .get(table)
             .ok_or_else(|| GalaxError::TableNotFound(table.to_string()))?;
 
-        let request = EmbedRequest {
-            row_id: 0,
-            text: query_text.to_string(),
-            column: idx.embedding_column.clone(),
-        };
+        // This text is a search query — asymmetric models apply their query prefix.
+        let request = EmbedRequest::query(0, query_text.to_string(), idx.embedding_column.clone());
         let response = sidecar
             .embed(request)
             .map_err(|_| GalaxError::SidecarUnavailable)?;
@@ -3202,12 +3199,9 @@ impl VectorSearchBackend for EmbeddedVectorBackend {
         // same key) and so `on_row_deleted` can tombstone the right entry.
         let row_id = xxhash_rust::xxh3::xxh3_64(row_key);
 
+        // A stored row is a document — asymmetric models apply their document prefix.
         let response = sidecar
-            .embed(EmbedRequest {
-                row_id,
-                text,
-                column: source_column,
-            })
+            .embed(EmbedRequest::document(row_id, text, source_column))
             .map_err(|e| {
                 GalaxError::Internal(format!(
                     "embedding sidecar failed for insert into '{table}': {e}"
@@ -3219,6 +3213,23 @@ impl VectorSearchBackend for EmbeddedVectorBackend {
         // primary-key → row-id mapping so a later DELETE can tombstone it.
         let mut indexes = self.indexes.write().unwrap();
         if let Some(idx) = indexes.get_mut(table) {
+            // Dimension integrity (task A.5): the model's real output dimension must
+            // match the table's declared `DIM`. A mismatch means the configured model
+            // does not fit the schema — refuse with a typed error rather than storing a
+            // wrong-width vector that would corrupt the index or silently truncate.
+            if response.embedding.len() != idx.dim {
+                return Err(GalaxError::Internal(format!(
+                    "embedding dimension mismatch for table '{table}': model '{}' produced \
+                     {}-d vectors but the '{}' column was declared DIM {}. Re-create the table \
+                     with DIM {} or configure a model whose dimension is {}.",
+                    response.model_version,
+                    response.embedding.len(),
+                    idx.embedding_column,
+                    idx.dim,
+                    response.embedding.len(),
+                    idx.dim,
+                )));
+            }
             idx.delta.insert(row_id, response.embedding.clone());
             idx.vectors.insert(row_id, response.embedding);
             idx.key_to_row_id.insert(row_key.to_vec(), row_id);

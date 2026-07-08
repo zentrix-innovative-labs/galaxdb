@@ -33,12 +33,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use candle_core::{Device, Tensor};
-use candle_nn::VarBuilder;
-use candle_transformers::models::bert::{BertModel, Config as BertConfig};
-use hf_hub::{api::sync::Api, Repo, RepoType};
-use tokenizers::Tokenizer;
+use candle_core::Device;
 
+use galaxdb_sidecar::models::{self, Loaded, ModelSpec};
 use galaxdb_sidecar::protocol::*;
 
 /// Process exit code used when the model fails to load.
@@ -48,104 +45,50 @@ use galaxdb_sidecar::protocol::*;
 /// embeddings.
 const EXIT_MODEL_LOAD_FAILED: i32 = 1;
 
-/// Loaded sentence-transformer model (Candle + tokenizer).
+/// A loaded embedding model behind the multi-architecture registry.
+///
+/// The concrete architecture (BERT / XLM-RoBERTa / Qwen3 decoder / bidirectional
+/// Gemma 3 / bidirectional LFM2) is chosen at load time from the model id; every
+/// path computes real vectors — there is no mock or fallback.
 struct EmbeddingModel {
-    model: BertModel,
-    tokenizer: Tokenizer,
-    device: Device,
-    dim: usize,
-    model_id: String,
+    loaded: Loaded,
 }
 
 impl EmbeddingModel {
-    /// Load a sentence-transformer model from HuggingFace Hub.
-    ///
-    /// Downloads `config.json`, `tokenizer.json`, and `model.safetensors`
-    /// from the HF Hub cache. Returns an error (never a mock) if any part
-    /// of the download, parse, or weight-load step fails.
-    fn load(model_id: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        eprintln!("[sidecar] downloading model: {}", model_id);
-        let api = Api::new()?;
-        let repo = api.repo(Repo::new(model_id.to_string(), RepoType::Model));
-
-        let config_path = repo.get("config.json")?;
-        let tokenizer_path = repo.get("tokenizer.json")?;
-        let weights_path = repo.get("model.safetensors")?;
-
-        eprintln!("[sidecar] loading config...");
-        let config: BertConfig =
-            serde_json::from_str(&std::fs::read_to_string(&config_path)?)?;
-        let dim = config.hidden_size;
-
-        eprintln!("[sidecar] loading tokenizer...");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| format!("tokenizer load failed: {}", e))?;
-
-        eprintln!("[sidecar] loading weights ({})...", weights_path.display());
+    /// Resolve + load a model from HuggingFace Hub by id. Returns a typed error
+    /// (never a mock) if the id is unsupported or any load step fails.
+    fn load(model_id: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        eprintln!("[sidecar] resolving + loading model: {}", model_id);
         let device = Device::Cpu;
-        let vb = unsafe {
-            VarBuilder::from_mmaped_safetensors(
-                &[weights_path],
-                candle_core::DType::F32,
-                &device,
-            )?
-        };
-
-        let model = BertModel::load(vb, &config)?;
-        eprintln!("[sidecar] model loaded: dim={}", dim);
-
-        Ok(Self {
-            model,
-            tokenizer,
-            device,
-            dim,
-            model_id: model_id.to_string(),
-        })
+        let loaded = models::load(model_id, &device)?;
+        let spec = &loaded.spec;
+        eprintln!(
+            "[sidecar] model loaded: id={} arch={:?} pooling={:?} dim={} gated={}",
+            spec.hf_id,
+            spec.arch,
+            spec.pooling,
+            spec.effective_dim(),
+            spec.gated
+        );
+        Ok(Self { loaded })
     }
 
-    /// Generate an L2-normalized embedding for `text`. Returns the
-    /// pooled, normalized vector or an error describing which step
-    /// (tokenize / forward / pool) failed.
-    fn embed(&self, text: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-        let encoding = self
-            .tokenizer
-            .encode(text, true)
-            .map_err(|e| format!("tokenize failed: {}", e))?;
-        let input_ids: Vec<u32> = encoding.get_ids().to_vec();
-        let attention_mask: Vec<u32> = encoding.get_attention_mask().to_vec();
-        let token_type_ids: Vec<u32> = encoding.get_type_ids().to_vec();
-        let seq_len = input_ids.len();
+    fn spec(&self) -> &ModelSpec {
+        &self.loaded.spec
+    }
 
-        let input_ids_t =
-            Tensor::new(input_ids.as_slice(), &self.device)?.reshape((1, seq_len))?;
-        let attention_mask_t =
-            Tensor::new(attention_mask.as_slice(), &self.device)?.reshape((1, seq_len))?;
-        let token_type_ids_t =
-            Tensor::new(token_type_ids.as_slice(), &self.device)?.reshape((1, seq_len))?;
+    fn dim(&self) -> usize {
+        self.loaded.embedder.dim()
+    }
 
-        let output =
-            self.model
-                .forward(&input_ids_t, &token_type_ids_t, Some(&attention_mask_t))?;
-
-        // Mean pooling with attention mask.
-        let mask_f32 = attention_mask_t
-            .to_dtype(candle_core::DType::F32)?
-            .unsqueeze(2)?
-            .broadcast_as(output.shape())?;
-        let masked = (output * mask_f32.clone())?;
-        let summed = masked.sum(1)?;
-        let mask_sum = mask_f32.sum(1)?;
-        let pooled = (summed / mask_sum)?;
-
-        // Extract and L2-normalize.
-        let mut vec: Vec<f32> = pooled.squeeze(0)?.to_vec1()?;
-        let norm: f32 = vec.iter().map(|x| x * x).sum::<f32>().sqrt();
-        if norm > f32::EPSILON {
-            for x in vec.iter_mut() {
-                *x /= norm;
-            }
-        }
-        Ok(vec)
+    /// Generate an L2-normalized embedding for `text`. `is_query` selects the
+    /// query vs document prefix for asymmetric models (no-op for symmetric ones).
+    fn embed(
+        &self,
+        text: &str,
+        is_query: bool,
+    ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
+        self.loaded.embedder.embed(text, is_query)
     }
 }
 
@@ -179,8 +122,10 @@ fn main() {
         }
     };
 
-    let dimensions = model.dim;
-    let model_version = model.model_id.clone();
+    let dimensions = model.dim();
+    let model_version = model.spec().hf_id.clone();
+    let architecture = model.spec().arch.as_str().to_string();
+    let pooling = model.spec().pooling.as_str().to_string();
 
     // Remove stale socket file.
     let _ = std::fs::remove_file(&socket_path);
@@ -215,12 +160,16 @@ fn main() {
             Ok((stream, _)) => {
                 let dims = dimensions;
                 let version = model_version.clone();
+                let arch = architecture.clone();
+                let pool = pooling.clone();
                 let in_flight = in_flight.clone();
                 let running = running.clone();
                 let model = model.clone();
 
                 std::thread::spawn(move || {
-                    handle_connection(stream, dims, &version, &in_flight, &running, &model);
+                    handle_connection(
+                        stream, dims, &version, &arch, &pool, &in_flight, &running, &model,
+                    );
                 });
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -237,10 +186,13 @@ fn main() {
     eprintln!("[sidecar] shutdown");
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_connection(
     stream: UnixStream,
     dimensions: usize,
     model_version: &str,
+    architecture: &str,
+    pooling: &str,
     in_flight: &AtomicUsize,
     running: &AtomicBool,
     model: &EmbeddingModel,
@@ -267,7 +219,7 @@ fn handle_connection(
                         message: "max in-flight exceeded".to_string(),
                     }
                 } else {
-                    let result = model.embed(&req.text);
+                    let result = model.embed(&req.text, req.is_query);
                     in_flight.fetch_sub(1, Ordering::Relaxed);
                     match result {
                         Ok(embedding) => SidecarMessage::EmbedResponse(EmbedResponse {
@@ -288,6 +240,8 @@ fn handle_connection(
                 dimensions,
                 in_flight: in_flight.load(Ordering::Relaxed),
                 max_in_flight: MAX_IN_FLIGHT,
+                architecture: architecture.to_string(),
+                pooling: pooling.to_string(),
             }),
             _ => SidecarMessage::Error {
                 message: "unexpected message type".to_string(),

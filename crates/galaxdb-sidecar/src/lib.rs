@@ -18,6 +18,11 @@ pub mod manager;
 #[cfg(unix)]
 pub mod tracking;
 
+// Multi-architecture embedding model registry + loaders (candle). Used by the sidecar
+// binary (Unix-only). Gated to Unix to keep the non-Unix stub build minimal.
+#[cfg(unix)]
+pub mod models;
+
 // On non-Unix platforms, provide stub types so dependents compile.
 #[cfg(not(unix))]
 pub mod manager {

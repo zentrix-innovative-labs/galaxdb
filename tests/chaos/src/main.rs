@@ -898,11 +898,7 @@ async fn test_sidecar_kill_mid_request() -> TestResult {
     let num_requests = 50;
     let mut embed_errors = 0;
     for i in 0..num_requests {
-        let req = EmbedRequest {
-            row_id: i,
-            text: format!("document {}", i),
-            column: "embedding".to_string(),
-        };
+        let req = EmbedRequest::document(i, format!("document {}", i), "embedding".to_string());
         if mgr.embed(req).is_err() {
             embed_errors += 1;
         }
