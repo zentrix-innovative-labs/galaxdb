@@ -988,7 +988,7 @@ impl Engine {
         let mut tombstoned: HashMap<Vec<u8>, Timestamp> = HashMap::new();
 
         if let Ok(registry) = self.sst_registry.read() {
-            for (_sst_id, entry) in registry.entries.iter() {
+            for entry in registry.entries.values() {
                 let Ok(data) = std::fs::read(&entry.path) else {
                     continue;
                 };
@@ -1127,7 +1127,7 @@ impl Engine {
         // future relative to the caller's snapshot and must not be
         // visible.
         if let Ok(registry) = self.sst_registry.read() {
-            for (_sst_id, entry) in registry.entries.iter() {
+            for entry in registry.entries.values() {
                 let Ok(data) = std::fs::read(&entry.path) else {
                     continue;
                 };
@@ -1303,7 +1303,7 @@ impl Engine {
         };
 
         if let Ok(registry) = self.sst_registry.read() {
-            for (_sst_id, entry) in registry.entries.iter() {
+            for entry in registry.entries.values() {
                 let Ok(data) = std::fs::read(&entry.path) else {
                     continue;
                 };

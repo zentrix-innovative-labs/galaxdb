@@ -175,17 +175,17 @@ impl NodeCache {
         self.map.get(&id).cloned()
     }
     fn put(&mut self, id: u32, node: Node) {
-        if self.map.contains_key(&id) {
-            self.map.insert(id, node);
+        // Present already → update in place, insertion order unchanged.
+        if self.map.insert(id, node).is_some() {
             return;
         }
-        if self.map.len() >= self.capacity {
+        // New entry: track its order and evict the oldest if over capacity.
+        self.order.push_back(id);
+        if self.map.len() > self.capacity {
             if let Some(evict) = self.order.pop_front() {
                 self.map.remove(&evict);
             }
         }
-        self.map.insert(id, node);
-        self.order.push_back(id);
     }
 }
 

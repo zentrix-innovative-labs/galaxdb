@@ -49,10 +49,7 @@ impl VersionedValue {
             if current.timestamp <= read_ts {
                 return Some(current.value.clone());
             }
-            match &current.prev {
-                Some(prev) => current = prev,
-                None => return None,
-            }
+            current = current.prev.as_deref()?;
         }
     }
 
@@ -76,10 +73,7 @@ impl VersionedValue {
             if current.timestamp <= read_ts {
                 return Some((current.value.clone(), current.timestamp));
             }
-            match &current.prev {
-                Some(prev) => current = prev,
-                None => return None,
-            }
+            current = current.prev.as_deref()?;
         }
     }
 

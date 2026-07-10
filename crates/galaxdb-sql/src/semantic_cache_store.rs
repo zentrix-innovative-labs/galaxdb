@@ -32,7 +32,7 @@ pub struct CacheConfig {
 }
 
 impl CacheConfig {
-    fn to_bytes(&self) -> Vec<u8> {
+    fn to_bytes(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(8);
         out.extend_from_slice(&self.similarity.to_le_bytes());
         out.extend_from_slice(&self.ttl_secs.to_le_bytes());

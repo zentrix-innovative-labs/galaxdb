@@ -300,7 +300,7 @@ impl Encoder {
         for layer in &self.layers {
             xs = layer.forward(&xs)?;
         }
-        Ok(self.norm.forward(&xs)?)
+        self.norm.forward(&xs)
     }
 }
 
