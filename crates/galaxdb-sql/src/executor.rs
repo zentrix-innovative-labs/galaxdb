@@ -849,7 +849,7 @@ pub fn execute_with_context(
     // the check and preserves today's behavior.
     enforce_authorization(plan, ctx)?;
 
-    match plan {
+    let result = match plan {
         QueryPlan::CreateTable(stmt) => exec_create_table(stmt, ctx),
         QueryPlan::DropTable { name, if_exists } => exec_drop_table(name, *if_exists, ctx),
 
@@ -943,7 +943,36 @@ pub fn execute_with_context(
         QueryPlan::AlterTableSetStorage { table, mode } => {
             exec_alter_table_set_storage(table, *mode, ctx)
         }
+    };
+
+    // v0.6 metering (E-4): count client-visible data operations once per
+    // statement, on success. Reads and vector searches are always one plan per
+    // statement and every entry path funnels through here, so they are counted
+    // here (complete + exact). `Update`/`Delete`/`BulkInsert` are also one plan
+    // per statement. A multi-row `INSERT` is expanded into one `Insert` plan
+    // per row *before* this dispatch, so `Insert` is counted once per statement
+    // at the ingress (galaxdb-embedded), NOT here — otherwise a 10k-row INSERT
+    // would bill as 10k ops. These are neutral operational counters; no billing
+    // concept lives in the engine.
+    if result.is_ok() {
+        let m = galaxdb_observe::metrics();
+        match plan {
+            QueryPlan::PointLookup { .. }
+            | QueryPlan::FullScan { .. }
+            | QueryPlan::FullScanAtVersion { .. } => m.read_ops_total.inc(),
+            QueryPlan::SemanticSearch { .. }
+            | QueryPlan::HybridSearch { .. }
+            | QueryPlan::HybridSearchAtVersion { .. } => m.vector_ops_total.inc(),
+            QueryPlan::Update { .. }
+            | QueryPlan::Delete { .. }
+            | QueryPlan::BulkInsert { .. } => m.write_ops_total.inc(),
+            // `Insert` counted per-statement at the ingress; DDL / roles /
+            // grants / backup / restore / analyze are not billable data ops.
+            _ => {}
+        }
     }
+
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1597,6 +1626,12 @@ fn exec_full_scan(
 /// pick the same representative per group.
 fn apply_not_duplicate_pass(buffered: &mut Vec<BufferedRow>) {
     use std::collections::HashMap;
+
+    // v0.6 metering (E-4): count the rows this near-dedup pass processes
+    // (the buffered candidate set it consumes before collapsing groups).
+    galaxdb_observe::metrics()
+        .near_dedup_rows_total
+        .inc_by(buffered.len() as u64);
 
     // Pass 1: for each group ID, remember the smallest primary key.
     let mut representative: HashMap<i64, Vec<u8>> = HashMap::new();

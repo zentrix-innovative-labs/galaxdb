@@ -76,6 +76,41 @@ pub struct Metrics {
     pub sidecar_status: IntGauge,
     /// Total queries served over the wire (counter).
     pub queries_total: IntCounter,
+
+    // -----------------------------------------------------------------
+    // v0.6 usage-metering counters (E-4). Neutral operational usage
+    // counters — the engine has no concept of tenants, tiers, prices,
+    // or billing; a downstream collector (e.g. GalaxDB Cloud) does that
+    // interpretation. All six persist across restart via MeteringState.
+    // -----------------------------------------------------------------
+    /// Read operations served: one per client read statement (point
+    /// lookup / scan / time-travel scan). One statement = one op,
+    /// independent of row count.
+    pub read_ops_total: IntCounter,
+    /// Write operations committed: one per client write statement
+    /// (INSERT / BULK INSERT / UPDATE / DELETE / COPY FROM), independent
+    /// of the number of rows affected.
+    pub write_ops_total: IntCounter,
+    /// Vector-search operations: one per SEMANTIC_MATCH / hybrid / ANN
+    /// search statement. Disjoint from `read_ops_total`.
+    pub vector_ops_total: IntCounter,
+    /// Rows embedded by the sidecar (documents + queries), one per row.
+    pub embedding_ops_total: IntCounter,
+    /// Rows processed by a `WHERE NOT DUPLICATE` / near-dedup pass.
+    pub near_dedup_rows_total: IntCounter,
+    /// Bytes emitted by training-dataset (Lance) exports.
+    pub training_export_bytes_total: IntCounter,
+
+    // v0.6 capacity gauges (recomputed live from the engine; not persisted).
+    /// Physical on-disk bytes for this database (post-compaction,
+    /// compressed, encrypted). Accurate only while the process runs.
+    pub storage_bytes: IntGauge,
+    /// Total live row count.
+    pub rows_total: IntGauge,
+    /// Process start time as unix epoch seconds. Set once at startup so a
+    /// collector can detect a restart and reconcile the unpersisted
+    /// counter tail.
+    pub process_start_time_seconds: IntGauge,
 }
 
 static METRICS: OnceLock<Arc<Metrics>> = OnceLock::new();
@@ -94,7 +129,7 @@ fn build_metrics() -> Arc<Metrics> {
         let _ = default_registry().register(Box::new(c.clone()));
         c
     }
-    Arc::new(Metrics {
+    let m = Arc::new(Metrics {
         buffer_pool_hot_set_usage: gauge(
             "galaxdb_buffer_pool_hot_set_usage",
             "Bytes resident in the LRU hot-set portion of the buffer pool",
@@ -139,7 +174,55 @@ fn build_metrics() -> Arc<Metrics> {
             "galaxdb_queries_total",
             "Total queries served over the wire",
         ),
-    })
+        read_ops_total: counter(
+            "galaxdb_read_ops_total",
+            "Read operations served (one per client read statement, any row count)",
+        ),
+        write_ops_total: counter(
+            "galaxdb_write_ops_total",
+            "Write operations committed (one per INSERT/UPDATE/DELETE/COPY statement, any row count)",
+        ),
+        vector_ops_total: counter(
+            "galaxdb_vector_ops_total",
+            "Vector-search operations (one per SEMANTIC_MATCH/hybrid/ANN statement)",
+        ),
+        embedding_ops_total: counter(
+            "galaxdb_embedding_ops_total",
+            "Rows embedded by the sidecar (documents and queries), one per row",
+        ),
+        near_dedup_rows_total: counter(
+            "galaxdb_near_dedup_rows_total",
+            "Rows processed by a WHERE NOT DUPLICATE / near-dedup pass",
+        ),
+        training_export_bytes_total: counter(
+            "galaxdb_training_export_bytes_total",
+            "Bytes emitted by training-dataset (Lance) exports",
+        ),
+        storage_bytes: gauge(
+            "galaxdb_storage_bytes",
+            "Physical on-disk bytes for this database (post-compaction), accurate while running",
+        ),
+        rows_total: gauge(
+            "galaxdb_rows_total",
+            "Total live row count",
+        ),
+        process_start_time_seconds: gauge(
+            "galaxdb_process_start_time_seconds",
+            "Process start time in unix epoch seconds (set once at startup)",
+        ),
+    });
+
+    // Set the process start time once, at first metrics construction
+    // (which happens at process startup via `register_all_metrics`). The
+    // OnceLock guarantees this runs exactly once per process, so the gauge
+    // is a stable per-process value a collector can use for reset detection.
+    let start_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    m.process_start_time_seconds.set(start_secs);
+
+    m
 }
 
 /// Return the process-wide [`Metrics`] handle. First call registers
@@ -155,6 +238,112 @@ pub fn metrics() -> Arc<Metrics> {
 /// first `/metrics` scrape returns the complete set. Idempotent.
 pub fn register_all_metrics() {
     let _ = metrics();
+}
+
+// ---------------------------------------------------------------------------
+// v0.6 metering counter persistence (E-4, task M.6)
+//
+// The six cumulative billing-grade counters must survive the frequent
+// stop/start of scale-to-zero databases. They are persisted to
+// `<data_dir>/metering.gmet` using the shared `galaxdb-common::format`
+// machinery (versioned header + crash-safe `atomic_replace`), seeded back
+// into the live counters on open, and flushed on checkpoint + graceful
+// shutdown. The gauges are NOT persisted — they are recomputed live from the
+// engine, so a reset on restart is harmless.
+// ---------------------------------------------------------------------------
+
+use galaxdb_common::format::{atomic_replace, FormatHeader, FormatSupport, FORMAT_HEADER_SIZE};
+use galaxdb_common::{GalaxError, GalaxResult};
+use std::path::Path;
+
+/// Format support for the metering counter-persistence file. Same versioned
+/// header + typed too-old/too-new refusal as every other v0.5 artifact.
+pub const METERING: FormatSupport = FormatSupport {
+    artifact: "metering",
+    magic: *b"GMET",
+    min_readable: 1,
+    current_write: 1,
+};
+
+/// File name (under the engine data directory) holding the persisted totals.
+pub const METERING_FILE: &str = "metering.gmet";
+
+/// Six little-endian `u64` counter totals follow the 16-byte header.
+const METERING_PAYLOAD_LEN: usize = 6 * 8;
+
+/// Load persisted cumulative counter totals from `<data_dir>/metering.gmet`
+/// and seed the live counters. Call once at engine open, before any ops.
+///
+/// - Absent file → fresh database, no-op.
+/// - Too-new / too-old format version → typed `FormatTooNew`/`FormatTooOld`
+///   (refuse; a newer engine's totals are never misread).
+/// - Bad magic or truncated file → logged and treated as "no prior totals"
+///   (never a silent zeroing of a *valid* file — that path returns the error).
+pub fn load_metering(data_dir: &Path) -> GalaxResult<()> {
+    let path = data_dir.join(METERING_FILE);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(GalaxError::Io(e)),
+    };
+    if bytes.len() < FORMAT_HEADER_SIZE + METERING_PAYLOAD_LEN {
+        tracing::warn!(
+            path = %path.display(),
+            "metering file too short; ignoring prior totals"
+        );
+        return Ok(());
+    }
+    let mut hdr = [0u8; FORMAT_HEADER_SIZE];
+    hdr.copy_from_slice(&bytes[..FORMAT_HEADER_SIZE]);
+    let header = match FormatHeader::from_bytes(&hdr, METERING.magic) {
+        Ok(h) => h,
+        Err(_) => {
+            tracing::warn!(
+                path = %path.display(),
+                "metering file has unexpected magic; ignoring prior totals"
+            );
+            return Ok(());
+        }
+    };
+    // Typed too-old / too-new refusal — propagate so open fails cleanly.
+    METERING.check(header.format_version)?;
+
+    let payload = &bytes[FORMAT_HEADER_SIZE..FORMAT_HEADER_SIZE + METERING_PAYLOAD_LEN];
+    let read_u64 = |i: usize| -> u64 {
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&payload[i * 8..i * 8 + 8]);
+        u64::from_le_bytes(b)
+    };
+    let m = metrics();
+    m.read_ops_total.inc_by(read_u64(0));
+    m.write_ops_total.inc_by(read_u64(1));
+    m.vector_ops_total.inc_by(read_u64(2));
+    m.embedding_ops_total.inc_by(read_u64(3));
+    m.near_dedup_rows_total.inc_by(read_u64(4));
+    m.training_export_bytes_total.inc_by(read_u64(5));
+    Ok(())
+}
+
+/// Persist the current cumulative counter totals to `<data_dir>/metering.gmet`
+/// crash-safely (write temp → fsync → atomic rename → fsync dir). Call on
+/// checkpoint/flush and on graceful shutdown. A crash mid-write leaves either
+/// the prior or the new totals, never a torn value.
+pub fn flush_metering(data_dir: &Path) -> GalaxResult<()> {
+    let m = metrics();
+    let vals: [u64; 6] = [
+        m.read_ops_total.get(),
+        m.write_ops_total.get(),
+        m.vector_ops_total.get(),
+        m.embedding_ops_total.get(),
+        m.near_dedup_rows_total.get(),
+        m.training_export_bytes_total.get(),
+    ];
+    let mut out = METERING.header().to_bytes().to_vec();
+    for v in vals {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    let path = data_dir.join(METERING_FILE);
+    atomic_replace(&path, &out).map_err(GalaxError::Io)
 }
 
 // ---------------------------------------------------------------------------
@@ -648,6 +837,16 @@ mod tests {
         m.hnsw_recall_estimate.set(0);
         m.connections_active.set(0);
         m.sidecar_status.set(0);
+        // v0.6 metering handles.
+        m.read_ops_total.inc();
+        m.write_ops_total.inc();
+        m.vector_ops_total.inc();
+        m.embedding_ops_total.inc();
+        m.near_dedup_rows_total.inc();
+        m.training_export_bytes_total.inc();
+        m.storage_bytes.set(0);
+        m.rows_total.set(0);
+        m.process_start_time_seconds.set(1);
 
         // Gather and confirm every metric name appears in the output.
         let families = default_registry().gather();
@@ -667,6 +866,15 @@ mod tests {
             "galaxdb_connections_active",
             "galaxdb_disk_full",
             "galaxdb_sidecar_status",
+            "galaxdb_read_ops_total",
+            "galaxdb_write_ops_total",
+            "galaxdb_vector_ops_total",
+            "galaxdb_embedding_ops_total",
+            "galaxdb_near_dedup_rows_total",
+            "galaxdb_training_export_bytes_total",
+            "galaxdb_storage_bytes",
+            "galaxdb_rows_total",
+            "galaxdb_process_start_time_seconds",
         ] {
             assert!(
                 names.contains(required),

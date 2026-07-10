@@ -149,6 +149,29 @@ here. Dates are release-tag dates. Versions follow semver; the PyPI client
 (`galaxdb-client`), the Docker image (`harbi256/galaxdb`), and the server
 binaries share the same version.
 
+### v0.6.0
+
+**Added — usage-metering metrics on `/metrics` (E-4).** The engine now exposes
+neutral, billing-grade operational counters and capacity gauges so a control
+plane can meter usage by scraping port 9090 (no auth change). New cumulative
+counters: `galaxdb_read_ops_total`, `galaxdb_write_ops_total`,
+`galaxdb_vector_ops_total` (disjoint from reads), `galaxdb_embedding_ops_total`
+(per row), `galaxdb_near_dedup_rows_total`, and `galaxdb_training_export_bytes_total`.
+New gauges: `galaxdb_storage_bytes` (physical on-disk size, post-compaction),
+`galaxdb_rows_total`, and `galaxdb_process_start_time_seconds`. Op counting is
+**one statement = one op** — reads/vector searches are counted at the executor
+(the single dispatch every statement funnels through), writes once per statement
+at the ingress above the per-row `INSERT` fan-out, so a 10k-row `INSERT` and a
+10k-row `COPY` are each one write op. See `docs/METRICS.md` for exact definitions.
+
+**Added — restart-durable counters.** The six cumulative counters persist to
+`<data_dir>/metering.gmet` using the v0.5 versioned-header + crash-safe
+`atomic_replace` machinery (a mid-write crash leaves the prior or the new totals,
+never a torn value; a too-new file is refused with a typed error). They are
+seeded back on open and flushed on every checkpoint and on graceful shutdown, so
+scale-to-zero stop/start never resets usage to zero. `galaxdb_process_start_time_seconds`
+lets a collector detect a restart and reconcile the unpersisted tail.
+
 ### v0.5.0
 
 **Added — multi-architecture embedding models.** The sidecar is no longer a

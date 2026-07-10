@@ -109,7 +109,7 @@ async fn main() {
 
     let cfg = ServerConfig {
         bind_addr: format!("0.0.0.0:{port}"),
-        data_dir,
+        data_dir: data_dir.clone(),
         max_connections: 1000,
         sidecar_binary,
         model_id,
@@ -176,6 +176,18 @@ async fn main() {
             // Give in-flight connections up to 5 s to finish.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
+    }
+
+    // v0.6 metering (E-4): explicitly persist the cumulative usage counters on
+    // graceful shutdown. The `Database`/`Engine` lives in the detached accept
+    // task, so its `Drop` (which also flushes) is not guaranteed to run before
+    // the process exits — and scale-to-zero orchestrators stop the container
+    // frequently. Flushing here guarantees the counters survive a clean stop;
+    // `galaxdb_process_start_time_seconds` covers any tail lost to SIGKILL.
+    if let Err(e) = galaxdb_observe::flush_metering(std::path::Path::new(&data_dir)) {
+        tracing::warn!(error = %e, "failed to persist metering counters on shutdown");
+    } else {
+        tracing::info!("persisted metering counters on shutdown");
     }
 
     tracing::info!("GalaxDB server stopped");

@@ -196,6 +196,10 @@ impl SidecarManager {
 
         match result {
             Ok(response) => {
+                // v0.6 metering (E-4): one row embedded (document or query).
+                // Counted only on a real success — backlogged/failed embeds
+                // increment nothing until they actually succeed.
+                galaxdb_observe::metrics().embedding_ops_total.inc();
                 // Update model version
                 let mut ver = self.model_version.lock().unwrap();
                 *ver = response.model_version.clone();

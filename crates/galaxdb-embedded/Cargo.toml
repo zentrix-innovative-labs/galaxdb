@@ -21,6 +21,7 @@ galaxdb-vector = { path = "../galaxdb-vector" }
 galaxdb-sidecar = { path = "../galaxdb-sidecar" }
 galaxdb-versioning = { path = "../galaxdb-versioning" }
 galaxdb-io = { path = "../galaxdb-io" }
+galaxdb-observe.workspace = true
 sqlparser.workspace = true
 tokio.workspace = true
 tracing = { workspace = true }

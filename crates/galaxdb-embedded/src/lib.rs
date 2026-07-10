@@ -770,6 +770,11 @@ impl Database {
                                 // never mutates it, and this is &self so we couldn't anyway.
                                 last = query_result_from(res);
                             }
+                            // v0.6 metering: one INSERT statement = one write
+                            // op, regardless of row count. Counted here (above
+                            // the per-row fan-out), on success — a failed row
+                            // returns early via `?` and never reaches this.
+                            galaxdb_observe::metrics().write_ops_total.inc();
                             continue;
                         }
                         sqlparser::ast::Statement::Update {
@@ -1023,6 +1028,9 @@ impl Database {
                         _ => 1,
                     };
                 }
+                // v0.6 metering: one INSERT statement = one write op (in-txn
+                // path), counted after all rows succeed.
+                galaxdb_observe::metrics().write_ops_total.inc();
                 Ok(QueryResult::RowCount(inserted))
             }
             Statement::Update {
@@ -1510,6 +1518,9 @@ impl Database {
                             let res = execute_with_context(&row_plan, &mut ctx)?;
                             last = query_result_from(res);
                         }
+                        // v0.6 metering: one INSERT statement = one write op
+                        // (extended/prepared path), counted after the row loop.
+                        galaxdb_observe::metrics().write_ops_total.inc();
                         continue;
                     }
                     sqlparser::ast::Statement::Update {
@@ -2295,6 +2306,9 @@ impl Database {
             // double-embed the wire path or skip it entirely.
         }
 
+        // v0.6 metering: one INSERT statement = one write op (embedded/&mut
+        // path), counted after all rows succeed.
+        galaxdb_observe::metrics().write_ops_total.inc();
         Ok(QueryResult::RowCount(count))
     }
 
@@ -2949,6 +2963,28 @@ impl Database {
                 .record(entry)
                 .map_err(|e| GalaxError::Internal(format!("lineage flush failed: {e}")))?;
         }
+
+        // v0.6 metering (E-4): count the real bytes emitted by this export
+        // (recursive on-disk size of the Lance dataset directory). Measured,
+        // not estimated; counted only after a successful export.
+        fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+            let mut total = 0u64;
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return 0;
+            };
+            for entry in entries.flatten() {
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.is_file() {
+                    total += meta.len();
+                } else if meta.is_dir() {
+                    total += dir_size_bytes(&entry.path());
+                }
+            }
+            total
+        }
+        galaxdb_observe::metrics()
+            .training_export_bytes_total
+            .inc_by(dir_size_bytes(&output_path));
 
         Ok(output_path)
     }

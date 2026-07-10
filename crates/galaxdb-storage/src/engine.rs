@@ -467,6 +467,13 @@ impl Engine {
             );
         }
 
+        // v0.6 metering (E-4, M.6): seed the cumulative usage counters from the
+        // persisted totals on the data volume so they survive scale-to-zero
+        // stop/start. A too-new metering file is refused here (typed error), so
+        // opening with an older binary against newer-written totals fails
+        // cleanly rather than under-counting. Absent file → fresh start.
+        galaxdb_observe::load_metering(&config.data_dir)?;
+
         Ok(Self {
             config,
             memtable_mgr,
@@ -818,6 +825,43 @@ impl Engine {
         galaxdb_observe::metrics()
             .checkpoint_last_duration_ms
             .set(elapsed_ms);
+
+        // v0.6 metering (E-4): refresh capacity gauges on each flush — the
+        // natural moment on-disk bytes and live row count change.
+        // `storage_bytes` is PHYSICAL on-disk size (post-compaction,
+        // compressed, encrypted), accurate only while the process runs.
+        {
+            // Recursively sum on-disk file bytes under the data dir.
+            // Best-effort: unreadable entries are skipped rather than
+            // failing a flush (metering must never break a write path).
+            fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+                let mut total = 0u64;
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    return 0;
+                };
+                for entry in entries.flatten() {
+                    let Ok(meta) = entry.metadata() else { continue };
+                    if meta.is_file() {
+                        total += meta.len();
+                    } else if meta.is_dir() {
+                        total += dir_size_bytes(&entry.path());
+                    }
+                }
+                total
+            }
+            let m = galaxdb_observe::metrics();
+            m.rows_total.set(self.row_count() as i64);
+            m.storage_bytes
+                .set(dir_size_bytes(&self.config.data_dir) as i64);
+        }
+
+        // v0.6 metering (M.6): persist cumulative usage counters on each flush
+        // (a checkpoint) so the unpersisted tail stays bounded. Best-effort —
+        // the rows are already durable, so a metering-persist failure must not
+        // fail the flush; it is logged.
+        if let Err(e) = galaxdb_observe::flush_metering(&self.config.data_dir) {
+            tracing::warn!(error = %e, "failed to persist metering counters on flush");
+        }
 
         // Runtime compaction (Req 12 knob consumer): once the on-disk SST
         // count reaches the configured L0 trigger, merge the SSTs so file
@@ -1683,6 +1727,15 @@ impl Engine {
 
 impl Drop for Engine {
     fn drop(&mut self) {
+        // v0.6 metering (M.6): final best-effort persist of the cumulative
+        // usage counters on graceful shutdown, so the totals accumulated since
+        // the last checkpoint survive a clean stop (scale-to-zero). Failures
+        // are logged, not propagated — Drop cannot return an error, and the
+        // process_start_time_seconds gauge lets the collector reconcile any
+        // tail lost to an ungraceful crash.
+        if let Err(e) = galaxdb_observe::flush_metering(&self.config.data_dir) {
+            tracing::warn!(error = %e, "failed to persist metering counters on shutdown");
+        }
         self.wal.shutdown();
     }
 }
