@@ -4,30 +4,30 @@
 class Galaxdb < Formula
   desc "AI-native database — SQL + vector search + training exports in one system"
   homepage "https://github.com/zentrix-innovative-labs/galaxdb"
-  version "0.6.0"
+  version "0.7.0"
   license "Apache-2.0"
 
   on_macos do
     on_intel do
-      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.6.0/galaxdb-server-macos-x86_64"
-      sha256 "cc30ce5c514046a2f285219406d9cea0fca386a0e66323efca667daa4599b368"
+      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.7.0/galaxdb-server-macos-x86_64"
+      sha256 "9a9a168098e65837a90eaeb7282123be74a8f1d53326ea9ed0f7eb1a41aaba3e"
     end
 
     on_arm do
-      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.6.0/galaxdb-server-macos-arm64"
-      sha256 "11cde1ca5b9e304f4d7beae79eda306e64a73181993e9211f6524bbdb4fc31db"
+      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.7.0/galaxdb-server-macos-arm64"
+      sha256 "1781d994ededa7bbc81a396159ee067551537af2d9f56a9de678bd5729c73904"
     end
   end
 
   on_linux do
     on_intel do
-      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.6.0/galaxdb-server-linux-x86_64"
-      sha256 "bd732f1f0f532eefbc588a79340250dcbbe9762617a72abc42a94b9bbfdf675e"
+      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.7.0/galaxdb-server-linux-x86_64"
+      sha256 "f357a6f16cf933db5526337560d7f0bc1c167804afe80335f1bbdfcf2e1fd4fd"
     end
 
     on_arm do
-      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.6.0/galaxdb-server-linux-aarch64"
-      sha256 "7a09da3e08b166e565820037059301791c376df8b2f859bd4dd4d83249264ba2"
+      url "https://github.com/zentrix-innovative-labs/galaxdb/releases/download/v0.7.0/galaxdb-server-linux-aarch64"
+      sha256 "cbf3cf5921f001af8ad96c5541fd9d3cec5b56c16dcf1487fa91b4f6add1e66f"
     end
   end
 
