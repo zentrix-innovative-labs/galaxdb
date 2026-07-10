@@ -8,6 +8,7 @@
 //! - **Quantization**: SQ8, FP16, RaBitQ for memory-efficient storage (Month 3)
 
 pub mod delta_buffer;
+pub mod diskann;
 pub mod distance;
 pub mod hnsw;
 pub mod hnsw_file;
@@ -16,6 +17,7 @@ pub mod quantizer;
 pub mod semantic_match;
 
 pub use delta_buffer::{DeltaBuffer, DeltaSearchResult, union_and_rerank};
+pub use diskann::{DiskAnnConfig, DiskAnnIndex, Metric as DiskAnnMetric};
 pub use distance::{cosine_distance, cosine_similarity, normalize};
 pub use hnsw::{HnswConfig, HnswGraph};
 pub use hnsw_file::{MmapHnswGraph, write_hnsw_file};

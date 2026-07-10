@@ -33,7 +33,7 @@ Check health:
 
 ```bash
 curl http://localhost:9090/health
-# {"status":"ok","version":"0.4.0","subsystems":{"disk_full":false,"sidecar_healthy":false,"connections_active":0}}
+# {"status":"ok","version":"0.7.0","subsystems":{"disk_full":false,"sidecar_healthy":false,"connections_active":0}}
 ```
 
 ## Semantic search with local embeddings
@@ -68,12 +68,14 @@ LIMIT 20;
 
 ## Features
 
-- Full SQL — joins, aggregates, `GROUP BY`, transactions (snapshot isolation)
-- Local embeddings + `SEMANTIC_MATCH` semantic search (HNSW vector index)
-- Time-travel queries (`AT VERSION`), version tags, `FOR TRAINING` Lance export
+- Full SQL — joins, aggregates, `GROUP BY`, transactions (snapshot isolation + opt-in Serializable Snapshot Isolation)
+- Local embeddings + `SEMANTIC_MATCH` semantic search (HNSW vector index, persisted across restart)
+- Semantic result caching (`CREATE SEMANTIC CACHE FOR TABLE ... SIMILARITY ... TTL ...`)
+- Disk-resident DiskANN index (opt-in) for larger-than-RAM vector sets
+- Time-travel queries (`AT VERSION`), exact historical vector search (`CONSISTENCY 'SEMANTIC_SNAPSHOT'`), version tags, `FOR TRAINING` Lance export
 - Near-duplicate detection (`WHERE NOT DUPLICATE`)
 - SCRAM-SHA-256 auth, TLS, AES-256-GCM encryption at rest
-- WAL crash recovery, PostgreSQL wire protocol, `/health` + `/metrics`
+- WAL crash recovery, PostgreSQL wire protocol, `/health` + `/metrics` (incl. usage-metering counters)
 
 ## Security — read before exposing this on a network
 
@@ -97,7 +99,7 @@ the wire protocol in transit.
 ## Tags
 
 - `latest` — most recent stable release
-- `0.4.0` — pinned version
+- `0.7.0` — pinned version
 
 ## Other install options
 

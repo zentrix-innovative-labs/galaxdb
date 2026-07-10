@@ -113,6 +113,14 @@ LIMIT 50;
 -- Time-travel query — reproduce exactly what data existed at a point in time
 SELECT * FROM docs AT VERSION 'training-v1';
 
+-- Exact historical vector search — run semantic search as of a past version
+SELECT id, title FROM articles AT VERSION 'train-v1' CONSISTENCY 'SEMANTIC_SNAPSHOT'
+WHERE SEMANTIC_MATCH(title, 'climate policy', 0.7);
+
+-- Semantic result cache — serve near-identical queries from cache (drops latency + cost)
+CREATE SEMANTIC CACHE FOR TABLE articles SIMILARITY 0.98 TTL 300;
+-- (a cache hit increments galaxdb_semantic_cache_hits_total and skips the HNSW search)
+
 -- Near-duplicate deduplication — cut training set size by 15–30%
 SELECT * FROM docs WHERE NOT DUPLICATE;
 
@@ -316,7 +324,7 @@ Windows x86-64 from the [Releases page](https://github.com/zentrix-innovative-la
 
 ```toml
 [dependencies]
-galaxdb-embedded = "0.6.0"
+galaxdb-embedded = "0.7.0"
 ```
 
 ---
@@ -328,7 +336,7 @@ Every server instance exposes:
 ```bash
 # Health check — reflects real subsystem state
 curl http://localhost:9090/health
-# {"status":"ok","version":"0.6.0","subsystems":{"disk_full":false,"sidecar_healthy":true,"connections_active":3}}
+# {"status":"ok","version":"0.7.0","subsystems":{"disk_full":false,"sidecar_healthy":true,"connections_active":3}}
 
 # Prometheus metrics (incl. v0.6 usage-metering counters — see docs/METRICS.md)
 curl http://localhost:9090/metrics

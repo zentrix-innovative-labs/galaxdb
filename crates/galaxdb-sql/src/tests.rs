@@ -112,6 +112,15 @@ fn parse_at_version_with_semantic_fresh() {
 }
 
 #[test]
+fn parse_at_version_with_semantic_snapshot() {
+    // v0.7 (inventory 5.12/8.13): SEMANTIC_SNAPSHOT is now a real mode.
+    let av =
+        parse_at_version("AT VERSION 'snap' CONSISTENCY 'SEMANTIC_SNAPSHOT'").unwrap();
+    assert_eq!(av.version, VersionRef::Tag("snap".to_string()));
+    assert_eq!(av.consistency, Some(ConsistencyMode::SemanticSnapshot));
+}
+
+#[test]
 fn parse_at_version_rejects_trailing_where() {
     // Regression: `AT VERSION 'x' WHERE ...` must not silently drop the
     // WHERE (which returned an unfiltered result). It is a typed parse error.

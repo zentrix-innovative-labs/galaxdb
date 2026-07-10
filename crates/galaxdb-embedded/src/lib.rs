@@ -135,6 +135,482 @@ struct TableVectorIndex {
     /// SQL-level DELETEs would leave orphaned vectors in the HNSW
     /// graph (task 18.6 hole surfaced during the Phase I audit).
     key_to_row_id: HashMap<Vec<u8>, u64>,
+    /// Per-table semantic result cache (v0.7, inventory 8.11). Disabled
+    /// until `CREATE SEMANTIC CACHE` configures it. Interior-mutable so it
+    /// can be used through the shared read lock on the indexes map.
+    semantic_cache: SemanticCache,
+}
+
+// ---------------------------------------------------------------------------
+// Semantic result cache (v0.7, inventory 8.11 / Cloud E-4.1).
+//
+// A per-table cache of recent `SEMANTIC_MATCH` results keyed by the query
+// embedding. A later query whose embedding is within the configured cosine
+// SIMILARITY of a cached, unexpired, param-matching entry returns the cached
+// results without running HNSW — and increments
+// `galaxdb_semantic_cache_hits_total`. Interior-mutable (RwLock) so lookups/
+// stores work through the shared read lock on the `indexes` map, mirroring
+// the `DeltaBuffer` pattern. In-memory only: an empty cache after restart is
+// correct (misses until repopulated). Only the pure `SEMANTIC_MATCH` path is
+// cached; filtered/brute-force searches bypass the cache (the filter is not
+// part of the key), so a filtered result is never served to an unfiltered
+// query.
+// ---------------------------------------------------------------------------
+
+/// One cached semantic-search result set.
+struct SemCacheEntry {
+    query_embedding: Vec<f32>,
+    model_version: String,
+    threshold_bits: u64,
+    k: usize,
+    results: Vec<VectorSearchResult>,
+    created_at: std::time::Instant,
+    last_used: std::time::Instant,
+}
+
+struct SemCacheInner {
+    enabled: bool,
+    similarity: f32,
+    ttl: std::time::Duration,
+    max_entries: usize,
+    entries: Vec<SemCacheEntry>,
+}
+
+/// Interior-mutable per-table semantic cache.
+struct SemanticCache {
+    inner: std::sync::RwLock<SemCacheInner>,
+}
+
+impl SemanticCache {
+    /// Default per-table entry bound (LRU-evicted beyond this).
+    const DEFAULT_MAX_ENTRIES: usize = 256;
+
+    fn new() -> Self {
+        Self {
+            inner: std::sync::RwLock::new(SemCacheInner {
+                enabled: false,
+                similarity: 1.0,
+                ttl: std::time::Duration::from_secs(0),
+                max_entries: Self::DEFAULT_MAX_ENTRIES,
+                entries: Vec::new(),
+            }),
+        }
+    }
+
+    /// Enable / reconfigure the cache; changing config clears stale entries.
+    fn configure(&self, similarity: f32, ttl_secs: u32) {
+        let mut inner = self.inner.write().expect("semantic cache lock");
+        inner.enabled = true;
+        inner.similarity = similarity;
+        inner.ttl = std::time::Duration::from_secs(ttl_secs as u64);
+        inner.entries.clear();
+    }
+
+    /// Disable and discard the cache (`DROP SEMANTIC CACHE`).
+    fn disable(&self) {
+        let mut inner = self.inner.write().expect("semantic cache lock");
+        inner.enabled = false;
+        inner.entries.clear();
+    }
+
+    /// Invalidate all entries (called on any write to the table).
+    fn invalidate(&self) {
+        let mut inner = self.inner.write().expect("semantic cache lock");
+        inner.entries.clear();
+    }
+
+    #[allow(dead_code)] // used by tests + future introspection
+    fn is_enabled(&self) -> bool {
+        self.inner.read().expect("semantic cache lock").enabled
+    }
+
+    /// Look up a hit for `query_embedding` under the given params + model.
+    /// Returns the cached results on a hit (and refreshes LRU); `None` on a
+    /// miss. Expired entries encountered are dropped.
+    fn lookup(
+        &self,
+        query_embedding: &[f32],
+        model_version: &str,
+        threshold_bits: u64,
+        k: usize,
+    ) -> Option<Vec<VectorSearchResult>> {
+        let mut inner = self.inner.write().expect("semantic cache lock");
+        if !inner.enabled {
+            return None;
+        }
+        let ttl = inner.ttl;
+        let sim_threshold = inner.similarity;
+        let now = std::time::Instant::now();
+        // Drop expired entries first (lazy eviction).
+        inner.entries.retain(|e| now.duration_since(e.created_at) < ttl);
+        // Find the first param+model-matching entry within similarity.
+        let mut hit_idx: Option<usize> = None;
+        for (i, e) in inner.entries.iter().enumerate() {
+            if e.threshold_bits != threshold_bits
+                || e.k != k
+                || e.model_version != model_version
+            {
+                continue;
+            }
+            if cosine_similarity(query_embedding, &e.query_embedding) >= sim_threshold {
+                hit_idx = Some(i);
+                break;
+            }
+        }
+        let i = hit_idx?;
+        inner.entries[i].last_used = now;
+        Some(inner.entries[i].results.clone())
+    }
+
+    /// Store a fresh result set (called on a miss).
+    fn store(
+        &self,
+        query_embedding: Vec<f32>,
+        model_version: String,
+        threshold_bits: u64,
+        k: usize,
+        results: Vec<VectorSearchResult>,
+    ) {
+        let mut inner = self.inner.write().expect("semantic cache lock");
+        if !inner.enabled {
+            return;
+        }
+        let now = std::time::Instant::now();
+        // LRU-evict if at capacity.
+        if inner.entries.len() >= inner.max_entries {
+            if let Some((oldest, _)) = inner
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, e)| e.last_used)
+            {
+                inner.entries.remove(oldest);
+            }
+        }
+        inner.entries.push(SemCacheEntry {
+            query_embedding,
+            model_version,
+            threshold_bits,
+            k,
+            results,
+            created_at: now,
+            last_used: now,
+        });
+    }
+}
+
+/// Cosine similarity of two equal-length vectors. Robust to non-normalized
+/// inputs (computes the full cosine), though embeddings are L2-normalized.
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return -1.0;
+    }
+    let mut dot = 0.0f32;
+    let mut na = 0.0f32;
+    let mut nb = 0.0f32;
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    if na == 0.0 || nb == 0.0 {
+        return -1.0;
+    }
+    dot / (na.sqrt() * nb.sqrt())
+}
+
+// ---------------------------------------------------------------------------
+// On-disk vector-index persistence (v0.7, inventory 4.10).
+//
+// The embedded engine keeps each embedding table's vectors in the delta
+// buffer + `vectors` map (the HNSW graph is empty — nothing merges into it),
+// so a restart re-embeds every durable row (O(rows × embed)). We persist the
+// full reconstructable state — dim, source/embedding columns, and every
+// (primary_key, row_id, vector) — to `<data_dir>/vidx_<hash>.gvix` on flush,
+// and on open reconcile it against the durable rows: reuse a persisted vector
+// when its key is still durable, embed only rows the snapshot is missing, and
+// drop snapshot entries whose row was deleted. When the snapshot is fresh this
+// does zero embeds; it is always correct because the durable rows are the
+// source of truth.
+// ---------------------------------------------------------------------------
+
+/// Filesystem-safe, collision-resistant snapshot path for a table.
+fn vindex_path(data_dir: &std::path::Path, table: &str) -> std::path::PathBuf {
+    let h = xxhash_rust::xxh3::xxh3_64(table.as_bytes());
+    data_dir.join(format!("vidx_{h:016x}.gvix"))
+}
+
+/// Serialize a table's vector state to the versioned `GVIX` snapshot bytes.
+fn serialize_vindex(idx: &TableVectorIndex) -> Vec<u8> {
+    let mut out = galaxdb_common::format::VINDEX.header().to_bytes().to_vec();
+    out.extend_from_slice(&(idx.dim as u32).to_le_bytes());
+    let sc = idx.source_column.as_bytes();
+    out.extend_from_slice(&(sc.len() as u32).to_le_bytes());
+    out.extend_from_slice(sc);
+    let ec = idx.embedding_column.as_bytes();
+    out.extend_from_slice(&(ec.len() as u32).to_le_bytes());
+    out.extend_from_slice(ec);
+    // Only persist entries that still have a vector (skip tombstoned rows).
+    let entries: Vec<(&Vec<u8>, u64, &Vec<f32>)> = idx
+        .key_to_row_id
+        .iter()
+        .filter_map(|(k, rid)| idx.vectors.get(rid).map(|v| (k, *rid, v)))
+        .collect();
+    out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+    for (key, row_id, vec) in entries {
+        out.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        out.extend_from_slice(key);
+        out.extend_from_slice(&row_id.to_le_bytes());
+        for f in vec {
+            out.extend_from_slice(&f.to_le_bytes());
+        }
+    }
+    out
+}
+
+/// Parsed snapshot: dim, source column, and key → (row_id, vector).
+/// `dim`/`source_column`/`embedding_column` are retained from the on-disk
+/// format for completeness and future schema-drift validation; the reconcile
+/// path keys off `by_key`.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct VindexSnapshot {
+    dim: usize,
+    source_column: String,
+    embedding_column: String,
+    by_key: HashMap<Vec<u8>, (u64, Vec<f32>)>,
+}
+
+/// Deserialize a `GVIX` snapshot. Returns a typed `FormatTooNew`/`FormatTooOld`
+/// on an out-of-range version (rollback safety), or a parse error on a
+/// truncated/corrupt file.
+fn deserialize_vindex(bytes: &[u8]) -> GalaxResult<VindexSnapshot> {
+    use galaxdb_common::format::{FormatHeader, FORMAT_HEADER_SIZE, VINDEX};
+    if bytes.len() < FORMAT_HEADER_SIZE + 4 {
+        return Err(GalaxError::Internal("vindex snapshot too small".into()));
+    }
+    let mut hdr = [0u8; FORMAT_HEADER_SIZE];
+    hdr.copy_from_slice(&bytes[..FORMAT_HEADER_SIZE]);
+    let header = FormatHeader::from_bytes(&hdr, VINDEX.magic)?;
+    VINDEX.check(header.format_version)?;
+
+    let mut pos = FORMAT_HEADER_SIZE;
+    let read_u32 = |b: &[u8], p: &mut usize| -> GalaxResult<u32> {
+        if *p + 4 > b.len() {
+            return Err(GalaxError::Internal("vindex truncated (u32)".into()));
+        }
+        let v = u32::from_le_bytes([b[*p], b[*p + 1], b[*p + 2], b[*p + 3]]);
+        *p += 4;
+        Ok(v)
+    };
+    let read_u64 = |b: &[u8], p: &mut usize| -> GalaxResult<u64> {
+        if *p + 8 > b.len() {
+            return Err(GalaxError::Internal("vindex truncated (u64)".into()));
+        }
+        let mut a = [0u8; 8];
+        a.copy_from_slice(&b[*p..*p + 8]);
+        *p += 8;
+        Ok(u64::from_le_bytes(a))
+    };
+
+    let dim = read_u32(bytes, &mut pos)? as usize;
+    let sc_len = read_u32(bytes, &mut pos)? as usize;
+    if pos + sc_len > bytes.len() {
+        return Err(GalaxError::Internal("vindex truncated (source col)".into()));
+    }
+    let source_column = String::from_utf8(bytes[pos..pos + sc_len].to_vec())
+        .map_err(|_| GalaxError::Internal("vindex bad source col utf8".into()))?;
+    pos += sc_len;
+    let ec_len = read_u32(bytes, &mut pos)? as usize;
+    if pos + ec_len > bytes.len() {
+        return Err(GalaxError::Internal("vindex truncated (embed col)".into()));
+    }
+    let embedding_column = String::from_utf8(bytes[pos..pos + ec_len].to_vec())
+        .map_err(|_| GalaxError::Internal("vindex bad embed col utf8".into()))?;
+    pos += ec_len;
+
+    let count = read_u64(bytes, &mut pos)? as usize;
+    let mut by_key = HashMap::with_capacity(count);
+    for _ in 0..count {
+        let klen = read_u32(bytes, &mut pos)? as usize;
+        if pos + klen > bytes.len() {
+            return Err(GalaxError::Internal("vindex truncated (key)".into()));
+        }
+        let key = bytes[pos..pos + klen].to_vec();
+        pos += klen;
+        let row_id = read_u64(bytes, &mut pos)?;
+        if pos + dim * 4 > bytes.len() {
+            return Err(GalaxError::Internal("vindex truncated (vector)".into()));
+        }
+        let mut vec = Vec::with_capacity(dim);
+        for _ in 0..dim {
+            let f = f32::from_le_bytes([
+                bytes[pos],
+                bytes[pos + 1],
+                bytes[pos + 2],
+                bytes[pos + 3],
+            ]);
+            pos += 4;
+            vec.push(f);
+        }
+        by_key.insert(key, (row_id, vec));
+    }
+    Ok(VindexSnapshot {
+        dim,
+        source_column,
+        embedding_column,
+        by_key,
+    })
+}
+
+#[cfg(test)]
+mod vindex_tests {
+    use super::*;
+
+    #[test]
+    fn vindex_serialize_roundtrip() {
+        let mut idx = TableVectorIndex {
+            hnsw: HnswGraph::new(HnswConfig::new(3).with_max_elements(16)),
+            delta: DeltaBuffer::new(3),
+            dim: 3,
+            embedding_column: "emb".into(),
+            source_column: "body".into(),
+            vectors: HashMap::new(),
+            key_to_row_id: HashMap::new(),
+            semantic_cache: SemanticCache::new(),
+        };
+        idx.vectors.insert(10, vec![1.0, 2.0, 3.0]);
+        idx.key_to_row_id.insert(b"t:1".to_vec(), 10);
+        idx.vectors.insert(20, vec![4.0, 5.0, 6.0]);
+        idx.key_to_row_id.insert(b"t:2".to_vec(), 20);
+
+        let bytes = serialize_vindex(&idx);
+        let snap = deserialize_vindex(&bytes).expect("parse");
+        assert_eq!(snap.dim, 3);
+        assert_eq!(snap.source_column, "body");
+        assert_eq!(snap.by_key.len(), 2);
+        assert_eq!(snap.by_key.get(b"t:1".as_slice()).unwrap().0, 10);
+        assert_eq!(snap.by_key.get(b"t:2".as_slice()).unwrap().1, vec![4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn vindex_too_new_is_refused() {
+        let idx = TableVectorIndex {
+            hnsw: HnswGraph::new(HnswConfig::new(2).with_max_elements(16)),
+            delta: DeltaBuffer::new(2),
+            dim: 2,
+            embedding_column: "e".into(),
+            source_column: "s".into(),
+            vectors: HashMap::new(),
+            key_to_row_id: HashMap::new(),
+            semantic_cache: SemanticCache::new(),
+        };
+        let mut bytes = serialize_vindex(&idx);
+        // Bump the on-disk format version to current+1 (offset 4..6 LE).
+        bytes[4] = bytes[4].wrapping_add(1);
+        match deserialize_vindex(&bytes) {
+            Err(GalaxError::FormatTooNew { .. }) => {}
+            other => panic!("expected FormatTooNew, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod semantic_cache_tests {
+    use super::*;
+
+    fn res(row_id: u64, sim: f32) -> VectorSearchResult {
+        VectorSearchResult {
+            row_id,
+            similarity: sim,
+        }
+    }
+
+    #[test]
+    fn disabled_cache_never_hits() {
+        let c = SemanticCache::new();
+        assert!(!c.is_enabled());
+        // store is a no-op while disabled; lookup misses.
+        c.store(vec![1.0, 0.0], "m".into(), 0u64, 10, vec![res(1, 0.9)]);
+        assert!(c.lookup(&[1.0, 0.0], "m", 0u64, 10).is_none());
+    }
+
+    #[test]
+    fn hit_within_similarity_miss_outside() {
+        let c = SemanticCache::new();
+        c.configure(0.95, 3600);
+        let q = vec![1.0f32, 0.0, 0.0];
+        c.store(q.clone(), "m".into(), 7u64, 10, vec![res(42, 0.99)]);
+
+        // Identical query → cosine 1.0 ≥ 0.95 → hit.
+        let hit = c.lookup(&q, "m", 7u64, 10).expect("hit");
+        assert_eq!(hit.len(), 1);
+        assert_eq!(hit[0].row_id, 42);
+
+        // Orthogonal query → cosine 0 < 0.95 → miss.
+        assert!(c.lookup(&[0.0, 1.0, 0.0], "m", 7u64, 10).is_none());
+    }
+
+    #[test]
+    fn params_and_model_must_match() {
+        let c = SemanticCache::new();
+        c.configure(0.9, 3600);
+        let q = vec![1.0f32, 0.0];
+        c.store(q.clone(), "m1".into(), 7u64, 10, vec![res(1, 0.99)]);
+        // Same vector, different k → miss (no stale-shape bleed).
+        assert!(c.lookup(&q, "m1", 7u64, 50).is_none());
+        // Different threshold bits → miss.
+        assert!(c.lookup(&q, "m1", 8u64, 10).is_none());
+        // Different model version → miss (embeddings not comparable).
+        assert!(c.lookup(&q, "m2", 7u64, 10).is_none());
+        // All matching → hit.
+        assert!(c.lookup(&q, "m1", 7u64, 10).is_some());
+    }
+
+    #[test]
+    fn ttl_expiry_yields_miss() {
+        let c = SemanticCache::new();
+        c.configure(0.9, 0); // ttl 0 → everything already expired
+        // configure() clamps ttl to Duration(0); force a tiny ttl instead.
+        {
+            let mut inner = c.inner.write().unwrap();
+            inner.ttl = std::time::Duration::from_millis(20);
+        }
+        let q = vec![1.0f32, 0.0];
+        c.store(q.clone(), "m".into(), 0u64, 10, vec![res(1, 0.99)]);
+        assert!(c.lookup(&q, "m", 0u64, 10).is_some());
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        assert!(c.lookup(&q, "m", 0u64, 10).is_none(), "entry must expire");
+    }
+
+    #[test]
+    fn invalidate_clears_entries() {
+        let c = SemanticCache::new();
+        c.configure(0.9, 3600);
+        let q = vec![1.0f32, 0.0];
+        c.store(q.clone(), "m".into(), 0u64, 10, vec![res(1, 0.99)]);
+        assert!(c.lookup(&q, "m", 0u64, 10).is_some());
+        c.invalidate();
+        assert!(c.lookup(&q, "m", 0u64, 10).is_none(), "write invalidates");
+    }
+
+    #[test]
+    fn lru_bound_respected() {
+        let c = SemanticCache::new();
+        c.configure(0.999, 3600);
+        {
+            let mut inner = c.inner.write().unwrap();
+            inner.max_entries = 4;
+        }
+        // Insert 6 distinct (orthogonal-ish) queries; only 4 retained.
+        for i in 0..6u64 {
+            let mut v = vec![0.0f32; 6];
+            v[i as usize] = 1.0;
+            c.store(v, "m".into(), 0u64, 10, vec![res(i, 0.99)]);
+        }
+        let inner = c.inner.read().unwrap();
+        assert!(inner.entries.len() <= 4, "LRU bound: {}", inner.entries.len());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -435,8 +911,34 @@ impl Database {
             let prefix = format!("{}:", entry.name).into_bytes();
 
             let rows = self.engine.scan_all_with_prefix(Some(&prefix));
+
+            // v0.7 (inventory 4.10): load the persisted vector-index snapshot
+            // if present, so we reuse its vectors and embed ONLY rows the
+            // snapshot is missing (reconcile against the durable rows). A
+            // too-new snapshot is refused (rollback safety); a corrupt one
+            // falls back to a full re-embed. When the snapshot is fresh this
+            // does zero embeds.
+            let snapshot: Option<VindexSnapshot> =
+                match std::fs::read(vindex_path(self.engine.data_dir(), &entry.name)) {
+                    Ok(bytes) => match deserialize_vindex(&bytes) {
+                        Ok(s) => Some(s),
+                        Err(e @ GalaxError::FormatTooNew { .. }) => return Err(e),
+                        Err(e) => {
+                            tracing::warn!(
+                                table = %entry.name,
+                                error = %e,
+                                "vector-index snapshot unreadable; rebuilding by re-embedding"
+                            );
+                            None
+                        }
+                    },
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => return Err(GalaxError::Io(e)),
+                };
+
             let mut idx: Option<TableVectorIndex> = None;
-            let mut rebuilt: u64 = 0;
+            let mut reused: u64 = 0;
+            let mut embedded: u64 = 0;
 
             for (key, value) in rows {
                 if !key.starts_with(&prefix) {
@@ -455,15 +957,27 @@ impl Database {
                 // Same row-id convention as `on_row_inserted`: xxh3_64 of the
                 // full storage key, so search results join back to table rows.
                 let row_id = xxhash_rust::xxh3::xxh3_64(&key);
-                let resp = sidecar
-                    .embed(EmbedRequest::document(row_id, text, source_column.clone()))
-                    .map_err(|e| {
-                        GalaxError::Internal(format!(
-                            "rebuilding vector index for '{}': embedding failed: {e}",
-                            entry.name
-                        ))
-                    })?;
-                let dim = resp.embedding.len();
+                // Reuse the persisted vector when the snapshot still covers this
+                // durable key; otherwise embed the row (only the missing ones).
+                let embedding: Vec<f32> = match snapshot.as_ref().and_then(|s| s.by_key.get(&key)) {
+                    Some((_rid, v)) => {
+                        reused += 1;
+                        v.clone()
+                    }
+                    None => {
+                        let resp = sidecar
+                            .embed(EmbedRequest::document(row_id, text, source_column.clone()))
+                            .map_err(|e| {
+                                GalaxError::Internal(format!(
+                                    "rebuilding vector index for '{}': embedding failed: {e}",
+                                    entry.name
+                                ))
+                            })?;
+                        embedded += 1;
+                        resp.embedding
+                    }
+                };
+                let dim = embedding.len();
                 let index = idx.get_or_insert_with(|| {
                     let config = HnswConfig::new(dim).with_max_elements(1_000_000);
                     TableVectorIndex {
@@ -474,13 +988,14 @@ impl Database {
                         source_column: source_column.clone(),
                         vectors: HashMap::new(),
                         key_to_row_id: HashMap::new(),
+                        semantic_cache: SemanticCache::new(),
                     }
                 });
-                index.delta.insert(row_id, resp.embedding.clone());
-                index.vectors.insert(row_id, resp.embedding);
+                index.delta.insert(row_id, embedding.clone());
+                index.vectors.insert(row_id, embedding);
                 index.key_to_row_id.insert(key.clone(), row_id);
-                rebuilt += 1;
             }
+            let rebuilt = reused + embedded;
 
             // A table with an embedding column but no rows still needs a
             // registered (empty) index so SEMANTIC_MATCH returns zero rows
@@ -504,22 +1019,71 @@ impl Database {
                     source_column: source_column.clone(),
                     vectors: HashMap::new(),
                     key_to_row_id: HashMap::new(),
+                    semantic_cache: SemanticCache::new(),
                 });
             }
 
             if let Some(index) = idx {
+                // Persist a fresh snapshot so the next restart reuses these
+                // vectors instead of re-embedding. Best-effort: a write failure
+                // just means the next open re-embeds (correct, slower).
+                let path = vindex_path(self.engine.data_dir(), &entry.name);
+                if let Err(e) =
+                    galaxdb_common::format::atomic_replace(&path, &serialize_vindex(&index))
+                {
+                    tracing::warn!(
+                        table = %entry.name,
+                        error = %e,
+                        "failed to persist vector-index snapshot on open"
+                    );
+                }
                 self.vector_indexes
                     .write()
                     .unwrap()
                     .insert(entry.name.clone(), index);
                 tracing::info!(
                     table = %entry.name,
-                    rows = rebuilt,
-                    "rebuilt vector index on open (re-embedded durable rows)"
+                    reused,
+                    embedded,
+                    total = rebuilt,
+                    "vector index ready on open (reused persisted vectors; embedded only missing rows)"
                 );
             }
         }
+
+        // v0.7: re-apply persisted semantic-cache configs so a cache stays
+        // enabled across restart (the cached entries start empty, which is
+        // correct — misses until repopulated).
+        let cache_store =
+            galaxdb_sql::semantic_cache_store::SemanticCacheStore::new(self.engine.clone());
+        let mut indexes = self.vector_indexes.write().unwrap();
+        for (table, cfg) in cache_store.load_all() {
+            if let Some(idx) = indexes.get_mut(&table) {
+                idx.semantic_cache.configure(cfg.similarity, cfg.ttl_secs);
+            }
+        }
         Ok(())
+    }
+
+    /// Persist every table's vector-index snapshot to the data volume so a
+    /// restart reuses the vectors instead of re-embedding (v0.7, inventory
+    /// 4.10). Called on flush/checkpoint and on drop. Best-effort per table:
+    /// a write failure is logged, never fatal (the next open just re-embeds).
+    pub fn persist_vector_indexes(&self) {
+        let data_dir = self.engine.data_dir().to_path_buf();
+        let indexes = self.vector_indexes.read().unwrap();
+        for (table, idx) in indexes.iter() {
+            let path = vindex_path(&data_dir, table);
+            if let Err(e) =
+                galaxdb_common::format::atomic_replace(&path, &serialize_vindex(idx))
+            {
+                tracing::warn!(
+                    table = %table,
+                    error = %e,
+                    "failed to persist vector-index snapshot"
+                );
+            }
+        }
     }
 
     /// Attach an authenticated session to this database handle so every
@@ -859,6 +1423,9 @@ impl Database {
             .build()
             .map_err(|e| GalaxError::Internal(format!("flush runtime: {e}")))?
             .block_on(self.engine.flush_memtable())?;
+        // v0.7 (inventory 4.10): persist vector-index snapshots on checkpoint
+        // so a restart reuses the vectors instead of re-embedding.
+        self.persist_vector_indexes();
         Ok(())
     }
 
@@ -890,6 +1457,19 @@ impl Database {
         ))
     }
 
+    /// Begin a SERIALIZABLE (SSI) transaction (v0.7, inventory 8.14). Same as
+    /// [`begin_transaction`](Self::begin_transaction) but the handle tracks its
+    /// read-set and is certified for serializability at commit — a write-skew
+    /// (rw-antidependency into a concurrent committer) aborts with SQLSTATE
+    /// 40001. The default isolation remains snapshot isolation.
+    pub fn begin_transaction_serializable(
+        &self,
+    ) -> GalaxResult<galaxdb_sql::executor::TxnHandle> {
+        let mut txn = self.begin_transaction()?;
+        txn.set_serializable(true);
+        Ok(txn)
+    }
+
     /// Commit a transaction: atomically* apply every buffered write to the
     /// engine (durable through the WAL), then release the transaction's
     /// write locks and snapshot.
@@ -915,6 +1495,34 @@ impl Database {
         txn: &galaxdb_sql::executor::TxnHandle,
     ) -> GalaxResult<()> {
         let writes = txn.writes.lock().expect("txn writes lock").clone();
+
+        // v0.7 SSI (inventory 8.14): build the write-key set for the
+        // serializability certifier — each written storage key plus a
+        // table-granularity SIREAD sentinel, so a concurrent serializable scan
+        // of the same table conflicts (catches write-skew + phantoms).
+        let mut write_keys: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::new();
+        for key in writes.keys() {
+            write_keys.insert(key.clone());
+            if let Some(pos) = key.iter().position(|&b| b == b':') {
+                let table = String::from_utf8_lossy(&key[..pos]).to_string();
+                write_keys.insert(galaxdb_sql::executor::siread_sentinel(&table));
+            }
+        }
+        let read_keys = txn.read_key_set();
+
+        // Certify + allocate the commit timestamp BEFORE applying any write, so
+        // a transaction that fails serializability certification (40001) never
+        // persists. For an SI transaction (`serializable == false`) this is a
+        // plain commit. Releases write locks + drops the snapshot on success.
+        self.txn_manager.commit_serializable(
+            txn.txn_id,
+            &read_keys,
+            write_keys.into_iter().collect(),
+            txn.serializable,
+        )?;
+
+        // Certification passed — apply the buffered writes.
         for (key, value) in writes {
             match value {
                 Some(v) => {
@@ -925,14 +1533,6 @@ impl Database {
                 }
             }
         }
-        // Release write locks + drop the active snapshot. We reconstruct the
-        // manager Snapshot from the handle's owner id (the only field commit
-        // consults) since the handle stores the id, not the Snapshot itself.
-        let snapshot = galaxdb_sql::transaction::Snapshot {
-            read_timestamp: txn.txn_id,
-            write_set: Vec::new(),
-        };
-        self.txn_manager.commit(&snapshot)?;
         Ok(())
     }
 
@@ -2141,6 +2741,14 @@ impl Database {
                     mode: *mode,
                 })
             }
+            AuroraStatement::CreateSemanticCache(stmt) => {
+                self.dispatch(QueryPlan::CreateSemanticCache(stmt.clone()))
+            }
+            AuroraStatement::DropSemanticCache { table } => {
+                self.dispatch(QueryPlan::DropSemanticCache {
+                    table: table.clone(),
+                })
+            }
         }
     }
 
@@ -2248,6 +2856,7 @@ impl Database {
                         source_column: col.name.clone(),
                         vectors: HashMap::new(),
                         key_to_row_id: HashMap::new(),
+                        semantic_cache: SemanticCache::new(),
                     };
                     self.vector_indexes
                         .write()
@@ -2449,6 +3058,31 @@ impl Database {
         check_select_supported(q)?;
         let table = extract_table(q);
         let (columns, filter) = extract_projection_and_filter(q);
+
+        // v0.7 (inventory 5.12/8.13): SEMANTIC_MATCH + AT VERSION →
+        // historical semantic search (SEMANTIC_FRESH / SEMANTIC_SNAPSHOT),
+        // routed to HybridSearchAtVersion. Without a SEMANTIC_MATCH it stays a
+        // plain time-travel row scan (FullScanAtVersion).
+        if let Some(sem) = extract_semantic_match_from_query(q) {
+            let strategy = if filter.is_some() {
+                galaxdb_sql::planner::SearchStrategy::BruteForceFiltered
+            } else {
+                galaxdb_sql::planner::SearchStrategy::HnswWithPostFilter
+            };
+            let plan = QueryPlan::HybridSearchAtVersion {
+                table,
+                filter,
+                semantic: sem,
+                strategy,
+                at,
+                limit: None,
+            };
+            let mut ctx = self.context();
+            let res = execute_with_context(&plan, &mut ctx)?;
+            self.catalog = std::mem::take(&mut ctx.catalog);
+            return Ok(query_result_from(res));
+        }
+
         let plan = QueryPlan::FullScanAtVersion {
             table,
             filter,
@@ -2507,11 +3141,28 @@ impl Database {
         if table != "unknown" && !self.catalog.table_exists(&table) {
             return Err(GalaxError::TableNotFound(table));
         }
-        let plan = QueryPlan::FullScanAtVersion {
-            table,
-            filter,
-            columns,
-            at,
+        // v0.7: SEMANTIC_MATCH + AT VERSION → historical semantic search.
+        let plan = if let Some(sem) = extract_semantic_match_from_query(q) {
+            let strategy = if filter.is_some() {
+                galaxdb_sql::planner::SearchStrategy::BruteForceFiltered
+            } else {
+                galaxdb_sql::planner::SearchStrategy::HnswWithPostFilter
+            };
+            QueryPlan::HybridSearchAtVersion {
+                table,
+                filter,
+                semantic: sem,
+                strategy,
+                at,
+                limit: None,
+            }
+        } else {
+            QueryPlan::FullScanAtVersion {
+                table,
+                filter,
+                columns,
+                at,
+            }
         };
 
         let mut ctx = ExecutorContext::new(self.engine.clone());
@@ -2636,6 +3287,10 @@ impl Database {
         ctx.secondary_index = Some(galaxdb_sql::secondary_index::SecondaryIndexStore::new(
             self.engine.clone(),
         ));
+        // Semantic-cache config store (v0.7): engine-backed, durable.
+        ctx.semantic_cache_store = Some(
+            galaxdb_sql::semantic_cache_store::SemanticCacheStore::new(self.engine.clone()),
+        );
         // The authenticated session (if any) drives the executor's
         // authorization chokepoint. `None` = trusted embedded mode.
         ctx.session = self.session.clone();
@@ -3078,6 +3733,9 @@ impl Database {
 
 impl Drop for Database {
     fn drop(&mut self) {
+        // v0.7 (inventory 4.10): persist vector-index snapshots on graceful
+        // shutdown so the next open reuses the vectors instead of re-embedding.
+        self.persist_vector_indexes();
         // Stop the background compaction worker promptly (it holds only a
         // Weak<Engine>, but this wakes it instead of waiting for its poll
         // timeout), then run the engine's own shutdown.
@@ -3262,6 +3920,80 @@ impl VectorSearchBackend for EmbeddedVectorBackend {
             .embed(request)
             .map_err(|_| GalaxError::SidecarUnavailable)?;
 
+        // v0.7 semantic cache (inventory 8.11 / E-4.1): a query whose
+        // embedding is within the configured SIMILARITY of a cached,
+        // unexpired, param-matching entry returns the cached results without
+        // running HNSW — and counts as a cache hit. Only this pure
+        // `SEMANTIC_MATCH` path is cached; `brute_force_filtered` bypasses it.
+        let threshold_bits = threshold.to_bits();
+        if let Some(cached) = idx.semantic_cache.lookup(
+            &response.embedding,
+            &response.model_version,
+            threshold_bits,
+            k,
+        ) {
+            galaxdb_observe::metrics().semantic_cache_hits_total.inc();
+            return Ok(cached);
+        }
+
+        let sm_config = SemanticMatchConfig {
+            hnsw_candidates: 100,
+            ef_search: 200,
+            brute_force_threshold: 1000,
+            brute_force_ratio: 0.001,
+        };
+        let vectors_ref = &idx.vectors;
+        let results = execute_semantic_match(
+            &response.embedding,
+            &idx.hnsw,
+            &idx.delta,
+            threshold,
+            k,
+            &sm_config,
+            |row_id| vectors_ref.get(&row_id).cloned(),
+        );
+        let out: Vec<VectorSearchResult> = results
+            .into_iter()
+            .map(|r| VectorSearchResult {
+                row_id: r.row_id,
+                similarity: r.similarity,
+            })
+            .collect();
+        // Populate the cache on a miss (no-op when the cache is disabled).
+        idx.semantic_cache.store(
+            response.embedding,
+            response.model_version,
+            threshold_bits,
+            k,
+            out.clone(),
+        );
+        Ok(out)
+    }
+
+    fn brute_force_filtered(
+        &self,
+        table: &str,
+        query_text: &str,
+        threshold: f64,
+        k: usize,
+        _filter: &FilterExpr,
+    ) -> GalaxResult<Vec<VectorSearchResult>> {
+        // The brute-force path shares the HNSW-backed implementation but
+        // MUST bypass the semantic cache: the cache key does not include the
+        // filter, so serving a cached (unfiltered) result here would be
+        // wrong. Run the search directly without cache lookup/store.
+        let sidecar = self
+            .sidecar
+            .as_ref()
+            .ok_or(GalaxError::SidecarUnavailable)?;
+        let indexes = self.indexes.read().unwrap();
+        let idx = indexes
+            .get(table)
+            .ok_or_else(|| GalaxError::TableNotFound(table.to_string()))?;
+        let request = EmbedRequest::query(0, query_text.to_string(), idx.embedding_column.clone());
+        let response = sidecar
+            .embed(request)
+            .map_err(|_| GalaxError::SidecarUnavailable)?;
         let sm_config = SemanticMatchConfig {
             hnsw_candidates: 100,
             ef_search: 200,
@@ -3287,27 +4019,18 @@ impl VectorSearchBackend for EmbeddedVectorBackend {
             .collect())
     }
 
-    fn brute_force_filtered(
-        &self,
-        table: &str,
-        query_text: &str,
-        threshold: f64,
-        k: usize,
-        _filter: &FilterExpr,
-    ) -> GalaxResult<Vec<VectorSearchResult>> {
-        // Today the brute-force path shares the HNSW-backed
-        // implementation; the planner's adaptive decision between
-        // `BruteForceFiltered` and `HnswWithPostFilter` still picks
-        // which plan variant reaches us, but both resolve here for
-        // v1. A dedicated scan-then-distance path is task 31.5
-        // follow-up work.
-        self.semantic_search(
-            table,
-            query_text,
-            threshold,
-            k,
-            SearchStrategy::HnswWithPostFilter,
-        )
+    fn configure_semantic_cache(&self, table: &str, similarity: f32, ttl_secs: u32) {
+        let indexes = self.indexes.read().unwrap();
+        if let Some(idx) = indexes.get(table) {
+            idx.semantic_cache.configure(similarity, ttl_secs);
+        }
+    }
+
+    fn drop_semantic_cache(&self, table: &str) {
+        let indexes = self.indexes.read().unwrap();
+        if let Some(idx) = indexes.get(table) {
+            idx.semantic_cache.disable();
+        }
     }
 
     fn on_row_deleted(&self, table: &str, row_key: &[u8]) -> GalaxResult<()> {
@@ -3344,6 +4067,9 @@ impl VectorSearchBackend for EmbeddedVectorBackend {
             idx.delta.delete(row_id);
             idx.vectors.remove(&row_id);
             idx.key_to_row_id.remove(row_key);
+            // v0.7: a write invalidates the semantic cache so no cached
+            // result predating this delete is served.
+            idx.semantic_cache.invalidate();
         }
 
         Ok(())
@@ -3423,6 +4149,9 @@ impl VectorSearchBackend for EmbeddedVectorBackend {
             idx.delta.insert(row_id, response.embedding.clone());
             idx.vectors.insert(row_id, response.embedding);
             idx.key_to_row_id.insert(row_key.to_vec(), row_id);
+            // v0.7: a write invalidates the semantic cache so no cached
+            // result predating this insert is served.
+            idx.semantic_cache.invalidate();
         }
 
         Ok(())

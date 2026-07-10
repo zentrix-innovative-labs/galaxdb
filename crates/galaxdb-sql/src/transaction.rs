@@ -19,6 +19,12 @@ pub struct TransactionManager {
     /// Write locks: key → (writer_txn_id, write_timestamp).
     /// Used for write-write conflict detection.
     write_locks: RwLock<HashMap<Vec<u8>, u64>>,
+    /// Recently-committed transactions' `(commit_ts, write_keys)` used by the
+    /// v0.7 SSI certifier (inventory 8.14). Pruned to entries that could still
+    /// conflict with an active transaction (commit_ts > oldest active begin),
+    /// so it stays bounded and never yields a false negative. Only committed
+    /// write-sets are recorded (reads don't go here).
+    committed_writes: RwLock<Vec<(u64, Vec<Vec<u8>>)>>,
 }
 
 impl TransactionManager {
@@ -28,6 +34,7 @@ impl TransactionManager {
             next_timestamp: AtomicU64::new(1),
             active_snapshots: RwLock::new(BTreeSet::new()),
             write_locks: RwLock::new(HashMap::new()),
+            committed_writes: RwLock::new(Vec::new()),
         }
     }
 
@@ -37,7 +44,59 @@ impl TransactionManager {
             next_timestamp: AtomicU64::new(start),
             active_snapshots: RwLock::new(BTreeSet::new()),
             write_locks: RwLock::new(HashMap::new()),
+            committed_writes: RwLock::new(Vec::new()),
         }
+    }
+
+    /// Serializable Snapshot Isolation certification + commit (v0.7,
+    /// inventory 8.14). Conservative certifier: if `serializable`, abort with
+    /// [`GalaxError::WriteConflict`] (SQLSTATE 40001) when any key this
+    /// transaction **read** was **written** by a transaction that committed
+    /// after this transaction's snapshot (`begin_ts`) — the rw-antidependency
+    /// that permits write-skew. Safe (false-positive aborts allowed, never a
+    /// false negative). When `!serializable` this is a plain commit (SI).
+    ///
+    /// Atomic under the committed-ring lock so a concurrent certify/commit
+    /// cannot slip a conflicting write past the check. Records this
+    /// transaction's `write_keys` for future certifications, releases its
+    /// write locks, drops its snapshot, and returns the commit timestamp.
+    pub fn commit_serializable(
+        &self,
+        begin_ts: u64,
+        read_keys: &std::collections::HashSet<Vec<u8>>,
+        write_keys: Vec<Vec<u8>>,
+        serializable: bool,
+    ) -> GalaxResult<Timestamp> {
+        let mut committed = self.committed_writes.write().unwrap();
+        if serializable {
+            for (cts, wkeys) in committed.iter() {
+                if *cts > begin_ts && wkeys.iter().any(|k| read_keys.contains(k)) {
+                    // rw-antidependency into a concurrent committer → abort.
+                    return Err(GalaxError::WriteConflict);
+                }
+            }
+        }
+        let commit_ts = self.next_timestamp.fetch_add(1, Ordering::SeqCst);
+        if !write_keys.is_empty() {
+            committed.push((commit_ts, write_keys));
+        }
+        // Prune entries that can no longer conflict with any active txn: an
+        // entry with commit_ts <= the oldest active begin can never satisfy
+        // `commit_ts > begin_ts` for any active or future transaction. With no
+        // active snapshots, everything is safe to drop.
+        let oldest_active = {
+            let snaps = self.active_snapshots.read().unwrap();
+            snaps.iter().next().copied()
+        };
+        match oldest_active {
+            Some(o) => committed.retain(|(cts, _)| *cts > o),
+            None => committed.clear(),
+        }
+        drop(committed);
+
+        self.release_write_locks(begin_ts);
+        self.active_snapshots.write().unwrap().remove(&begin_ts);
+        Ok(commit_ts)
     }
 
     /// Begin a new transaction, returning a Snapshot.
@@ -331,5 +390,67 @@ mod tests {
         // Both can commit — this is write-skew (SI limitation, SSI in v2)
         tm.commit(&s1).unwrap();
         tm.commit(&s2).unwrap();
+    }
+
+    // ── v0.7 SSI certifier (inventory 8.14) ──────────────────────────────
+
+    fn keyset(keys: &[&[u8]]) -> std::collections::HashSet<Vec<u8>> {
+        keys.iter().map(|k| k.to_vec()).collect()
+    }
+
+    #[test]
+    fn ssi_prevents_write_skew() {
+        // Classic write-skew: T1 reads X writes Y; T2 reads Y writes X.
+        // Under SSI one must abort.
+        let tm = TransactionManager::new();
+        let t1 = tm.begin();
+        let t2 = tm.begin();
+        // T1 commits first (wrote Y).
+        tm.commit_serializable(t1.read_timestamp, &keyset(&[b"X"]), vec![b"Y".to_vec()], true)
+            .unwrap();
+        // T2 read Y, which T1 committed after T2's snapshot → abort (40001).
+        let res =
+            tm.commit_serializable(t2.read_timestamp, &keyset(&[b"Y"]), vec![b"X".to_vec()], true);
+        assert!(matches!(res, Err(GalaxError::WriteConflict)), "expected write-skew abort");
+    }
+
+    #[test]
+    fn si_allows_write_skew_when_not_serializable() {
+        // Same shape but serializable=false → SI, both commit (documented).
+        let tm = TransactionManager::new();
+        let t1 = tm.begin();
+        let t2 = tm.begin();
+        tm.commit_serializable(t1.read_timestamp, &keyset(&[b"X"]), vec![b"Y".to_vec()], false)
+            .unwrap();
+        assert!(tm
+            .commit_serializable(t2.read_timestamp, &keyset(&[b"Y"]), vec![b"X".to_vec()], false)
+            .is_ok());
+    }
+
+    #[test]
+    fn ssi_no_false_positive_without_conflict() {
+        // Disjoint read/write sets → no rw-antidependency → both commit.
+        let tm = TransactionManager::new();
+        let t1 = tm.begin();
+        let t2 = tm.begin();
+        tm.commit_serializable(t1.read_timestamp, &keyset(&[b"A"]), vec![b"C".to_vec()], true)
+            .unwrap();
+        assert!(tm
+            .commit_serializable(t2.read_timestamp, &keyset(&[b"B"]), vec![b"D".to_vec()], true)
+            .is_ok());
+    }
+
+    #[test]
+    fn ssi_non_concurrent_read_after_commit_is_fine() {
+        // T1 commits BEFORE T2 begins → not concurrent → T2 reading T1's write
+        // key is serializable (T2's snapshot already includes T1). No abort.
+        let tm = TransactionManager::new();
+        let t1 = tm.begin();
+        tm.commit_serializable(t1.read_timestamp, &keyset(&[]), vec![b"Y".to_vec()], true)
+            .unwrap();
+        let t2 = tm.begin(); // begins after T1 committed
+        assert!(tm
+            .commit_serializable(t2.read_timestamp, &keyset(&[b"Y"]), vec![b"Z".to_vec()], true)
+            .is_ok());
     }
 }

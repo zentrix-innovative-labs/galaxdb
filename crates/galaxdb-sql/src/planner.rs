@@ -134,6 +134,10 @@ pub enum QueryPlan {
         table: String,
         mode: galaxdb_common::StorageMode,
     },
+    /// CREATE SEMANTIC CACHE FOR TABLE t SIMILARITY f TTL n (v0.7, inventory 8.11).
+    CreateSemanticCache(crate::ast::CreateSemanticCacheStmt),
+    /// DROP SEMANTIC CACHE FOR TABLE t.
+    DropSemanticCache { table: String },
 }
 
 /// Search strategy chosen by the adaptive planner (Req 22).

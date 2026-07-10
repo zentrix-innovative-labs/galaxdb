@@ -40,11 +40,10 @@ pub fn validate_version_query(
                 .to_string()
         ),
         Some(ConsistencyMode::SemanticFresh) => Ok(Some(ConsistencyMode::SemanticFresh)),
-        Some(ConsistencyMode::SemanticSnapshot) => Err(
-            "CONSISTENCY 'SEMANTIC_SNAPSHOT' is a v2 feature and is not yet implemented. \
-             Use CONSISTENCY 'SEMANTIC_FRESH' instead."
-                .to_string()
-        ),
+        // v0.7 (inventory 5.12/8.13): SEMANTIC_SNAPSHOT is implemented — search
+        // restricted to rows visible at the tagged version, exact because
+        // embedding-source columns are immutable.
+        Some(ConsistencyMode::SemanticSnapshot) => Ok(Some(ConsistencyMode::SemanticSnapshot)),
     }
 }
 
@@ -97,9 +96,9 @@ mod tests {
     }
 
     #[test]
-    fn at_version_semantic_match_semantic_snapshot_rejected() {
+    fn at_version_semantic_match_semantic_snapshot_allowed() {
+        // v0.7 (inventory 5.12/8.13): SEMANTIC_SNAPSHOT is implemented.
         let result = validate_version_query(true, true, Some(ConsistencyMode::SemanticSnapshot));
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("v2 feature"));
+        assert_eq!(result.unwrap(), Some(ConsistencyMode::SemanticSnapshot));
     }
 }

@@ -17,8 +17,11 @@ Requires Python 3.9+. Pre-built wheels for Linux x86_64, macOS Intel, macOS Appl
 - **Full SQL** -- CREATE, INSERT, UPDATE, DELETE, SELECT with WHERE filters
 - **Local embeddings** -- text to vector conversion runs inside the process, no API key needed
 - **Semantic search** -- `SEMANTIC_MATCH(col, 'query', threshold)` in any WHERE clause; add `LIMIT n` for the *n* nearest matches
-- **HNSW vector index** -- recall@10 = 0.990 on SIFT-1M at ef=200
-- **Time-travel queries** -- `SELECT ... AT VERSION 'tag'` to query historical snapshots
+- **Semantic caching** -- `CREATE SEMANTIC CACHE FOR TABLE t SIMILARITY 0.98 TTL 300` serves near-identical queries from cache
+- **HNSW vector index** -- recall@10 = 0.990 on SIFT-1M at ef=200, persisted across restart (no re-embed)
+- **DiskANN** -- opt-in disk-resident (Vamana) index for larger-than-RAM vector sets
+- **Time-travel queries** -- `SELECT ... AT VERSION 'tag'`, including exact historical vector search with `CONSISTENCY 'SEMANTIC_SNAPSHOT'`
+- **Serializable isolation** -- opt-in Serializable Snapshot Isolation on top of the default snapshot isolation
 - **Training export** -- `CREATE VERSION TAG ... FOR TRAINING` exports a Lance dataset, zero-copy PyTorch-ready
 - **Near-dedup** -- `WHERE NOT DUPLICATE` removes near-duplicate rows using MinHash LSH
 - **Crash safety** -- WAL + checksum, 7 chaos scenarios pass in under 11 seconds
@@ -204,7 +207,7 @@ docker run -d -p 5433:5433 -p 9090:9090 \
 ```bash
 # Health check
 curl http://localhost:9090/health
-# {"status":"ok","version":"0.4.0","subsystems":{"sidecar_healthy":true}}
+# {"status":"ok","version":"0.7.0","subsystems":{"sidecar_healthy":true}}
 
 # Prometheus metrics
 curl http://localhost:9090/metrics

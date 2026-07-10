@@ -257,6 +257,26 @@ pub const HNSW: FormatSupport = FormatSupport {
     current_write: 1,
 };
 
+/// Persisted vector-index snapshot (v0.7, inventory 4.10): the per-table
+/// `(dim, columns, [(key, row_id, vector)])` state the embedded engine reloads
+/// on open instead of re-embedding every durable row.
+pub const VINDEX: FormatSupport = FormatSupport {
+    artifact: "vector index snapshot",
+    magic: *b"GVIX",
+    min_readable: 1,
+    current_write: 1,
+};
+
+/// DiskANN (Vamana) disk-resident ANN index (v0.7, inventory 8.17): the graph
+/// adjacency + full-precision vectors laid out as fixed-size on-disk node
+/// records for O(1) random access during beam search.
+pub const DISKANN: FormatSupport = FormatSupport {
+    artifact: "DiskANN index",
+    magic: *b"GDAN",
+    min_readable: 1,
+    current_write: 1,
+};
+
 // ---------------------------------------------------------------------------
 // Crash-safe upgrade-on-open migration (B.5).
 //
@@ -444,7 +464,7 @@ mod tests {
 
     #[test]
     fn all_launch_artifacts_start_at_v1() {
-        for s in [WAL, SST, PAX, BLOB, CATALOG, HNSW] {
+        for s in [WAL, SST, PAX, BLOB, CATALOG, HNSW, VINDEX, DISKANN] {
             assert_eq!(s.min_readable, 1, "{}", s.artifact);
             assert_eq!(s.current_write, FORMAT_VERSION, "{}", s.artifact);
             assert!(s.check(FORMAT_VERSION).is_ok(), "{}", s.artifact);

@@ -115,6 +115,22 @@ impl<K: Clone + Eq + Hash, V> LruCache<K, V> {
         self.map.keys().cloned()
     }
 
+    /// Return up to `k` keys starting from the LRU (tail) end, walking toward
+    /// MRU. O(k) — used by RGABH to sample eviction candidates from the stale
+    /// end without scanning the whole cache.
+    pub fn lru_tail_keys(&self, k: usize) -> Vec<K> {
+        let mut out = Vec::with_capacity(k);
+        let mut cur = self.tail;
+        while let Some(idx) = cur {
+            if out.len() >= k {
+                break;
+            }
+            out.push(self.node(idx).key.clone());
+            cur = self.node(idx).prev;
+        }
+        out
+    }
+
     /// Check if a key is present without promoting it.
     pub fn contains(&self, key: &K) -> bool {
         self.map.contains_key(key)

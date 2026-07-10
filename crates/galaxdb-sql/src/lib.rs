@@ -11,6 +11,7 @@ pub mod planner;
 pub mod row_codec;
 pub mod scalar;
 pub mod secondary_index;
+pub mod semantic_cache_store;
 pub mod stmt_cache;
 pub mod transaction;
 pub mod types;

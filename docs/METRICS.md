@@ -25,6 +25,7 @@ recomputed live from the engine.
 | `galaxdb_embedding_ops_total` | counter | rows | One per **row embedded** by the sidecar (documents and queries both). A backlogged/failed embed counts only once it actually succeeds. |
 | `galaxdb_near_dedup_rows_total` | counter | rows | Rows processed by a `WHERE NOT DUPLICATE` / near-dedup pass (the buffered candidate set the pass consumes). |
 | `galaxdb_training_export_bytes_total` | counter | bytes | Bytes emitted by a successful training-dataset (Lance) export, measured from the on-disk dataset. |
+| `galaxdb_semantic_cache_hits_total` | counter | operations | One per **semantic-cache hit** served (v0.7, E-4.1): a `SEMANTIC_MATCH` answered from the configured semantic cache instead of running HNSW. Zero per miss. See [below](#semantic-cache-hit-metric--live-in-v070-cloud-e-41). |
 | `galaxdb_storage_bytes` | gauge | bytes | **Physical** on-disk size of this database (post-compaction, compressed, encrypted), summed under the data directory. Refreshed on checkpoint/flush; accurate only while the process runs. |
 | `galaxdb_rows_total` | gauge | rows | Total live row count (`Engine::row_count()`). |
 | `galaxdb_process_start_time_seconds` | gauge | unix seconds | Process start time, set once at startup. Lets a collector detect a restart and reconcile any counter tail not yet persisted. |
@@ -46,12 +47,14 @@ engine work (catalog persistence, embedding-backlog drains, background near-dedu
 
 ## Persistence across restart
 
-Scale-to-zero databases stop and start frequently, so the six cumulative counters must not
+Scale-to-zero databases stop and start frequently, so the cumulative counters must not
 reset to 0 on start. GalaxDB implements **both** acceptable designs:
 
 1. **Volume persistence (primary).** Cumulative totals are written to
    `<data_dir>/metering.gmet` — a versioned `GMET` header (the same `galaxdb-common::format`
-   machinery used by every other on-disk artifact) followed by six little-endian `u64` totals.
+   machinery used by every other on-disk artifact) followed by the cumulative little-endian
+   `u64` totals (six in v0.6, seven since v0.7 with `semantic_cache_hits`; the reader is
+   length-tolerant so a v0.6 file loads with the new counter seeded to 0).
    Written crash-safely (`atomic_replace`: temp → fsync → rename → fsync dir) on every
    checkpoint/flush and on graceful shutdown, and read back to seed the live counters on open.
    A crash mid-write leaves either the prior or the new totals, never a torn value. A metering
@@ -71,15 +74,21 @@ Gauges published since Phase E, unchanged: `galaxdb_buffer_pool_hot_set_usage`,
 all-statements counter, not restart-durable; superseded for usage accounting by the
 read/write/vector split above but kept for backward compatibility).
 
-## Semantic-cache-hit metric — deferred, not faked
+## Semantic-cache-hit metric — live in v0.7.0 (Cloud E-4.1)
 
-The E-4 request included `galaxdb_semantic_cache_hits_total`. **GalaxDB has no semantic result
-cache today** (the only caches are the DEK cache, the SQL statement/AST cache, and the
-buffer-pool block cache — none caches semantic-search results). Semantic caching is a planned
-open-source feature that does not exist yet, so per the engineering principles (no faked
-metrics) this counter is **not exposed** rather than hardwired to zero. The metric name is
-**reserved** and will keep a stable definition once the semantic-cache feature ships. A
-collector should keep any cache-hit dimension gated until then.
+`galaxdb_semantic_cache_hits_total` (counter) is **live as of v0.7.0**. The semantic cache
+shipped this release (`CREATE SEMANTIC CACHE FOR TABLE <t> SIMILARITY <f> TTL <n>`): a query
+whose embedding is within the configured cosine similarity of a cached query, inside its TTL
+and with matching search params + embedding model, is served from cache and increments this
+counter (the HNSW search is skipped). A miss does not move it. The counter:
+
+- increments exactly once per served hit, zero per miss (monotonic, cumulative);
+- is **restart-durable** as the 7th `u64` in `<data_dir>/metering.gmet` (a v0.6 six-counter
+  file loads forward-compatibly with this counter seeded to 0 — length-tolerant read);
+- is present-and-0 (never a stub) when no semantic cache is configured.
+
+This closes the last E-4 billing dimension: Cloud already maps the name, so it flows end-to-end
+with no Cloud change.
 
 ## Answers to the control-plane metering questions
 

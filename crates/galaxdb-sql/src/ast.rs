@@ -43,6 +43,22 @@ pub enum AuroraStatement {
         table: String,
         mode: galaxdb_common::StorageMode,
     },
+    /// CREATE SEMANTIC CACHE FOR TABLE t SIMILARITY f TTL n (v0.7, inventory 8.11).
+    CreateSemanticCache(CreateSemanticCacheStmt),
+    /// DROP SEMANTIC CACHE FOR TABLE t.
+    DropSemanticCache { table: String },
+}
+
+/// CREATE SEMANTIC CACHE statement (v0.7): enable a per-table semantic
+/// result cache with a cosine-similarity hit threshold and a TTL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSemanticCacheStmt {
+    /// Table the cache is attached to (must have an embedding column).
+    pub table: String,
+    /// Cosine-similarity threshold in (0.0, 1.0] for a cache hit.
+    pub similarity: f32,
+    /// Time-to-live in seconds; entries older than this are never served.
+    pub ttl_secs: u32,
 }
 
 /// A privilege that can be granted on a table.
@@ -138,6 +154,9 @@ pub enum VersionRef {
 pub enum ConsistencyMode {
     RowSnapshot,
     SemanticFresh,
+    /// SEMANTIC_SNAPSHOT (v0.7, inventory 5.12/8.13): exact historical vector
+    /// search — results restricted to rows visible at the tagged version.
+    SemanticSnapshot,
 }
 
 /// CREATE VERSION TAG statement.

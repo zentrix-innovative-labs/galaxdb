@@ -67,6 +67,12 @@ pub fn parse(sql: &str) -> GalaxResult<Vec<AuroraStatement>> {
     if upper.starts_with("REVOKE ") {
         return Ok(vec![parse_grant(trimmed, true)?]);
     }
+    if upper.starts_with("CREATE SEMANTIC CACHE") {
+        return Ok(vec![parse_create_semantic_cache(trimmed)?]);
+    }
+    if upper.starts_with("DROP SEMANTIC CACHE") {
+        return Ok(vec![parse_drop_semantic_cache(trimmed)?]);
+    }
     if upper.starts_with("CREATE INDEX") || upper.starts_with("CREATE UNIQUE INDEX") {
         return Ok(vec![parse_create_index(trimmed)?]);
     }
@@ -463,6 +469,98 @@ fn parse_drop_index(sql: &str) -> GalaxResult<AuroraStatement> {
     Ok(AuroraStatement::DropIndex { name, if_exists })
 }
 
+/// Parse `CREATE SEMANTIC CACHE FOR TABLE <t> SIMILARITY <f> TTL <n>` (v0.7).
+fn parse_create_semantic_cache(sql: &str) -> GalaxResult<AuroraStatement> {
+    // Normalize: strip trailing ';' and collapse whitespace for keyword scans.
+    let s = sql.trim().trim_end_matches(';').trim();
+    let upper = s.to_uppercase();
+
+    let for_table = "CREATE SEMANTIC CACHE FOR TABLE";
+    if !upper.starts_with(for_table) {
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: "expected CREATE SEMANTIC CACHE FOR TABLE <table> SIMILARITY <f> TTL <n>"
+                .to_string(),
+        });
+    }
+    let rest = s[for_table.len()..].trim();
+    // table name is the first identifier.
+    let (table, after_table) = take_ident(rest).ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "CREATE SEMANTIC CACHE requires a table name".to_string(),
+    })?;
+
+    let after_upper = after_table.to_uppercase();
+    let sim_pos = after_upper.find("SIMILARITY").ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "CREATE SEMANTIC CACHE requires SIMILARITY <float>".to_string(),
+    })?;
+    let ttl_pos = after_upper.find("TTL").ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "CREATE SEMANTIC CACHE requires TTL <seconds>".to_string(),
+    })?;
+    if ttl_pos < sim_pos {
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: "CREATE SEMANTIC CACHE expects SIMILARITY before TTL".to_string(),
+        });
+    }
+    let sim_str = after_table[sim_pos + "SIMILARITY".len()..ttl_pos].trim();
+    let ttl_str = after_table[ttl_pos + "TTL".len()..].trim();
+
+    let similarity: f32 = sim_str.split_whitespace().next().unwrap_or("").parse().map_err(|_| {
+        GalaxError::SqlParse {
+            position: 0,
+            message: format!("SIMILARITY must be a float in (0.0, 1.0]; got '{sim_str}'"),
+        }
+    })?;
+    if !(similarity > 0.0 && similarity <= 1.0) {
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: format!("SIMILARITY must be in (0.0, 1.0]; got {similarity}"),
+        });
+    }
+    let ttl_secs: u32 = ttl_str.split_whitespace().next().unwrap_or("").parse().map_err(|_| {
+        GalaxError::SqlParse {
+            position: 0,
+            message: format!("TTL must be a positive integer number of seconds; got '{ttl_str}'"),
+        }
+    })?;
+    if ttl_secs == 0 {
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: "TTL must be a positive number of seconds".to_string(),
+        });
+    }
+
+    Ok(AuroraStatement::CreateSemanticCache(
+        crate::ast::CreateSemanticCacheStmt {
+            table,
+            similarity,
+            ttl_secs,
+        },
+    ))
+}
+
+/// Parse `DROP SEMANTIC CACHE FOR TABLE <t>` (v0.7).
+fn parse_drop_semantic_cache(sql: &str) -> GalaxResult<AuroraStatement> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let upper = s.to_uppercase();
+    let prefix = "DROP SEMANTIC CACHE FOR TABLE";
+    if !upper.starts_with(prefix) {
+        return Err(GalaxError::SqlParse {
+            position: 0,
+            message: "expected DROP SEMANTIC CACHE FOR TABLE <table>".to_string(),
+        });
+    }
+    let rest = s[prefix.len()..].trim();
+    let (table, _) = take_ident(rest).ok_or_else(|| GalaxError::SqlParse {
+        position: 0,
+        message: "DROP SEMANTIC CACHE requires a table name".to_string(),
+    })?;
+    Ok(AuroraStatement::DropSemanticCache { table })
+}
+
 /// Parse CREATE VERSION TAG 'name' [FOR TRAINING [WITH TRAINING PRECISION ...] [TRAINING SEED n]].
 fn parse_create_version_tag(sql: &str) -> GalaxResult<AuroraStatement> {
     let upper = sql.to_uppercase();
@@ -801,7 +899,11 @@ pub fn parse_at_version(expr: &str) -> GalaxResult<AtVersionExpr> {
     let consistency = if upper_rem.is_empty() {
         None
     } else if upper_rem.starts_with("CONSISTENCY") {
-        if upper_rem.contains("ROW_SNAPSHOT") {
+        // Check SEMANTIC_SNAPSHOT before SEMANTIC_FRESH is irrelevant (distinct
+        // substrings); order chosen for readability.
+        if upper_rem.contains("SEMANTIC_SNAPSHOT") {
+            Some(ConsistencyMode::SemanticSnapshot)
+        } else if upper_rem.contains("ROW_SNAPSHOT") {
             Some(ConsistencyMode::RowSnapshot)
         } else if upper_rem.contains("SEMANTIC_FRESH") {
             Some(ConsistencyMode::SemanticFresh)
@@ -810,7 +912,7 @@ pub fn parse_at_version(expr: &str) -> GalaxResult<AtVersionExpr> {
                 position: 0,
                 message: format!(
                     "unrecognized CONSISTENCY mode in AT VERSION clause: '{}' \
-                     (expected 'ROW_SNAPSHOT' or 'SEMANTIC_FRESH')",
+                     (expected 'ROW_SNAPSHOT', 'SEMANTIC_FRESH', or 'SEMANTIC_SNAPSHOT')",
                     remainder.trim()
                 ),
             });

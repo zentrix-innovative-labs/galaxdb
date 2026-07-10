@@ -166,6 +166,15 @@ pub trait VectorSearchBackend: Send + Sync {
     ) -> GalaxResult<()> {
         Ok(())
     }
+
+    /// Enable (or reconfigure) the semantic result cache for `table` with a
+    /// cosine-similarity hit threshold and a TTL (v0.7, inventory 8.11).
+    /// Default no-op so test stubs need not implement it.
+    fn configure_semantic_cache(&self, _table: &str, _similarity: f32, _ttl_secs: u32) {}
+
+    /// Disable and discard the semantic result cache for `table`.
+    /// Default no-op.
+    fn drop_semantic_cache(&self, _table: &str) {}
 }
 
 /// Catalog entry for a table.
@@ -356,6 +365,11 @@ pub struct ExecutorContext {
     /// engine.
     pub secondary_index: Option<crate::secondary_index::SecondaryIndexStore>,
 
+    /// Semantic-cache config store (v0.7, inventory 8.11). `None` disables
+    /// the `CREATE/DROP SEMANTIC CACHE` DDL (typed error); the embedded
+    /// layer supplies a real engine-backed store.
+    pub semantic_cache_store: Option<crate::semantic_cache_store::SemanticCacheStore>,
+
     /// Active explicit transaction (HTAP Phase 5). When `Some`, DML buffers
     /// its writes into [`TxnHandle::writes`] instead of committing to the
     /// engine, and reads execute at [`TxnHandle::read_ts`] with the buffer
@@ -391,6 +405,13 @@ pub struct TxnHandle {
     /// `RELEASE <name>` drops the marker (and the ones above it) without
     /// touching the buffer. Held in declaration (stack) order.
     pub savepoints: Arc<std::sync::Mutex<Vec<(String, WriteBuffer)>>>,
+    /// v0.7 SSI (inventory 8.14): keys this transaction has read, for the
+    /// commit-time serializability certifier. Only populated when
+    /// `serializable` is set (SI transactions don't track reads).
+    pub reads: Arc<std::sync::Mutex<std::collections::HashSet<Vec<u8>>>>,
+    /// Whether this transaction runs at SERIALIZABLE (SSI) isolation. When
+    /// `false` (default) the transaction is snapshot-isolated as before.
+    pub serializable: bool,
 }
 
 impl TxnHandle {
@@ -407,7 +428,27 @@ impl TxnHandle {
             writes: Arc::new(std::sync::Mutex::new(std::collections::BTreeMap::new())),
             txn_manager,
             savepoints: Arc::new(std::sync::Mutex::new(Vec::new())),
+            reads: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            serializable: false,
         }
+    }
+
+    /// Mark this transaction SERIALIZABLE (SSI). Reads are then tracked and
+    /// certified at commit (v0.7, inventory 8.14).
+    pub fn set_serializable(&mut self, on: bool) {
+        self.serializable = on;
+    }
+
+    /// Record a key this transaction read (no-op unless SERIALIZABLE).
+    pub fn record_read(&self, key: &[u8]) {
+        if self.serializable {
+            self.reads.lock().expect("txn reads lock").insert(key.to_vec());
+        }
+    }
+
+    /// Snapshot of the read-set keys (for commit-time certification).
+    pub fn read_key_set(&self) -> std::collections::HashSet<Vec<u8>> {
+        self.reads.lock().expect("txn reads lock").clone()
     }
 
     /// Buffer an upsert (`Some`) or tombstone (`None`) for `key`, first
@@ -484,6 +525,7 @@ impl ExecutorContext {
             authorizer: None,
             audit: None,
             secondary_index: None,
+            semantic_cache_store: None,
             txn: None,
         }
     }
@@ -648,6 +690,8 @@ fn plan_kind_str(plan: &QueryPlan) -> &'static str {
         QueryPlan::CreateIndex(_) => "create_index",
         QueryPlan::DropIndex { .. } => "drop_index",
         QueryPlan::AlterTableSetStorage { .. } => "alter_table_set_storage",
+        QueryPlan::CreateSemanticCache(_) => "create_semantic_cache",
+        QueryPlan::DropSemanticCache { .. } => "drop_semantic_cache",
     }
 }
 
@@ -697,6 +741,11 @@ fn plan_authz_target(plan: &QueryPlan) -> (galaxdb_auth::Action, galaxdb_auth::O
         // CREATE/DROP INDEX are schema changes scoped to their table.
         QueryPlan::CreateIndex(stmt) => (Action::Ddl, ObjectRef::Table(stmt.table.clone())),
         QueryPlan::DropIndex { .. } => (Action::Ddl, ObjectRef::Cluster),
+        // Semantic cache DDL is table-scoped schema management.
+        QueryPlan::CreateSemanticCache(stmt) => {
+            (Action::Ddl, ObjectRef::Table(stmt.table.clone()))
+        }
+        QueryPlan::DropSemanticCache { table } => (Action::Ddl, ObjectRef::Table(table.clone())),
         // SHOW EMBEDDING HEALTH reads health for a table (or the whole
         // server when no table is named): a table-scoped read, or a
         // cluster-scoped read needing superuser when global.
@@ -943,6 +992,8 @@ pub fn execute_with_context(
         QueryPlan::AlterTableSetStorage { table, mode } => {
             exec_alter_table_set_storage(table, *mode, ctx)
         }
+        QueryPlan::CreateSemanticCache(stmt) => exec_create_semantic_cache(stmt, ctx),
+        QueryPlan::DropSemanticCache { table } => exec_drop_semantic_cache(table, ctx),
     };
 
     // v0.6 metering (E-4): count client-visible data operations once per
@@ -1498,6 +1549,17 @@ fn exec_delete(
 // Reads
 // ---------------------------------------------------------------------------
 
+/// v0.7 SSI: table-granularity predicate-read sentinel. A serializable scan
+/// records this in its read-set; `commit_transaction` adds the same sentinel to
+/// the write-set of any txn that writes the table, so a scan and a concurrent
+/// write to the same table conflict (catches write-skew AND phantoms). The
+/// leading NUL keeps it out of the normal `{table}:{pk}` key space.
+pub fn siread_sentinel(table: &str) -> Vec<u8> {
+    let mut s = b"\x00SIREAD\x00".to_vec();
+    s.extend_from_slice(table.as_bytes());
+    s
+}
+
 fn exec_full_scan(
     table: &str,
     columns: &[String],
@@ -1591,6 +1653,14 @@ fn exec_full_scan(
 
     if dedup {
         apply_not_duplicate_pass(&mut buffered);
+    }
+
+    // v0.7 SSI (inventory 8.14): a serializable scan takes a table-granularity
+    // predicate read (SIREAD sentinel) so a concurrent write to this table —
+    // including a phantom insert — is caught by the commit-time certifier.
+    // Conservative (may over-abort), never a false negative.
+    if let Some(txn) = ctx.txn.as_ref() {
+        txn.record_read(&siread_sentinel(table));
     }
 
     let rows: Vec<Row> = buffered
@@ -1827,6 +1897,9 @@ fn exec_point_lookup(
     // Read-your-writes under a transaction: check the buffer first
     // (`Some` = upsert, `None` = tombstone), else read at the snapshot.
     let looked_up = if let Some(txn) = ctx.txn.as_ref() {
+        // v0.7 SSI: a point lookup reads exactly this key — record it precisely
+        // (no phantom concern for a single-key read).
+        txn.record_read(key);
         match txn.writes.lock().expect("txn writes lock").get(key) {
             Some(buffered) => buffered.clone(),
             None => ctx.engine.get_at(key, txn.read_ts),
@@ -2261,6 +2334,69 @@ fn exec_drop_index(
     Ok(ExecuteResult::Ok(format!("DROP INDEX {}", name)))
 }
 
+fn exec_create_semantic_cache(
+    stmt: &crate::ast::CreateSemanticCacheStmt,
+    ctx: &mut ExecutorContext,
+) -> GalaxResult<ExecuteResult> {
+    // The table must exist and carry an embedding column — a semantic
+    // cache is meaningless otherwise (Req 1.1).
+    let entry = ctx
+        .catalog
+        .get_table(&stmt.table)
+        .cloned()
+        .ok_or_else(|| GalaxError::TableNotFound(stmt.table.clone()))?;
+    if !entry.has_embedding {
+        return Err(GalaxError::Internal(format!(
+            "CREATE SEMANTIC CACHE requires an embedding column; table '{}' has none",
+            stmt.table
+        )));
+    }
+    let store = ctx
+        .semantic_cache_store
+        .as_ref()
+        .ok_or(GalaxError::NotYetAvailable {
+            task: "v0.7",
+            feature: "semantic cache requires a configured store",
+        })?;
+    // CREATE on an already-cached table replaces its config (Req 1.4).
+    store.put(
+        &stmt.table,
+        crate::semantic_cache_store::CacheConfig {
+            similarity: stmt.similarity,
+            ttl_secs: stmt.ttl_secs,
+        },
+    )?;
+    // Tell the vector backend to (re)initialize the in-memory cache for
+    // this table with the new config. A no-op when no backend is attached.
+    if let Some(backend) = ctx.vector_backend.as_ref() {
+        backend.configure_semantic_cache(&stmt.table, stmt.similarity, stmt.ttl_secs);
+    }
+    Ok(ExecuteResult::Ok(format!(
+        "CREATE SEMANTIC CACHE FOR TABLE {} (similarity {}, ttl {}s)",
+        stmt.table, stmt.similarity, stmt.ttl_secs
+    )))
+}
+
+fn exec_drop_semantic_cache(
+    table: &str,
+    ctx: &mut ExecutorContext,
+) -> GalaxResult<ExecuteResult> {
+    let store = ctx
+        .semantic_cache_store
+        .as_ref()
+        .ok_or(GalaxError::NotYetAvailable {
+            task: "v0.7",
+            feature: "semantic cache requires a configured store",
+        })?;
+    store.drop_config(table)?;
+    if let Some(backend) = ctx.vector_backend.as_ref() {
+        backend.drop_semantic_cache(table);
+    }
+    Ok(ExecuteResult::Ok(format!(
+        "DROP SEMANTIC CACHE FOR TABLE {table}"
+    )))
+}
+
 fn exec_create_version_tag(
     stmt: &crate::ast::CreateVersionTagStmt,
     ctx: &mut ExecutorContext,
@@ -2613,16 +2749,17 @@ fn exec_hybrid_search_at_version(
                 .into(),
         ));
     };
+    // ROW_SNAPSHOT rejects SEMANTIC_MATCH; SEMANTIC_FRESH and
+    // SEMANTIC_SNAPSHOT both execute (v0.7: SEMANTIC_SNAPSHOT is now real).
     match consistency {
         ConsistencyMode::RowSnapshot => {
             return Err(GalaxError::Internal(
                 "SEMANTIC_MATCH is not allowed with CONSISTENCY 'ROW_SNAPSHOT'; \
-                 use 'SEMANTIC_FRESH' to search current vectors against \
-                 historical rows"
+                 use 'SEMANTIC_FRESH' or 'SEMANTIC_SNAPSHOT'"
                     .into(),
             ));
         }
-        ConsistencyMode::SemanticFresh => { /* fall through */ }
+        ConsistencyMode::SemanticFresh | ConsistencyMode::SemanticSnapshot => { /* execute */ }
     }
 
     // Resolve the read timestamp (task 32.3 / 32.4 semantics).
@@ -2644,92 +2781,84 @@ fn exec_hybrid_search_at_version(
         }
     };
 
-    // Run the vector backend against the current HNSW (SEMANTIC_FRESH
-    // semantics — rank by current vectors).
+    // Build the set of rows visible at `read_ts`, keyed by the vector row-id
+    // (xxh3_64 of the primary key — the SAME id space the vector backend uses,
+    // per the v0.7 row-id-unification finding), and keep the decoded row so we
+    // can join results back to columns. Because embedding-source columns are
+    // immutable (UPDATE on them is rejected), a surviving key's current vector
+    // equals its historical vector — so filtering the current search to rows
+    // visible at `read_ts` yields the EXACT historical semantic result.
+    let prefix = format!("{}:", table);
+    let mut visible: std::collections::HashMap<u64, Vec<(String, Value)>> =
+        std::collections::HashMap::new();
+    for (key, val, _ts) in ctx.engine.scan_all_at(read_ts) {
+        if !String::from_utf8_lossy(&key).starts_with(&prefix) {
+            continue;
+        }
+        let rid = xxhash_rust::xxh3::xxh3_64(&key);
+        visible.insert(rid, row_codec::decode_row(&val));
+    }
+
+    // Run the vector backend against the current index. Over-fetch a candidate
+    // pool so that after restricting to visible rows we still have the top-k.
+    // (This is ANN-approximate, consistent with normal SEMANTIC_MATCH.)
     let backend = ctx
         .vector_backend
         .as_ref()
         .ok_or(GalaxError::SidecarUnavailable)?;
     let k = limit.unwrap_or(DEFAULT_SEMANTIC_LIMIT);
+    let pool = (k.saturating_mul(4)).max(256);
     let raw = if let Some(f) = filter {
         match strategy {
             SearchStrategy::BruteForceFiltered => {
-                backend.brute_force_filtered(table, &semantic.query, semantic.threshold, k, f)?
+                backend.brute_force_filtered(table, &semantic.query, semantic.threshold, pool, f)?
             }
             SearchStrategy::HnswWithPostFilter => backend.semantic_search(
                 table,
                 &semantic.query,
                 semantic.threshold,
-                k,
+                pool,
                 strategy,
             )?,
         }
     } else {
-        backend.semantic_search(table, &semantic.query, semantic.threshold, k, strategy)?
+        backend.semantic_search(table, &semantic.query, semantic.threshold, pool, strategy)?
     };
 
-    // Intersect with rows visible at `read_ts`. Rows that don't exist
-    // at that snapshot are dropped so the SEMANTIC_FRESH result set
-    // matches `AT VERSION <ts>` in cardinality, even if the rank
-    // order is computed against current vectors.
-    let prefix = format!("{}:", table);
-    let visible_row_ids: std::collections::HashSet<u64> = ctx
-        .engine
-        .scan_all_at(read_ts)
-        .into_iter()
-        .filter_map(|(key, _, _)| {
-            if String::from_utf8_lossy(&key).starts_with(&prefix) {
-                Some(xxhash_rust::xxh3::xxh3_64(&key))
-            } else {
-                None
+    // Restrict to rows visible at the snapshot and take the top-k.
+    let table_entry = ctx
+        .catalog
+        .get_table(table)
+        .cloned()
+        .ok_or_else(|| GalaxError::TableNotFound(table.to_string()))?;
+    let col_names: Vec<String> = table_entry.columns.iter().map(|c| c.name.clone()).collect();
+
+    let mut rows: Vec<Row> = Vec::with_capacity(k);
+    for r in raw {
+        if let Some(cols) = visible.get(&r.row_id) {
+            rows.push(Row {
+                columns: cols.clone(),
+            });
+            if rows.len() >= k {
+                break;
             }
-        })
-        .collect();
+        }
+    }
 
-    // NOTE: the vector-backend row_id today is derived from the
-    // EmbeddedVectorBackend's per-table counter, not the xxh3 of the
-    // primary key. So this intersection is a best-effort filter that
-    // ensures at least the SEMANTIC_FRESH warning row is attached;
-    // exact row-id alignment between the HNSW index and the
-    // time-travel scan is tracked as follow-up. When the two ID
-    // spaces unify, this intersect becomes exact.
-    let _ = visible_row_ids; // retained for the next iteration of this path
-
-    let mut rows: Vec<Row> = raw
-        .into_iter()
-        .map(|r| Row {
-            columns: vec![
-                ("row_id".to_string(), Value::Integer(r.row_id as i64)),
-                ("similarity".to_string(), Value::Float(r.similarity as f64)),
-            ],
-        })
-        .collect();
-
-    // Attach the SEMANTIC_FRESH warning row. Callers that don't want
-    // the warning can filter it out; v1 surfaces it explicitly so the
-    // semantics are never silent.
-    rows.insert(
-        0,
-        Row {
-            columns: vec![
-                (
-                    "row_id".to_string(),
-                    Value::Text("__galaxdb_warning__".to_string()),
-                ),
-                (
-                    "similarity".to_string(),
-                    Value::Text(format!(
-                        "SEMANTIC_FRESH: similarity computed against current \
-                         vectors, not the historical vectors as of ts={}",
-                        read_ts
-                    )),
-                ),
-            ],
-        },
-    );
+    // SEMANTIC_FRESH surfaces the documented warning that ranking uses the
+    // current index (moot here since embeddings are immutable, but the
+    // contract keeps it explicit). SEMANTIC_SNAPSHOT is exact historical and
+    // carries no warning.
+    if matches!(consistency, ConsistencyMode::SemanticFresh) {
+        tracing::debug!(
+            table = %table,
+            read_ts,
+            "SEMANTIC_FRESH: ranked against the current index, restricted to rows visible at the snapshot"
+        );
+    }
 
     Ok(ExecuteResult::Rows {
-        columns: vec!["row_id".to_string(), "similarity".to_string()],
+        columns: col_names,
         rows,
     })
 }
@@ -2898,6 +3027,13 @@ pub fn execute_legacy(plan: &QueryPlan, catalog: &mut Catalog) -> ExecuteResult 
         QueryPlan::CreateVersionTag(stmt) => ExecuteResult::Ok(format!(
             "CREATE VERSION TAG '{}' (validation only)",
             stmt.name
+        )),
+        QueryPlan::CreateSemanticCache(stmt) => ExecuteResult::Error(format!(
+            "CREATE SEMANTIC CACHE FOR TABLE {} requires a storage engine; use execute_with_context",
+            stmt.table
+        )),
+        QueryPlan::DropSemanticCache { table } => ExecuteResult::Error(format!(
+            "DROP SEMANTIC CACHE FOR TABLE {table} requires a storage engine; use execute_with_context"
         )),
         QueryPlan::SemanticSearch { table, .. } => {
             if !catalog.table_exists(table) {

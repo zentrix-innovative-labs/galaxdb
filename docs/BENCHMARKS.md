@@ -4,6 +4,41 @@ All numbers in this document are measured on real hardware against real datasets
 
 ---
 
+## RGABH adaptive buffer pool — skewed-workload hit rate (v0.7)
+
+**Hardware:** Intel Core i7-7820HQ, macOS 13.7.8, rustc 1.96.0, `--release`. Date: 2026-07-10.
+**Command:** `cargo run --release -p galaxdb-storage --example rgabh_hitrate`
+
+Deterministic Zipfian-skewed access trace (YCSB-style: ~80% of accesses hit a 1,500-key hot
+set, ~20% over a 50,000-key cold tail), identical seed through two 2,000-slot pools.
+
+| Policy | HotSet hit rate |
+|---|---|
+| LRU/clock baseline | 0.6391 |
+| RGABH adaptive | 0.8030 |
+| **Delta** | **+16.39 pp** |
+
+RGABH's W-TinyLFU-style frequency admission keeps the durably-hot working set resident instead
+of letting the one-shot cold stream evict it. Admission/eviction is O(K); disabling RGABH
+reproduces the LRU/clock baseline exactly. Full record: `bench-results/rgabh-20260710/`.
+
+---
+
+## DiskANN disk-resident ANN — recall (v0.7)
+
+Recall verified against exact brute-force ground truth on real clustered data (`--release`):
+recall@10 ≥ 0.90 (cosine) and ≥ 0.85 (L2). Command: `cargo test --release -p galaxdb-vector diskann`.
+
+The full SIFT1M-scale recall and QPS numbers will be added once the 1M-vector run completes on the
+reference hardware. The harness is included:
+
+```bash
+cargo run --release -p galaxdb-vector --example diskann_sift_recall -- \
+    sift_base.fvecs sift_query.fvecs sift_groundtruth.ivecs 10 100 64 125
+```
+
+---
+
 ## Vector Search — HNSW on SIFT-1M
 
 **Hardware:** AWS c6id.4xlarge — Intel Xeon Platinum 8375C (Ice Lake, 16 vCPU, 32 GiB RAM, 884 GB NVMe), Ubuntu 24.04, io_uring backend.

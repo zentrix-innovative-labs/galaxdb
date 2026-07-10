@@ -18,7 +18,9 @@ The single-node engine is feature-complete and benchmarked on SIFT-1M (see
 [BENCHMARKS.md](docs/BENCHMARKS.md)).
 
 **Storage** — LSM + PAX columnar storage, ART primary index, Monkey-optimal Bloom filters, NUMA-aware
-buffer pool, Lazy Leveling compaction with MVCC GC, WAL with crash recovery, key-value separation,
+buffer pool with **RGABH gradient-driven adaptive admission** (per-block short/long/training heat +
+W-TinyLFU frequency admission and velocity-driven speculative prefetch; off-switch reverts to LRU/clock),
+Lazy Leveling compaction with MVCC GC, WAL with crash recovery, key-value separation,
 write-stall mitigation, io_uring/tokio backends, automatic memory/configuration tuning (buffer pool,
 memtable, compaction concurrency derived from host RAM/CPU), a **durable catalog** (table
 definitions, storage modes, and constraints survive restart), and AES-256-GCM encryption at rest with
@@ -34,13 +36,19 @@ overwrite), and arithmetic faults are typed (`22012` division-by-zero, `22003` o
 type mismatch).
 
 **Transactions** — explicit `BEGIN` / `COMMIT` / `ROLLBACK` with snapshot isolation, read-your-writes
-overlay, `SAVEPOINT` / `ROLLBACK TO`, and write-write conflict detection (SQLSTATE `40001`).
+overlay, `SAVEPOINT` / `ROLLBACK TO`, write-write conflict detection (SQLSTATE `40001`), and opt-in
+**Serializable Snapshot Isolation** (a commit-time certifier that aborts write-skew anomalies with
+`40001`; the default stays snapshot isolation).
 
 **Vector search** — mutable HNSW with crash-safe delta buffer, SQ8/FP16/RaBitQ quantization, parallel
-construction.
+construction, **on-disk index persistence** (reload on open instead of re-embedding durable rows), and a
+**disk-resident DiskANN** (Vamana) index with FreshDiskANN incremental insert/consolidate for
+larger-than-RAM vector sets (HNSW stays the default; DiskANN is opt-in).
 
 **AI-native SQL** — `EMBEDDING MODEL` columns with a local embedding sidecar (any HuggingFace model),
-`SEMANTIC_MATCH`, `AT VERSION` time-travel (including over flushed on-disk/SST data), version tags, MinHash
+`SEMANTIC_MATCH`, **semantic result caching** (`CREATE SEMANTIC CACHE FOR TABLE ... SIMILARITY ... TTL ...`),
+`AT VERSION` time-travel (including over flushed on-disk/SST data) with **exact historical vector search**
+(`CONSISTENCY 'SEMANTIC_SNAPSHOT'`), version tags, MinHash
 near-duplicate detection (`WHERE NOT DUPLICATE`), `FOR TRAINING` Lance export to PyTorch (including
 embedding/vector columns as Arrow `FixedSizeList`, with float32/SQ8/RaBitQ training precision), and EU AI
 Act Article 13 data lineage. Single-column secondary indexes (`CREATE INDEX` / `DROP INDEX`) accelerate
@@ -61,9 +69,9 @@ with a parsed-statement cache), `COPY FROM STDIN` / `COPY TO STDOUT` for bulk in
 vendor SDKs): `s3://` (plus S3-compatible endpoints — MinIO, Cloudflare R2), `gs://` (GCS), and `az://`
 (Azure Blob), with checksum validation and restore-aborts-on-corruption.
 
-The single-node open-source engine is **feature-complete** as of the v0.4.0 line: the entire relational +
-analytical + vector + transactional surface above ships today. Remaining OSS work is verification and
-published evidence, not missing features.
+The single-node open-source engine is **feature-complete** as of v0.7.0: the entire relational +
+analytical + vector + transactional surface above ships today, including semantic caching,
+`SEMANTIC_SNAPSHOT`, Serializable Snapshot Isolation, RGABH adaptive storage, and disk-resident DiskANN.
 
 ---
 
@@ -80,16 +88,20 @@ Hardening and evidence for the shipped engine — not new capabilities.
 
 ---
 
-## Planned (v2 and research)
+## Planned (enterprise and research)
 
-Future capabilities beyond the v0.4.0 single-node engine.
+The open-source single-node engine is feature-complete (v0.7.0). Remaining capabilities are the
+enterprise edition (built on the open core via stable seams) and research directions:
 
-- Semantic query caching (`CREATE SEMANTIC CACHE`)
-- Gradient-driven adaptive storage (single-node)
-- Active-learning SQL: `FEEDBACK`, `ORDER BY ACTIVE_LEARNING()`, uncertainty and drift detection
-- Versioned vector-index snapshots (`SEMANTIC_SNAPSHOT`)
-- Serializable Snapshot Isolation (snapshot isolation ships today)
-- Disk-resident ANN for larger-than-RAM vector sets
+- Active-learning SQL: `FEEDBACK`, `ORDER BY ACTIVE_LEARNING()`, uncertainty and drift detection (enterprise)
+- Curriculum-ordered training export engine (enterprise)
+- GPU-accelerated embedding + index build serving plane (enterprise / cloud)
+- Cluster-wide adaptive tiering NVMe → object store → cold archive (enterprise)
+- Distributed clustering, distributed ANN, and HTAP read replicas (enterprise)
+
+The DiskANN index's SIFT1M-scale recall and QPS numbers will be published once the 1M-vector run
+completes on the reference hardware; recall is already verified against exact brute-force ground truth
+(see [BENCHMARKS.md](docs/BENCHMARKS.md)).
 
 ---
 
@@ -148,6 +160,54 @@ Now that the open-source engine is feature-complete, each release is tracked
 here. Dates are release-tag dates. Versions follow semver; the PyPI client
 (`galaxdb-client`), the Docker image (`harbi256/galaxdb`), and the server
 binaries share the same version.
+
+### v0.7.0
+
+**Added — semantic result caching.** `CREATE SEMANTIC CACHE FOR TABLE <t>
+SIMILARITY <f> TTL <n>` / `DROP SEMANTIC CACHE FOR TABLE <t>`. A `SEMANTIC_MATCH`
+whose query embedding is within the configured cosine similarity of a cached
+query — inside its TTL, with matching search params and embedding model — is
+served from the cache and skips the HNSW search. Cache config is durable; entries
+are invalidated on `INSERT`/`UPDATE`/`DELETE` and on a model-version change.
+
+**Added — `galaxdb_semantic_cache_hits_total` metric (E-4.1).** A restart-durable
+counter (the 7th `metering.gmet` counter) incremented once per semantic-cache hit,
+zero per miss. A v0.6 six-counter metering file loads forward-compatibly with the
+new counter seeded to 0. This closes the last usage-metering dimension.
+
+**Added — on-disk vector-index persistence.** Each table's vector index state is
+persisted to `<data_dir>/vidx_<hash>.gvix` (versioned `GVIX`) on flush and
+shutdown, and reconciled against durable rows on open — reused vectors are loaded,
+only genuinely missing rows are re-embedded, deleted keys are dropped. Removes the
+re-embed-every-row-on-restart cost; a too-new file is refused with a typed error.
+
+**Added — exact historical vector search (`SEMANTIC_SNAPSHOT`).** `SELECT ... AT
+VERSION <v> CONSISTENCY 'SEMANTIC_SNAPSHOT' WHERE SEMANTIC_MATCH(...)` runs a
+semantic search restricted to the rows visible at version `v`, joined exactly by
+key. Rows without a recoverable vector at `v` are excluded, never fabricated; the
+live index is never mutated.
+
+**Added — Serializable Snapshot Isolation.** An opt-in serializable isolation
+level (`begin_transaction_serializable()`) with a conservative commit-time
+certifier that aborts write-skew anomalies with SQLSTATE `40001`. The default
+remains snapshot isolation, so existing workloads are unchanged.
+
+**Added — RGABH gradient-driven adaptive buffer pool.** Per-block heat gradient
+(fast/slow/training exponential moving averages) drives W-TinyLFU-style frequency
+admission and velocity-based speculative prefetch on the background IO queue. On a
+skewed workload the HotSet hit rate improves from 0.639 to 0.803 (+16.39 points);
+disabling RGABH reproduces the LRU/clock baseline exactly.
+
+**Added — disk-resident DiskANN (Vamana) index.** A graph + full-precision vectors
+laid out as fixed-size on-disk records (versioned `GDAN`) with a bounded in-memory
+node cache, beam search, and FreshDiskANN incremental insert / delete / consolidate.
+HNSW remains the default; DiskANN is opt-in for larger-than-RAM vector sets. Recall
+is verified against exact brute-force ground truth (recall@10 ≥ 0.90 cosine,
+≥ 0.85 L2); a SIFT1M harness ships for the full-scale number.
+
+**Compatibility.** Existing v0.6 databases open unchanged. The v0.6 six-counter
+`metering.gmet` file is read forward-compatibly. HNSW-indexed tables are
+unaffected by the new DiskANN option.
 
 ### v0.6.0
 

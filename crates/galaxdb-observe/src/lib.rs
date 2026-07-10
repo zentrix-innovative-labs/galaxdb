@@ -100,6 +100,9 @@ pub struct Metrics {
     pub near_dedup_rows_total: IntCounter,
     /// Bytes emitted by training-dataset (Lance) exports.
     pub training_export_bytes_total: IntCounter,
+    /// Semantic-cache hits served (v0.7, E-4.1). One per query served from
+    /// the per-table semantic cache instead of running HNSW search.
+    pub semantic_cache_hits_total: IntCounter,
 
     // v0.6 capacity gauges (recomputed live from the engine; not persisted).
     /// Physical on-disk bytes for this database (post-compaction,
@@ -198,6 +201,10 @@ fn build_metrics() -> Arc<Metrics> {
             "galaxdb_training_export_bytes_total",
             "Bytes emitted by training-dataset (Lance) exports",
         ),
+        semantic_cache_hits_total: counter(
+            "galaxdb_semantic_cache_hits_total",
+            "Semantic-cache hits served (query answered from cache, no HNSW search)",
+        ),
         storage_bytes: gauge(
             "galaxdb_storage_bytes",
             "Physical on-disk bytes for this database (post-compaction), accurate while running",
@@ -268,8 +275,15 @@ pub const METERING: FormatSupport = FormatSupport {
 /// File name (under the engine data directory) holding the persisted totals.
 pub const METERING_FILE: &str = "metering.gmet";
 
-/// Six little-endian `u64` counter totals follow the 16-byte header.
-const METERING_PAYLOAD_LEN: usize = 6 * 8;
+/// Cumulative counter totals follow the 16-byte header as little-endian
+/// `u64`s. v0.6 wrote 6; v0.7 appended a 7th (`semantic_cache_hits`).
+/// `load_metering` reads however many are present (min with this), seeding
+/// any missing trailing counter to 0 — so a v0.6 file loads forward-compatibly
+/// and a v0.7 file round-trips. The length change alone is additive and never
+/// triggers a format error (the header `format_version` stays 1).
+const METERING_COUNTERS: usize = 7;
+/// Minimum payload we require to treat a file as present (v0.6's six counters).
+const METERING_MIN_PAYLOAD_LEN: usize = 6 * 8;
 
 /// Load persisted cumulative counter totals from `<data_dir>/metering.gmet`
 /// and seed the live counters. Call once at engine open, before any ops.
@@ -286,7 +300,7 @@ pub fn load_metering(data_dir: &Path) -> GalaxResult<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(e) => return Err(GalaxError::Io(e)),
     };
-    if bytes.len() < FORMAT_HEADER_SIZE + METERING_PAYLOAD_LEN {
+    if bytes.len() < FORMAT_HEADER_SIZE + METERING_MIN_PAYLOAD_LEN {
         tracing::warn!(
             path = %path.display(),
             "metering file too short; ignoring prior totals"
@@ -308,8 +322,15 @@ pub fn load_metering(data_dir: &Path) -> GalaxResult<()> {
     // Typed too-old / too-new refusal — propagate so open fails cleanly.
     METERING.check(header.format_version)?;
 
-    let payload = &bytes[FORMAT_HEADER_SIZE..FORMAT_HEADER_SIZE + METERING_PAYLOAD_LEN];
+    // Read however many counters are present (a v0.6 file has 6, a v0.7 file
+    // has 7), capped at what this build knows. Missing trailing counters
+    // default to 0 (seeded by not incrementing them).
+    let payload = &bytes[FORMAT_HEADER_SIZE..];
+    let present = (payload.len() / 8).min(METERING_COUNTERS);
     let read_u64 = |i: usize| -> u64 {
+        if i >= present {
+            return 0;
+        }
         let mut b = [0u8; 8];
         b.copy_from_slice(&payload[i * 8..i * 8 + 8]);
         u64::from_le_bytes(b)
@@ -321,6 +342,7 @@ pub fn load_metering(data_dir: &Path) -> GalaxResult<()> {
     m.embedding_ops_total.inc_by(read_u64(3));
     m.near_dedup_rows_total.inc_by(read_u64(4));
     m.training_export_bytes_total.inc_by(read_u64(5));
+    m.semantic_cache_hits_total.inc_by(read_u64(6));
     Ok(())
 }
 
@@ -330,13 +352,14 @@ pub fn load_metering(data_dir: &Path) -> GalaxResult<()> {
 /// the prior or the new totals, never a torn value.
 pub fn flush_metering(data_dir: &Path) -> GalaxResult<()> {
     let m = metrics();
-    let vals: [u64; 6] = [
+    let vals: [u64; METERING_COUNTERS] = [
         m.read_ops_total.get(),
         m.write_ops_total.get(),
         m.vector_ops_total.get(),
         m.embedding_ops_total.get(),
         m.near_dedup_rows_total.get(),
         m.training_export_bytes_total.get(),
+        m.semantic_cache_hits_total.get(),
     ];
     let mut out = METERING.header().to_bytes().to_vec();
     for v in vals {
@@ -844,6 +867,7 @@ mod tests {
         m.embedding_ops_total.inc();
         m.near_dedup_rows_total.inc();
         m.training_export_bytes_total.inc();
+        m.semantic_cache_hits_total.inc();
         m.storage_bytes.set(0);
         m.rows_total.set(0);
         m.process_start_time_seconds.set(1);
@@ -872,6 +896,7 @@ mod tests {
             "galaxdb_embedding_ops_total",
             "galaxdb_near_dedup_rows_total",
             "galaxdb_training_export_bytes_total",
+            "galaxdb_semantic_cache_hits_total",
             "galaxdb_storage_bytes",
             "galaxdb_rows_total",
             "galaxdb_process_start_time_seconds",
